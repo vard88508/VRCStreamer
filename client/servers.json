@@ -1,11 +1,13 @@
 [
   {
     "name": "Local Server Test",
+    "description": "Local test server. Use this when VRCStreamer is running on this machine.",
     "apiBase": "http://127.0.0.1",
     "rtspBase": "rtsp://127.0.0.1"
   },
   {
     "name": "Vard's EU Server",
+    "description": "Public EU server.",
     "apiBase": "https://eu.vard.cc",
     "rtspBase": "rtsp://eu.vard.cc"
   }

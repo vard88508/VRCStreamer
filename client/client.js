@@ -1,4 +1,5 @@
-﻿const serverSelectEl = document.getElementById("serverSelect");
+const serverSelectEl = document.getElementById("serverSelect");
+const serverDescriptionEl = document.getElementById("serverDescription");
 const customServerEl = document.getElementById("customServer");
 const customApiEl = document.getElementById("customApi");
 const customRtspEl = document.getElementById("customRtsp");
@@ -30,8 +31,18 @@ const expectedAacConfigHex = "1190";
 const statsRefreshMs = 15000;
 const monitorOutputGain = 0.0001;
 const fallbackServers = [
-  { name: "Local 554", apiBase: "http://127.0.0.1:8081", rtspBase: "rtsp://127.0.0.1" },
-  { name: "Local 8554", apiBase: "http://127.0.0.1:8081", rtspBase: "rtsp://127.0.0.1:8554" }
+  {
+    name: "Local 554",
+    description: "Local test server on default RTSP port 554.",
+    apiBase: "http://127.0.0.1:8081",
+    rtspBase: "rtsp://127.0.0.1"
+  },
+  {
+    name: "Local 8554",
+    description: "Local test server on RTSP port 8554.",
+    apiBase: "http://127.0.0.1:8081",
+    rtspBase: "rtsp://127.0.0.1:8554"
+  }
 ];
 
 let urlSeq = 0;
@@ -109,6 +120,7 @@ function normalizeServerEntry(entry) {
   if (!apiBase.trim() || !rtspBase.trim()) return null;
   return {
     name: String(entry.name || entry.label || apiBase).trim(),
+    description: String(entry.description || "").trim(),
     apiBase: apiBase.trim(),
     rtspBase: rtspBase.trim()
   };
@@ -175,12 +187,14 @@ function updateCustomVisibility() {
   customApiEl.disabled = Boolean(active) || !custom;
   customRtspEl.disabled = Boolean(active) || !custom;
   customPasswordEl.disabled = Boolean(active) || !custom;
+  serverDescriptionEl.textContent = custom ? "Use your own API and RTSP server addresses." : selectedServer().description || "";
 }
 
 function selectedServer() {
   if (serverSelectEl.value === "custom") {
     return {
       name: "Custom",
+      description: "Use your own API and RTSP server addresses.",
       apiBase: customApiEl.value,
       rtspBase: customRtspEl.value,
       password: customPasswordEl.value
