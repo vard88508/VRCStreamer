@@ -11,6 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use axum_server::tls_rustls::RustlsConfig;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -59,6 +60,8 @@ struct Config {
     bind_addr: SocketAddr,
     rtsp_bind_addr: SocketAddr,
     rtsp_extra_bind_addr: Option<SocketAddr>,
+    tls_cert_path: Option<String>,
+    tls_key_path: Option<String>,
     code_min_bytes: usize,
     code_max_bytes: usize,
     max_publishers: usize,
@@ -104,6 +107,8 @@ struct IngestQuery {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
         .init();
@@ -124,20 +129,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/ingest", get(ingest_ws))
         .with_state(state.clone());
 
-    let listener = TcpListener::bind(bind_addr).await?;
-    info!("listening on http://{bind_addr}");
-
     tokio::spawn(rtsp_server(state.clone(), state.config.rtsp_bind_addr));
     if let Some(addr) = state.config.rtsp_extra_bind_addr {
         tokio::spawn(rtsp_server(state.clone(), addr));
     }
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    let handle = axum_server::Handle::new();
+    tokio::spawn(shutdown_http_server(handle.clone()));
+
+    let tls_cert_path = state.config.tls_cert_path.clone();
+    let tls_key_path = state.config.tls_key_path.clone();
+    let service = app.into_make_service_with_connect_info::<SocketAddr>();
+
+    if let (Some(cert_path), Some(key_path)) = (tls_cert_path, tls_key_path) {
+        let tls_config = RustlsConfig::from_pem_file(cert_path, key_path).await?;
+        info!("listening on https://{bind_addr}");
+        axum_server::tls_rustls::bind_rustls(bind_addr, tls_config)
+            .handle(handle)
+            .serve(service)
+            .await?;
+    } else {
+        info!("listening on http://{bind_addr}");
+        axum_server::bind(bind_addr)
+            .handle(handle)
+            .serve(service)
+            .await?;
+    }
 
     Ok(())
 }
@@ -155,11 +172,18 @@ impl Config {
             .filter(|value| !value.is_empty())
             .map(|value| value.parse())
             .transpose()?;
+        let tls_cert_path = env_nonempty("TLS_CERT_PATH");
+        let tls_key_path = env_nonempty("TLS_KEY_PATH");
+        if tls_cert_path.is_some() != tls_key_path.is_some() {
+            return Err("TLS_CERT_PATH and TLS_KEY_PATH must be set together".into());
+        }
 
         Ok(Self {
             bind_addr,
             rtsp_bind_addr,
             rtsp_extra_bind_addr,
+            tls_cert_path,
+            tls_key_path,
             code_min_bytes: env_usize("CODE_MIN_BYTES", 8),
             code_max_bytes: env_usize("CODE_MAX_BYTES", 128),
             max_publishers: env_usize("MAX_PUBLISHERS", 500),
@@ -1301,6 +1325,10 @@ fn env_bool(key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn env_nonempty(key: &str) -> Option<String> {
+    env::var(key).ok().filter(|value| !value.is_empty())
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -1323,6 +1351,11 @@ async fn shutdown_signal() {
     }
 }
 
+async fn shutdown_http_server(handle: axum_server::Handle<SocketAddr>) {
+    shutdown_signal().await;
+    handle.graceful_shutdown(Some(Duration::from_secs(10)));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1341,6 +1374,8 @@ mod tests {
             bind_addr: "127.0.0.1:8080".parse().unwrap(),
             rtsp_bind_addr: "127.0.0.1:8554".parse().unwrap(),
             rtsp_extra_bind_addr: None,
+            tls_cert_path: None,
+            tls_key_path: None,
             code_min_bytes: 8,
             code_max_bytes: 128,
             max_publishers: 1,

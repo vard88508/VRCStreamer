@@ -85,19 +85,23 @@ rtsp://127.0.0.1:8554/live/<hash>
 
 If binding port `554` is not available on your OS, use the `Local 8554` option.
 
-## Simple Deploy
+## Simple Deploy Without Nginx
 
-This deploy example uses one public domain for the client and WebSocket API:
+The Rust backend can terminate HTTPS/WSS directly. No nginx is required for `/stats` or `/ingest`.
+
+Example `client/servers.json` entry:
 
 ```json
 {
-  "name": "Example Server",
+  "name": "Vard's EU Server",
   "apiBase": "https://example.com",
   "rtspBase": "rtsp://example.com"
 }
 ```
 
 Because `rtspBase` has no explicit port, AVPro/RTSP clients will use the default RTSP port `554`.
+
+Important: the Rust server still does not host `client/`. Host `client/` on static HTTPS hosting. Set `ALLOWED_ORIGINS` to the exact origin where the client page is opened. If the client is opened at `https://example.com`, use `ALLOWED_ORIGINS=https://example.com`.
 
 Build the server on the Linux host:
 
@@ -111,10 +115,21 @@ cp .env.example .env
 nano .env
 ```
 
+Place your existing certificate files on the server:
+
+```bash
+sudo mkdir -p /etc/ssl/vrc-audio-streamer
+sudo cp example.com.pem /etc/ssl/vrc-audio-streamer/example.com.pem
+sudo cp example.com.key /etc/ssl/vrc-audio-streamer/example.com.key
+sudo chmod 600 /etc/ssl/vrc-audio-streamer/example.com.key
+```
+
 Production `server/.env` example:
 
 ```env
-BIND_ADDR=127.0.0.1:8080
+BIND_ADDR=0.0.0.0:443
+TLS_CERT_PATH=/etc/ssl/vrc-audio-streamer/example.com.pem
+TLS_KEY_PATH=/etc/ssl/vrc-audio-streamer/example.com.key
 RTSP_BIND_ADDR=0.0.0.0:554
 RTSP_EXTRA_BIND_ADDR=
 ALLOWED_ORIGINS=https://example.com
@@ -154,6 +169,12 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 ```
 
+Ports `443` and `554` are privileged ports on Linux. Give the binary bind permission once after each rebuild:
+
+```bash
+sudo setcap 'cap_net_bind_service=+ep' /opt/vrc-audio-streamer/server/target/release/vrc-audio-streamer
+```
+
 Install and start it:
 
 ```bash
@@ -163,33 +184,25 @@ sudo systemctl enable --now vrc-audio-streamer
 sudo systemctl status vrc-audio-streamer
 ```
 
-Binding RTSP port `554` as a non-root service needs this once after each binary rebuild:
+Open firewall ports:
 
 ```bash
-sudo setcap 'cap_net_bind_service=+ep' /opt/vrc-audio-streamer/server/target/release/vrc-audio-streamer
-sudo systemctl restart vrc-audio-streamer
+sudo ufw allow 443/tcp
+sudo ufw allow 554/tcp
 ```
 
-Host the client files separately:
+Smoke test:
 
 ```bash
-sudo mkdir -p /var/www/vrc-audio-streamer/client
-sudo cp -r client/* /var/www/vrc-audio-streamer/client/
+curl https://example.com/healthz
+curl https://example.com/stats
 ```
 
-Edit `/var/www/vrc-audio-streamer/client/servers.json`:
+If you use RTSP port `8554` instead of `554`, then change `RTSP_BIND_ADDR` and include the port in `rtspBase`:
 
-```json
-[
-  {
-    "name": "Vard's EU Server",
-    "apiBase": "https://example.com",
-    "rtspBase": "rtsp://example.com"
-  }
-]
+```env
+RTSP_BIND_ADDR=0.0.0.0:8554
 ```
-
-If you use RTSP port `8554` instead of `554`, then `rtspBase` must include it:
 
 ```json
 {
@@ -199,92 +212,7 @@ If you use RTSP port `8554` instead of `554`, then `rtspBase` must include it:
 }
 ```
 
-## Nginx HTTPS/WSS
-
-Yes, if the client is hosted over HTTPS, the WebSocket API should also be HTTPS/WSS. The Rust server does not terminate TLS; put nginx in front of it. With the `example.com` config above, the browser opens `https://example.com`, fetches `https://example.com/stats`, and streams to `wss://example.com/ingest`.
-
-Place your existing certificate files on the server:
-
-```bash
-sudo mkdir -p /etc/ssl/vrc-audio-streamer
-sudo cp example.com.pem /etc/ssl/vrc-audio-streamer/example.com.pem
-sudo cp example.com.key /etc/ssl/vrc-audio-streamer/example.com.key
-sudo chmod 600 /etc/ssl/vrc-audio-streamer/example.com.key
-```
-
-Nginx for the static client, backend API, and WebSocket on one domain:
-
-```nginx
-server {
-    listen 80;
-    server_name example.com;
-    return 301 https://$host$request_uri;
-}
-
-server {
-    listen 443 ssl http2;
-    server_name example.com;
-
-    ssl_certificate /etc/ssl/vrc-audio-streamer/example.com.pem;
-    ssl_certificate_key /etc/ssl/vrc-audio-streamer/example.com.key;
-
-    root /var/www/vrc-audio-streamer/client;
-    index index.html;
-
-    location = /servers.json {
-        add_header Cache-Control "no-store";
-        try_files $uri =404;
-    }
-
-    location = /client.js {
-        try_files $uri =404;
-    }
-
-    location = /aac-worker.js {
-        try_files $uri =404;
-    }
-
-    location /vendor/ {
-        try_files $uri =404;
-    }
-
-    location /healthz {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
-    location /stats {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
-    location /ingest {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 86400;
-        proxy_send_timeout 86400;
-        proxy_buffering off;
-        proxy_request_buffering off;
-    }
-
-    location / {
-        try_files $uri =404;
-    }
-}
-```
-
-RTSP is not proxied by nginx. Open the RTSP port directly in the firewall:
-
-```bash
-sudo ufw allow 443/tcp
-sudo ufw allow 554/tcp
-```
+If `TLS_CERT_PATH` and `TLS_KEY_PATH` are not set, the API runs as plain HTTP/WS. That is useful for local tests, but not for a public HTTPS client because browsers can block non-secure WebSocket connections from HTTPS pages.
 
 ## Server Endpoints
 
@@ -298,7 +226,9 @@ sudo ufw allow 554/tcp
 
 | Name | Default | Meaning |
 | --- | ---: | --- |
-| `BIND_ADDR` | `0.0.0.0:8080` | HTTP API and WebSocket ingest listen address |
+| `BIND_ADDR` | `0.0.0.0:8080` | HTTP/HTTPS API and WebSocket ingest listen address |
+| `TLS_CERT_PATH` | empty | PEM certificate path; enables HTTPS/WSS when set with `TLS_KEY_PATH` |
+| `TLS_KEY_PATH` | empty | PEM private key path; enables HTTPS/WSS when set with `TLS_CERT_PATH` |
 | `RTSP_BIND_ADDR` | `0.0.0.0:8554` | RTSP listen address |
 | `RTSP_EXTRA_BIND_ADDR` | empty | Optional second RTSP listen address, useful for also binding `0.0.0.0:554` |
 | `MAX_PUBLISHERS` | `500` | Max simultaneous broadcasters |
