@@ -33,7 +33,7 @@ use tokio::{
     task::JoinHandle,
     time::{Instant as TokioInstant, sleep_until, timeout},
 };
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
 const RTP_AUDIO_PAYLOAD_TYPE: u8 = 96;
@@ -138,7 +138,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
         .init();
 
-    let config = Config::from_env()?;
+    let config = match Config::from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            error!(
+                %error,
+                active_streams = 0usize,
+                active_listeners = 0usize,
+                "server failed to load config"
+            );
+            return Err(error);
+        }
+    };
     let bind_addr = config.bind_addr;
     let state = Arc::new(AppState {
         config,
@@ -148,6 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         active_listeners: AtomicUsize::new(0),
         next_rtsp_session: AtomicUsize::new(1),
     });
+    install_panic_hook(state.clone());
 
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -167,19 +179,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tls_key_path = state.config.tls_key_path.clone();
     let service = app.into_make_service_with_connect_info::<SocketAddr>();
 
-    if let (Some(cert_path), Some(key_path)) = (tls_cert_path, tls_key_path) {
-        let tls_config = RustlsConfig::from_pem_file(cert_path, key_path).await?;
-        info!("listening on https://{bind_addr}");
-        axum_server::tls_rustls::bind_rustls(bind_addr, tls_config)
-            .handle(handle)
-            .serve(service)
-            .await?;
-    } else {
-        info!("listening on http://{bind_addr}");
-        axum_server::bind(bind_addr)
-            .handle(handle)
-            .serve(service)
-            .await?;
+    let result = async {
+        if let (Some(cert_path), Some(key_path)) = (tls_cert_path, tls_key_path) {
+            let tls_config = RustlsConfig::from_pem_file(cert_path, key_path).await?;
+            info!("listening on https://{bind_addr}");
+            axum_server::tls_rustls::bind_rustls(bind_addr, tls_config)
+                .handle(handle)
+                .serve(service)
+                .await?;
+        } else {
+            info!("listening on http://{bind_addr}");
+            axum_server::bind(bind_addr)
+                .handle(handle)
+                .serve(service)
+                .await?;
+        }
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    if let Err(error) = result {
+        log_fatal_error(&state, error.as_ref());
+        return Err(error);
     }
 
     Ok(())
@@ -418,7 +440,7 @@ async fn publisher_session(
                 if frames == 1 {
                     info!(%addr, %key, "publisher sent first aac frame");
                 }
-                if frames % 250 == 0 || last_report.elapsed() >= Duration::from_secs(5) {
+                if frames.is_multiple_of(250) || last_report.elapsed() >= Duration::from_secs(5) {
                     let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
                     info!(
                         %addr,
@@ -762,7 +784,6 @@ async fn subscribe_listener(
         state: state.clone(),
         key: key.to_owned(),
         channel,
-        released: false,
     };
     Ok((rx, guard))
 }
@@ -810,7 +831,7 @@ async fn rtsp_rtp_task(
                             rtp.skip_samples(AAC_SAMPLES_PER_FRAME);
                             dropped += 1;
                         }
-                        if dropped != 0 && dropped % 50 == 0 {
+                        if dropped != 0 && dropped.is_multiple_of(50) {
                             warn!(%addr, %key, dropped, "rtsp client dropped queued aac frames to keep latency bounded");
                         }
                     }
@@ -824,7 +845,7 @@ async fn rtsp_rtp_task(
             }
             _ = &mut sleep, if started => {
                 let frame = if let Some(frame) = buffer.pop_front() {
-                    if buffer.len() < RTSP_LOW_WATER_FRAMES && packets % 50 == 0 {
+                    if buffer.len() < RTSP_LOW_WATER_FRAMES && packets.is_multiple_of(50) {
                         warn!(
                             %addr,
                             %key,
@@ -836,7 +857,7 @@ async fn rtsp_rtp_task(
                 } else {
                     underruns += 1;
                     silence_packets += 1;
-                    if underruns <= 5 || underruns % 50 == 0 {
+                    if underruns <= 5 || underruns.is_multiple_of(50) {
                         warn!(%addr, %key, underruns, "rtsp rtp underrun; sending aac silence");
                     }
                     Bytes::from_static(AAC_SILENCE_ACCESS_UNIT)
@@ -1170,15 +1191,10 @@ struct ListenerGuard {
     state: Arc<AppState>,
     key: String,
     channel: Arc<Channel>,
-    released: bool,
 }
 
 impl Drop for ListenerGuard {
     fn drop(&mut self) {
-        if self.released {
-            return;
-        }
-        self.released = true;
         self.channel.listeners.fetch_sub(1, Ordering::AcqRel);
         self.state.active_listeners.fetch_sub(1, Ordering::AcqRel);
 
@@ -1337,7 +1353,6 @@ fn try_acquire_publisher_ip(
     Ok(Some(PublisherIpGuard {
         state: state.clone(),
         ip,
-        released: false,
     }))
 }
 
@@ -1351,16 +1366,10 @@ fn prune_ip_limits(limits: &mut HashMap<IpAddr, IpLimitEntry>, now: Instant, con
 struct PublisherIpGuard {
     state: Arc<AppState>,
     ip: IpAddr,
-    released: bool,
 }
 
 impl Drop for PublisherIpGuard {
     fn drop(&mut self) {
-        if self.released {
-            return;
-        }
-        self.released = true;
-
         let mut limits = self
             .state
             .ip_limits
@@ -1371,6 +1380,51 @@ impl Drop for PublisherIpGuard {
             entry.last_seen = Instant::now();
         }
     }
+}
+
+fn install_panic_hook(state: Arc<AppState>) {
+    std::panic::set_hook(Box::new(move |panic| {
+        let message = panic
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("panic");
+        let location = panic
+            .location()
+            .map(|location| format!("{}:{}", location.file(), location.line()))
+            .unwrap_or_else(|| "unknown".to_owned());
+        let active_streams = active_streams(&state);
+        let active_listeners = state.active_listeners.load(Ordering::Acquire);
+
+        error!(
+            %message,
+            %location,
+            ?active_streams,
+            active_listeners,
+            "server panicked"
+        );
+    }));
+}
+
+fn log_fatal_error(state: &AppState, error: &dyn std::error::Error) {
+    let active_streams = active_streams(state);
+    let active_listeners = state.active_listeners.load(Ordering::Acquire);
+
+    error!(
+        %error,
+        ?active_streams,
+        active_listeners,
+        "server stopped after fatal error"
+    );
+}
+
+fn active_streams(state: &AppState) -> Option<usize> {
+    state
+        .channels
+        .try_lock()
+        .ok()
+        .map(|channels| channels.len())
 }
 
 fn validate_code(code: &str, config: &Config) -> Result<(), &'static str> {

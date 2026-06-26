@@ -1,162 +1,61 @@
-# VRC Audio Streamer
+# VRC Audio Streamer Server
 
-Minimal browser-to-RTSP audio relay for AVPro/VRChat.
+Minimal Rust WebSocket-to-RTSP audio relay for AVPro/VRChat.
 
-## Layout
+This server deploy guide has only been checked on Debian.
 
-- `client/` - static browser client. Host these files on any normal static hosting.
-- `client/client.js` - browser UI and streaming logic.
-- `client/servers.json` - list of relay servers shown in the client dropdown.
-- `server/` - Rust backend, WebSocket ingest API, stats API, and RTSP relay.
-
-The Rust server intentionally does not host the client. Deploy the client and server separately.
-
-## Architecture
-
-1. Browser captures 48 kHz stereo audio with `AudioWorklet`.
-2. The main page transfers PCM blocks to `client/aac-worker.js`.
-3. The Worker encodes AAC-LC using the selected encoder mode: native WebCodecs AAC at 192 kbps, or the vendored WASM AAC encoder at 320 kbps.
-4. Browser sends raw AAC access units over WebSocket to `GET /ingest?code=...`.
-5. Server validates and relays those raw AAC frames as RTSP/RTP `mpeg4-generic`.
-
-The server does not run `ffmpeg`, does not transcode, and does not store stream links. The hidden code and stream URL are derived with the first 32 hex chars of `SHA-256(code)` on both client and server.
-
-Output stream shape:
-
-- RTSP path: `/<hash32>`
-- Codec: AAC-LC
-- Sample rate: 48000 Hz
-- Channels: stereo
-- Bitrate: 192 kbps in native mode, 320 kbps in WASM mode
-- RTP payload: `mpeg4-generic`, payload type `96`, `trackID=0`
-- SDP config: `1190`
-
-## Client Servers
-
-Edit `client/servers.json` before hosting the client:
-
-```json
-[
-  {
-    "name": "Vard's EU Server",
-    "apiBase": "https://example.com",
-    "rtspBase": "rtsp://example.com"
-  }
-]
-```
-
-The browser uses `apiBase` for `/stats` and WebSocket `/ingest`. The generated VRChat URL uses `rtspBase`.
-
-The client dropdown always also has `Custom`, where a user can enter custom API and RTSP addresses manually.
-
-The client refreshes `/stats` every 15 seconds while the page is open.
-
-During streaming, the status text shows whether the browser is using native WebCodecs AAC or the WASM encoder. Native AAC support is browser/platform dependent even when `AudioEncoder` exists; on Windows, Chromium may reject 320 kbps because the system AAC encoder supports a limited bitrate set.
-
-The client has an encoder dropdown:
-
-- `Native AAC 192 kbps` - uses WebCodecs native AAC at 192 kbps only. If native 192 kbps is unavailable, streaming fails instead of silently switching encoder.
-- `WASM AAC 320 kbps` - skips native WebCodecs and uses the vendored WASM AAC encoder at 320 kbps.
-
-The selected encoder mode is saved in browser `localStorage`.
-
-Keep the streaming tab visible for the most stable realtime output. Chromium can throttle or freeze hidden/minimized tabs at the browser's discretion. The client requests a screen wake lock and keeps a very quiet monitor output connected to reduce background throttling, but a web page cannot force realtime priority when fully minimized. For guaranteed background streaming, use a native desktop encoder instead of a browser page.
-
-The AAC encoder runs in a module Worker so WebCodecs/WASM work and PCM conversion stay off the page's main thread.
-
-If the client page is hosted over HTTPS, `apiBase` should also be HTTPS/WSS-capable; otherwise browsers may block the WebSocket/fetch as mixed content. `rtspBase` is separate because AVPro/VRChat consumes that URL, not the browser.
-
-If your static host sets Content Security Policy, allow the client script and module Worker:
-
-```text
-Content-Security-Policy: default-src 'self'; script-src 'self'; worker-src 'self'; connect-src 'self' https: wss:; media-src 'self' blob:; object-src 'none'
-```
-
-For report-only testing, use the same value in `Content-Security-Policy-Report-Only`. A policy like `script-src 'none'` or missing `worker-src` can break `client.js`, `aac-worker.js`, or the WASM fallback import.
-
-## Run Locally
-
-Terminal 1, backend:
-
-```powershell
-cd server
-$env:BIND_ADDR='127.0.0.1:8081'
-$env:RTSP_BIND_ADDR='0.0.0.0:554'
-$env:RTSP_EXTRA_BIND_ADDR='0.0.0.0:8554'
-$env:ALLOWED_ORIGINS='http://127.0.0.1:8080,http://localhost:8080'
-cargo run --release
-```
-
-Terminal 2, static client:
-
-```powershell
-cd client
-python -m http.server 8080
-```
-
-Open:
-
-```text
-http://127.0.0.1:8080/
-```
-
-The default `servers.json` points to `http://127.0.0.1:8081` and can generate either:
-
-```text
-rtsp://127.0.0.1/<hash32>
-rtsp://127.0.0.1:8554/<hash32>
-```
-
-If binding port `554` is not available on your OS, use the `Local 8554` option.
-
-## Simple Deploy Without Nginx
-
-The Rust backend can terminate HTTPS/WSS directly. No nginx is required for `/stats` or `/ingest`.
-
-Example `client/servers.json` entry:
-
-```json
-{
-  "name": "Vard's EU Server",
-  "apiBase": "https://example.com",
-  "rtspBase": "rtsp://example.com"
-}
-```
-
-Because `rtspBase` has no explicit port, AVPro/RTSP clients will use the default RTSP port `554`.
-
-Important: the Rust server still does not host `client/`. Host `client/` on static HTTPS hosting. Set `ALLOWED_ORIGINS` to the exact origin where the client page is opened. If the client is opened at `https://example.com`, use `ALLOWED_ORIGINS=https://example.com`.
-
-Build the server on the Linux host:
+## 1. Install Rust
 
 ```bash
-sudo mkdir -p /opt/vrc-audio-streamer
-sudo chown "$USER":"$USER" /opt/vrc-audio-streamer
-cp -r server /opt/vrc-audio-streamer/
+sudo apt install -y curl build-essential
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
+```
+
+If `git` is not installed on the server:
+
+```bash
+sudo apt install -y git
+```
+
+## 2. Clone And Build
+
+```bash
+sudo mkdir -p /opt
+cd /opt
+sudo git clone https://github.com/vard88508/VRCStreamer.git vrc-audio-streamer
+sudo chown -R "$USER":"$USER" /opt/vrc-audio-streamer
 cd /opt/vrc-audio-streamer/server
-cargo build --release
+chmod +x build.sh create_service.sh
+./build.sh
+```
+
+`build.sh` compiles the Rust server and copies the executable to:
+
+```text
+/opt/vrc-audio-streamer/server/vrc-audio-streamer
+```
+
+If the `vrc-audio-streamer` systemd service already exists, `build.sh` restarts it after a successful build.
+
+## 3. Configure `.env`
+
+On the first install:
+
+```bash
 cp .env.example .env
 nano .env
 ```
 
-Place your existing certificate files on the server:
-
-```bash
-sudo mkdir -p /etc/ssl/vrc-audio-streamer
-sudo cp example.com.pem /etc/ssl/vrc-audio-streamer/example.com.pem
-sudo cp example.com.key /etc/ssl/vrc-audio-streamer/example.com.key
-sudo chmod 600 /etc/ssl/vrc-audio-streamer/example.com.key
-```
-
-Production `server/.env` example:
+Example:
 
 ```env
 BIND_ADDR=0.0.0.0:443
-TLS_CERT_PATH=/etc/ssl/vrc-audio-streamer/example.com.pem
-TLS_KEY_PATH=/etc/ssl/vrc-audio-streamer/example.com.key
+TLS_CERT_PATH=/etc/letsencrypt/live/example.com/fullchain.pem
+TLS_KEY_PATH=/etc/letsencrypt/live/example.com/privkey.pem
 RTSP_BIND_ADDR=0.0.0.0:554
 RTSP_EXTRA_BIND_ADDR=
-ALLOWED_ORIGINS=https://example.com
+ALLOWED_ORIGINS=https://vard.cc
 MAX_PUBLISHERS=500
 MAX_PUBLISHERS_PER_IP=3
 MAX_LISTENERS_TOTAL=2500
@@ -173,43 +72,20 @@ CODE_MAX_BYTES=128
 RUST_LOG=warn
 ```
 
-The server reads process environment variables. It does not load `.env` by itself. Load it from systemd or from your deploy script.
+Use your real domain in `TLS_CERT_PATH`, `TLS_KEY_PATH`, and `ALLOWED_ORIGINS`.
 
-Create a systemd service:
-
-```ini
-[Unit]
-Description=VRC Audio Streamer relay
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=/opt/vrc-audio-streamer/server
-EnvironmentFile=/opt/vrc-audio-streamer/server/.env
-ExecStart=/opt/vrc-audio-streamer/server/target/release/vrc-audio-streamer
-Restart=always
-RestartSec=2
-LimitNOFILE=65535
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Ports `443` and `554` are privileged ports on Linux. Give the binary bind permission once after each rebuild:
+## 4. Create Service
 
 ```bash
-sudo setcap 'cap_net_bind_service=+ep' /opt/vrc-audio-streamer/server/target/release/vrc-audio-streamer
+./create_service.sh
 ```
 
-Install and start it:
+The script writes `/etc/systemd/system/vrc-audio-streamer.service`, enables it, and starts/restarts the service.
+
+Check logs:
 
 ```bash
-sudo nano /etc/systemd/system/vrc-audio-streamer.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now vrc-audio-streamer
-sudo systemctl status vrc-audio-streamer
+journalctl -u vrc-audio-streamer -f
 ```
 
 Open firewall ports:
@@ -226,69 +102,45 @@ curl https://example.com/healthz
 curl https://example.com/stats
 ```
 
-If you use RTSP port `8554` instead of `554`, then change `RTSP_BIND_ADDR` and include the port in `rtspBase`:
+## Updating
 
-```env
-RTSP_BIND_ADDR=0.0.0.0:8554
+```bash
+cd /opt/vrc-audio-streamer
+git pull
+cd server
+./build.sh
 ```
 
-```json
-{
-  "name": "Vard's EU Server",
-  "apiBase": "https://example.com",
-  "rtspBase": "rtsp://example.com:8554"
-}
-```
-
-If `TLS_CERT_PATH` and `TLS_KEY_PATH` are not set, the API runs as plain HTTP/WS. That is useful for local tests, but not for a public HTTPS client because browsers can block non-secure WebSocket connections from HTTPS pages.
-
-## Server Endpoints
-
-- `GET /healthz` - health check.
-- `GET /stats` - JSON counters: active listeners and streams.
-- `GET /ingest?code=<hidden-code>` - WebSocket AAC ingest.
-- `RTSP /<hash32>` - AVPro/VRChat playback URL.
-
-## Server Environment
+## Environment
 
 | Name | Default | Meaning |
 | --- | ---: | --- |
 | `BIND_ADDR` | `0.0.0.0:8080` | HTTP/HTTPS API and WebSocket ingest listen address |
-| `TLS_CERT_PATH` | empty | PEM certificate path; enables HTTPS/WSS when set with `TLS_KEY_PATH` |
-| `TLS_KEY_PATH` | empty | PEM private key path; enables HTTPS/WSS when set with `TLS_CERT_PATH` |
+| `TLS_CERT_PATH` | empty | PEM certificate path; enables HTTPS/WSS with `TLS_KEY_PATH` |
+| `TLS_KEY_PATH` | empty | PEM private key path; enables HTTPS/WSS with `TLS_CERT_PATH` |
 | `RTSP_BIND_ADDR` | `0.0.0.0:8554` | RTSP listen address |
-| `RTSP_EXTRA_BIND_ADDR` | empty | Optional second RTSP listen address, useful for also binding `0.0.0.0:554` |
-| `MAX_PUBLISHERS` | `500` | Max simultaneous broadcasters |
-| `MAX_PUBLISHERS_PER_IP` | `3` | Max simultaneous broadcasters from one IP; `0` disables this limit |
+| `RTSP_EXTRA_BIND_ADDR` | empty | Optional second RTSP listen address |
+| `ALLOWED_ORIGINS` | empty | Comma-separated browser origins allowed to publish |
+| `ALLOW_ANY_ORIGIN` | `false` | Disable Origin protection when `true` |
+| `MAX_PUBLISHERS` | `500` | Max simultaneous publishers |
+| `MAX_PUBLISHERS_PER_IP` | `3` | Max simultaneous publishers from one IP; `0` disables this limit |
 | `MAX_LISTENERS_TOTAL` | `2500` | Max simultaneous RTSP clients |
 | `MAX_LISTENERS_PER_STREAM` | `85` | Max RTSP clients per stream |
-| `MAX_HTTP_REQUESTS_PER_IP` | `120` | Max HTTP/WebSocket handshake requests from one IP per rate-limit window; `0` disables this limit |
+| `MAX_HTTP_REQUESTS_PER_IP` | `120` | Max HTTP/WebSocket handshake requests from one IP per window; `0` disables this limit |
 | `HTTP_RATE_LIMIT_WINDOW_SECS` | `60` | HTTP request rate-limit window |
 | `MAX_TRACKED_IPS` | `8192` | Max IP entries kept by the in-memory limiter; `0` disables the cap |
 | `MAX_AAC_FRAME_BYTES` | `4096` | Max WebSocket AAC access unit size |
 | `MAX_INGEST_BYTES_PER_SEC` | `98304` | Average AAC ingest byte limit per publisher |
 | `CHANNEL_BUFFER` | `128` | Per-stream AAC frame broadcast buffer |
 | `PUBLISHER_IDLE_TIMEOUT_SECS` | `120` | Disconnect idle publishers |
-| `CODE_MIN_BYTES` | `8` | Min code length |
-| `CODE_MAX_BYTES` | `128` | Max code length |
-| `ALLOWED_ORIGINS` | empty | Comma-separated allowed browser origins |
-| `ALLOW_ANY_ORIGIN` | `false` | Disable Origin protection when set to `true` |
+| `CODE_MIN_BYTES` | `8` | Min hidden code length |
+| `CODE_MAX_BYTES` | `128` | Max hidden code length |
 
-## Abuse Limits
+## Endpoints
 
-- One active publisher per code/hash.
-- One IP may have at most `MAX_PUBLISHERS_PER_IP` active publishers by default.
-- HTTP/API requests are rate-limited per IP with a small in-memory window.
-- Codes are printable ASCII only, 8 to 128 bytes by default.
-- Stream IDs must be 32 hex chars.
-- WebSocket publishers may send binary messages only.
-- WebSocket binary messages must be raw AAC access units, not ADTS, video, or container data.
-- Input byte rate and frame size are bounded.
-- Slow RTSP clients drop old queued frames instead of growing latency.
-- Offline streams fail at RTSP `SETUP` and do not create channels.
+- `GET /healthz` - health check.
+- `GET /stats` - JSON counters: active listeners and streams.
+- `GET /ingest?code=<hidden-code>` - WebSocket raw AAC ingest.
+- `RTSP /<hash32>` - AVPro/VRChat playback URL.
 
-## Vendored WASM
-
-`client/vendor/mediabunny-aac.js` is the fallback AAC encoder build from `@mediabunny/aac-encoder`, transformed from CommonJS to a browser ESM default export so it can be loaded by `client/aac-worker.js` without a bundler.
-
-The vendored encoder is MPL-2.0 licensed; the license text is included at `client/vendor/mediabunny-aac.LICENSE.txt`.
+On fatal server errors and panics, the service logs the error reason plus the current listener count and stream count when available.
