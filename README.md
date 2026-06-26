@@ -59,7 +59,7 @@ MAX_AAC_FRAME_BYTES=4096
 MAX_INGEST_BYTES_PER_SEC=98304
 CHANNEL_BUFFER=128
 PUBLISHER_IDLE_TIMEOUT_SECS=120
-PUBLISH_PASSWORDS=
+PASSWORD=
 CODE_MIN_BYTES=8
 CODE_MAX_BYTES=128
 RUST_LOG=warn
@@ -67,10 +67,10 @@ RUST_LOG=warn
 
 Set your real domain in `TLS_CERT_PATH`, `TLS_KEY_PATH`, and `ALLOWED_ORIGINS`.
 
-Leave `PUBLISH_PASSWORDS` empty to allow publishing without a password. To require a publish password, set one or more comma-separated values:
+Leave `PASSWORD` empty to allow publishing without a password. To require a password, set one or more comma-separated values:
 
 ```env
-PUBLISH_PASSWORDS=password1,password2
+PASSWORD=password1,password2
 ```
 
 ## 4. Create Service
@@ -101,8 +101,6 @@ Choose `Custom` and enter your server addresses:
 API:  https://example.com
 RTSP: rtsp://example.com
 ```
-
-If `PUBLISH_PASSWORDS` is set on the server, enter one of those values in `Custom password`. Listeners do not need the password.
 
 ## Updating
 
@@ -135,7 +133,7 @@ cd server
 | `MAX_INGEST_BYTES_PER_SEC` | `98304` | Average AAC ingest byte limit per publisher |
 | `CHANNEL_BUFFER` | `128` | Per-stream AAC frame broadcast buffer |
 | `PUBLISHER_IDLE_TIMEOUT_SECS` | `120` | Disconnect idle publishers |
-| `PUBLISH_PASSWORDS` | empty | Optional comma-separated publish passwords; empty disables password auth |
+| `PASSWORD` | empty | Optional comma-separated passwords; empty disables password auth |
 | `CODE_MIN_BYTES` | `8` | Min hidden code length |
 | `CODE_MAX_BYTES` | `128` | Max hidden code length |
 | `RUST_LOG` | `warn` | Server log level |

@@ -77,7 +77,7 @@ struct Config {
     max_ingest_bytes_per_sec: usize,
     channel_buffer: usize,
     publisher_idle_timeout: Duration,
-    publish_passwords: Vec<String>,
+    passwords: Vec<String>,
     allow_any_origin: bool,
     allowed_origins: Vec<String>,
 }
@@ -258,7 +258,7 @@ impl Config {
                 "PUBLISHER_IDLE_TIMEOUT_SECS",
                 120,
             )),
-            publish_passwords: env_list("PUBLISH_PASSWORDS"),
+            passwords: env_list("PASSWORD"),
             allow_any_origin: env_bool("ALLOW_ANY_ORIGIN", false),
             allowed_origins: env::var("ALLOWED_ORIGINS")
                 .unwrap_or_else(|_| "https://vard.cc".to_owned())
@@ -348,7 +348,7 @@ async fn ingest_ws(
         return text_response(StatusCode::FORBIDDEN, "origin is not allowed\n");
     }
 
-    if !publish_password_allowed(query.password.as_deref(), &state.config) {
+    if !password_allowed(query.password.as_deref(), &state.config) {
         warn!(%addr, "rejected publisher with invalid password");
         return text_response_with_cors(
             StatusCode::UNAUTHORIZED,
@@ -1460,14 +1460,10 @@ fn validate_code(code: &str, config: &Config) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn publish_password_allowed(password: Option<&str>, config: &Config) -> bool {
-    config.publish_passwords.is_empty()
-        || password.is_some_and(|password| {
-            config
-                .publish_passwords
-                .iter()
-                .any(|allowed| allowed == password)
-        })
+fn password_allowed(password: Option<&str>, config: &Config) -> bool {
+    config.passwords.is_empty()
+        || password
+            .is_some_and(|password| config.passwords.iter().any(|allowed| allowed == password))
 }
 
 fn valid_hash(key: &str) -> bool {
@@ -1662,7 +1658,7 @@ mod tests {
             max_ingest_bytes_per_sec: 128 * 1024,
             channel_buffer: 8,
             publisher_idle_timeout: Duration::from_secs(1),
-            publish_passwords: Vec::new(),
+            passwords: Vec::new(),
             allow_any_origin: false,
             allowed_origins: Vec::new(),
         }
@@ -1720,16 +1716,16 @@ mod tests {
     }
 
     #[test]
-    fn publish_passwords_are_optional_and_exact() {
+    fn passwords_are_optional_and_exact() {
         let mut config = test_config();
-        assert!(publish_password_allowed(None, &config));
+        assert!(password_allowed(None, &config));
 
-        config.publish_passwords = vec!["alpha".to_owned(), "beta".to_owned()];
-        assert!(!publish_password_allowed(None, &config));
-        assert!(!publish_password_allowed(Some(""), &config));
-        assert!(!publish_password_allowed(Some("Alpha"), &config));
-        assert!(publish_password_allowed(Some("alpha"), &config));
-        assert!(publish_password_allowed(Some("beta"), &config));
+        config.passwords = vec!["alpha".to_owned(), "beta".to_owned()];
+        assert!(!password_allowed(None, &config));
+        assert!(!password_allowed(Some(""), &config));
+        assert!(!password_allowed(Some("Alpha"), &config));
+        assert!(password_allowed(Some("alpha"), &config));
+        assert!(password_allowed(Some("beta"), &config));
     }
 
     #[test]

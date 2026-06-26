@@ -1,13 +1,7 @@
 [
   {
-    "name": "Local Server Test",
-    "description": "Local test server. Use this when VRCStreamer is running on this machine.",
-    "apiBase": "http://127.0.0.1",
-    "rtspBase": "rtsp://127.0.0.1"
-  },
-  {
-    "name": "Vard's EU Server",
-    "description": "Public EU server.",
+    "name": "🔊 Vard's EU Server",
+    "description": "First VRCStreamer server with just 1 CPU core and 1 GB of RAM, hosted in the 🇳🇱 Netherlands.",
     "apiBase": "https://eu.vard.cc",
     "rtspBase": "rtsp://eu.vard.cc"
   }
