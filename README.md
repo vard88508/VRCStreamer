@@ -57,6 +57,14 @@ The AAC encoder runs in a module Worker so WebCodecs/WASM work and PCM conversio
 
 If the client page is hosted over HTTPS, `apiBase` should also be HTTPS/WSS-capable; otherwise browsers may block the WebSocket/fetch as mixed content. `rtspBase` is separate because AVPro/VRChat consumes that URL, not the browser.
 
+If your static host sets Content Security Policy, allow the client script and module Worker:
+
+```text
+Content-Security-Policy: default-src 'self'; script-src 'self'; worker-src 'self'; connect-src 'self' https: wss:; media-src 'self' blob:; object-src 'none'
+```
+
+For report-only testing, use the same value in `Content-Security-Policy-Report-Only`. A policy like `script-src 'none'` or missing `worker-src` can break `client.js`, `aac-worker.js`, or the WASM fallback import.
+
 ## Run Locally
 
 Terminal 1, backend:

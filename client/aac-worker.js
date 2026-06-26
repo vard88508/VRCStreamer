@@ -1,5 +1,3 @@
-import createAacModule from "./vendor/mediabunny-aac.js";
-
 let mode = "";
 let sampleRate = 48000;
 let channels = 2;
@@ -248,7 +246,7 @@ function closeNative() {
 
 async function ensureModule() {
   if (module) return module;
-  if (!modulePromise) modulePromise = createAacModule();
+  if (!modulePromise) modulePromise = import("./vendor/mediabunny-aac.js").then(mod => mod.default());
   module = await modulePromise;
   initEncoderFn = module.cwrap("init_encoder", "number", ["number", "number", "number"]);
   getEncoderFrameSizeFn = module.cwrap("get_encoder_frame_size", "number", ["number"]);
