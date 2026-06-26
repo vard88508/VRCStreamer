@@ -10,6 +10,7 @@ const gainEl = document.getElementById("gain");
 const forceMonoEl = document.getElementById("forceMono");
 const statusEl = document.getElementById("status");
 const statsEl = document.getElementById("stats");
+const copyUrlBtn = document.getElementById("copyUrl");
 const newLinkBtn = document.getElementById("newLink");
 const micBtn = document.getElementById("mic");
 const screenBtn = document.getElementById("screen");
@@ -222,16 +223,21 @@ function mediaUrl(hash) {
   return `${base}/${hash}`;
 }
 
+function setRtspUrl(value) {
+  rtspUrlEl.value = value;
+  copyUrlBtn.disabled = !value;
+}
+
 async function updateUrl() {
   const seq = ++urlSeq;
   const code = streamCode;
   if (!code) {
-    rtspUrlEl.value = "";
+    setRtspUrl("");
     return;
   }
   const hash = await streamHashHex(code);
   if (seq !== urlSeq) return;
-  rtspUrlEl.value = mediaUrl(hash);
+  setRtspUrl(mediaUrl(hash));
 }
 
 function currentGain() {
@@ -636,12 +642,11 @@ async function start(kind) {
       if (active && active.ws === ws) failActive("WebSocket error.");
     };
 
-    const vrcUrl = rtspUrlEl.value;
-    setStatus(`${encoderStatusLine(encoderInfo)}${browserThrottleWarning()}\nUse in VRChat: ${vrcUrl}`);
+    setStatus(`${encoderStatusLine(encoderInfo)}${browserThrottleWarning()}`);
     active.statusTimer = setInterval(() => {
       if (!active || active.ws !== ws) return;
       const stats = encoder.stats();
-      setStatus(`${encoderStatusLine(stats)}${browserThrottleWarning()}\nGain: ${currentGain().toFixed(2)}x\nEncoded AAC frames: ${stats.encodedFrames}\nEncoded fps: ${stats.encodedFps.toFixed(1)} / 46.9\nAAC kbps: ${stats.encodedKbps.toFixed(0)}\nEncoder queue: ${stats.queue}\nUse in VRChat: ${vrcUrl}`);
+      setStatus(`${encoderStatusLine(stats)}${browserThrottleWarning()}\nGain: ${currentGain().toFixed(2)}x\nEncoded AAC frames: ${stats.encodedFrames}\nEncoded fps: ${stats.encodedFps.toFixed(1)} / 46.9\nAAC kbps: ${stats.encodedKbps.toFixed(0)}\nEncoder queue: ${stats.queue}`);
     }, 1000);
   } catch (error) {
     if (encoder) encoder.close();
@@ -687,6 +692,27 @@ function cleanup() {
   current.audioContext.close();
 }
 
+async function copyUrl() {
+  const url = rtspUrlEl.value;
+  if (!url) return;
+
+  try {
+    if (!navigator.clipboard) throw new Error("Clipboard API is unavailable.");
+    await navigator.clipboard.writeText(url);
+  } catch (_) {
+    rtspUrlEl.focus();
+    rtspUrlEl.select();
+    document.execCommand("copy");
+    rtspUrlEl.setSelectionRange(rtspUrlEl.value.length, rtspUrlEl.value.length);
+  }
+
+  copyUrlBtn.textContent = "Copied";
+  setTimeout(() => {
+    copyUrlBtn.textContent = "Copy";
+  }, 800);
+}
+
+copyUrlBtn.onclick = copyUrl;
 newLinkBtn.onclick = () => {
   rotateCode();
   updateUrl();
