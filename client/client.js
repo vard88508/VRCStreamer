@@ -327,33 +327,68 @@ async function createCaptureNode(audioContext, onBlock) {
   return node;
 }
 
-async function supportedNativeAacConfig() {
-  if (!("AudioEncoder" in globalThis) || !("AudioData" in globalThis)) return null;
-  if (typeof AudioEncoder.isConfigSupported !== "function") return null;
+function errorText(error) {
+  if (!error) return "unknown error";
+  return error.message || String(error);
+}
 
-  const configs = [
-    {
+function limitText(text, maxLength = 220) {
+  const value = String(text || "");
+  return value.length <= maxLength ? value : value.slice(0, maxLength - 1) + "...";
+}
+
+function nativeAacConfigs() {
+  return [
+    ["raw AAC + CBR", {
+      codec: "mp4a.40.2",
+      sampleRate,
+      numberOfChannels: channels,
+      bitrate,
+      bitrateMode: "constant",
+      aac: { format: "aac" }
+    }],
+    ["raw AAC", {
+      codec: "mp4a.40.2",
+      sampleRate,
+      numberOfChannels: channels,
+      bitrate,
+      aac: { format: "aac" }
+    }],
+    ["default AAC + CBR", {
       codec: "mp4a.40.2",
       sampleRate,
       numberOfChannels: channels,
       bitrate,
       bitrateMode: "constant"
-    },
-    {
+    }],
+    ["default AAC", {
       codec: "mp4a.40.2",
       sampleRate,
       numberOfChannels: channels,
       bitrate
-    }
+    }]
   ];
+}
 
-  for (const config of configs) {
+async function supportedNativeAacConfig() {
+  if (!("AudioEncoder" in globalThis)) throw new Error("AudioEncoder is missing.");
+  if (!("AudioData" in globalThis)) throw new Error("AudioData is missing.");
+  if (typeof AudioEncoder.isConfigSupported !== "function") {
+    throw new Error("AudioEncoder.isConfigSupported is missing.");
+  }
+
+  const reasons = [];
+  for (const [label, config] of nativeAacConfigs()) {
     try {
       const support = await AudioEncoder.isConfigSupported(config);
-      if (support.supported) return support.config || config;
-    } catch (_) {}
+      if (support.supported) return { config: support.config || config, label };
+      reasons.push(`${label}: supported=false`);
+    } catch (error) {
+      reasons.push(`${label}: ${errorText(error)}`);
+    }
   }
-  return null;
+
+  throw new Error(`all AAC configs unsupported (${reasons.join("; ")})`);
 }
 
 function bytesToHex(bytes) {
@@ -397,13 +432,13 @@ async function probeNativeAacEncoder(config) {
     audioData.close();
     await encoder.flush();
   } finally {
-    encoder.close();
+    try { encoder.close(); } catch (_) {}
   }
 
   if (encoderError) throw encoderError;
   if (!firstPacket || firstPacket.byteLength < 4) throw new Error("Native AAC probe produced no packet.");
   if (firstPacket[0] === 0xff && (firstPacket[1] & 0xf6) === 0xf0) {
-    throw new Error("Native AAC encoder produced ADTS instead of raw access units.");
+    throw new Error("Native AAC encoder produced ADTS instead of raw AAC access units.");
   }
   if (configHex && !configHex.startsWith(expectedAacConfigHex)) {
     throw new Error(`Native AAC config ${configHex} does not match RTSP SDP ${expectedAacConfigHex}.`);
@@ -411,8 +446,7 @@ async function probeNativeAacEncoder(config) {
 }
 
 async function createNativeAacEncoder(onPacket, onError) {
-  const config = await supportedNativeAacConfig();
-  if (!config) throw new Error("Native AAC encoder is not supported.");
+  const { config, label } = await supportedNativeAacConfig();
   await probeNativeAacEncoder(config);
 
   let pcmBlocks = 0;
@@ -454,6 +488,7 @@ async function createNativeAacEncoder(onPacket, onError) {
 
   return {
     name: "Native WebCodecs AAC",
+    detail: label,
     encode(buffer) {
       pcmBlocks++;
       const frameCount = buffer.byteLength / Float32Array.BYTES_PER_ELEMENT / channels;
@@ -479,6 +514,8 @@ async function createNativeAacEncoder(onPacket, onError) {
         : Math.max((performance.now() - firstPacketAt) / 1000, 0.001);
       return {
         name: "Native WebCodecs AAC",
+        detail: label,
+        fallbackReason: "",
         pcmBlocks,
         encodedFrames,
         encodedBytes,
@@ -583,6 +620,8 @@ function createWorkerAacEncoder(onPacket, onError) {
         : Math.max((performance.now() - firstPacketAt) / 1000, 0.001);
       return {
         name: "WASM AAC",
+        detail: "",
+        fallbackReason: "",
         pcmBlocks,
         encodedFrames,
         encodedBytes,
@@ -597,15 +636,21 @@ function createWorkerAacEncoder(onPacket, onError) {
 function createAacEncoder(onPacket, onError) {
   let impl = null;
   let workerFallback = null;
+  let fallbackReason = "";
   const ready = createNativeAacEncoder(onPacket, onError)
     .then(nativeEncoder => {
       impl = nativeEncoder;
-      return { name: nativeEncoder.name };
+      return { name: nativeEncoder.name, detail: nativeEncoder.detail, fallbackReason: "" };
     })
-    .catch(() => {
+    .catch(error => {
+      fallbackReason = limitText(errorText(error));
       workerFallback = createWorkerAacEncoder(onPacket, onError);
       impl = workerFallback;
-      return workerFallback.ready.then(() => ({ name: "WASM AAC" }));
+      return workerFallback.ready.then(() => ({
+        name: "WASM AAC",
+        detail: "",
+        fallbackReason
+      }));
     });
 
   return {
@@ -630,12 +675,24 @@ function createAacEncoder(onPacket, onError) {
           encodedBytes: 0,
           encodedFps: 0,
           encodedKbps: 0,
-          queue: 0
+          queue: 0,
+          detail: "",
+          fallbackReason
         };
       }
-      return impl.stats();
+      const stats = impl.stats();
+      if (fallbackReason && !stats.fallbackReason) stats.fallbackReason = fallbackReason;
+      return stats;
     }
   };
+}
+
+function encoderStatusLine(info) {
+  let line = `Streaming ${info.name}`;
+  if (info.detail) line += ` (${info.detail})`;
+  line += ".";
+  if (info.fallbackReason) line += `\nNative AAC fallback: ${info.fallbackReason}`;
+  return line;
 }
 
 function setStreamingControls(streaming) {
@@ -741,11 +798,11 @@ async function start(kind) {
     };
 
     const vrcUrl = rtspUrlEl.value;
-    setStatus(`Streaming ${encoderInfo.name}.\nUse in VRChat: ${vrcUrl}`);
+    setStatus(`${encoderStatusLine(encoderInfo)}\nUse in VRChat: ${vrcUrl}`);
     active.statusTimer = setInterval(() => {
       if (!active || active.ws !== ws) return;
       const stats = encoder.stats();
-      setStatus(`Streaming ${stats.name}.\nGain: ${currentGain().toFixed(2)}x\nEncoded AAC frames: ${stats.encodedFrames}\nEncoded fps: ${stats.encodedFps.toFixed(1)} / 46.9\nAAC kbps: ${stats.encodedKbps.toFixed(0)}\nEncoder queue: ${stats.queue}\nUse in VRChat: ${vrcUrl}`);
+      setStatus(`${encoderStatusLine(stats)}\nGain: ${currentGain().toFixed(2)}x\nEncoded AAC frames: ${stats.encodedFrames}\nEncoded fps: ${stats.encodedFps.toFixed(1)} / 46.9\nAAC kbps: ${stats.encodedKbps.toFixed(0)}\nEncoder queue: ${stats.queue}\nUse in VRChat: ${vrcUrl}`);
     }, 1000);
   } catch (error) {
     if (encoder) encoder.close();

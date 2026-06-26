@@ -48,6 +48,8 @@ The browser uses `apiBase` for `/stats` and WebSocket `/ingest`. The generated V
 
 The client dropdown always also has `Custom`, where a user can enter custom API and RTSP addresses manually.
 
+During streaming, the status text shows whether the browser is using native WebCodecs AAC or the WASM fallback. Native AAC support is browser/platform dependent even when `AudioEncoder` exists; if native AAC is rejected, the client falls back to WASM and shows the exact reason.
+
 If the client page is hosted over HTTPS, `apiBase` should also be HTTPS/WSS-capable; otherwise browsers may block the WebSocket/fetch as mixed content. `rtspBase` is separate because AVPro/VRChat consumes that URL, not the browser.
 
 ## Run Locally
