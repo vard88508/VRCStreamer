@@ -22,6 +22,7 @@ const bitrate = 320000;
 const nativeAacBitrates = [320000, 256000, 192000, 160000, 128000, 96000];
 const expectedAacConfigHex = "1190";
 const wasmEncodeBatchFrames = 2;
+const monitorOutputGain = 0.0001;
 const fallbackServers = [
   { name: "Local 554", apiBase: "http://127.0.0.1:8081", rtspBase: "rtsp://127.0.0.1" },
   { name: "Local 8554", apiBase: "http://127.0.0.1:8081", rtspBase: "rtsp://127.0.0.1:8554" }
@@ -188,6 +189,37 @@ function currentGain() {
 
 function applyCaptureGain(node) {
   node.port.postMessage({ type: "gain", gain: currentGain() });
+}
+
+function browserThrottleWarning() {
+  return document.hidden ? "\nBrowser tab is hidden/minimized; Chrome may throttle realtime encoding." : "";
+}
+
+async function requestScreenWakeLock() {
+  if (!("wakeLock" in navigator)) return null;
+  try {
+    const wakeLock = await navigator.wakeLock.request("screen");
+    wakeLock.addEventListener("release", () => {
+      if (active && active.wakeLock === wakeLock) active.wakeLock = null;
+    });
+    return wakeLock;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function refreshScreenWakeLock() {
+  if (!active || document.visibilityState !== "visible") return;
+  if (active.wakeLock && !active.wakeLock.released) return;
+  const wakeLock = await requestScreenWakeLock();
+  if (active && wakeLock) active.wakeLock = wakeLock;
+}
+
+function setMediaSessionPlaying(playing) {
+  if (!("mediaSession" in navigator)) return;
+  try {
+    navigator.mediaSession.playbackState = playing ? "playing" : "none";
+  } catch (_) {}
 }
 
 function wsUrlForCode(code) {
@@ -793,8 +825,10 @@ async function start(kind) {
       encoder.encode(buffer);
     });
     applyCaptureGain(captureNode);
-    const muted = audioContext.createGain();
-    muted.gain.value = 0;
+    const monitor = audioContext.createGain();
+    monitor.gain.value = monitorOutputGain;
+    const wakeLock = await requestScreenWakeLock();
+    setMediaSessionPlaying(true);
 
     active = {
       mediaStream,
@@ -803,13 +837,14 @@ async function start(kind) {
       encoder,
       source,
       captureNode,
-      muted,
+      monitor,
+      wakeLock,
       statusTimer: null
     };
 
     source.connect(captureNode);
-    captureNode.connect(muted);
-    muted.connect(audioContext.destination);
+    captureNode.connect(monitor);
+    monitor.connect(audioContext.destination);
     await audioContext.resume();
 
     setStreamingControls(true);
@@ -825,11 +860,11 @@ async function start(kind) {
     };
 
     const vrcUrl = rtspUrlEl.value;
-    setStatus(`${encoderStatusLine(encoderInfo)}\nUse in VRChat: ${vrcUrl}`);
+    setStatus(`${encoderStatusLine(encoderInfo)}${browserThrottleWarning()}\nUse in VRChat: ${vrcUrl}`);
     active.statusTimer = setInterval(() => {
       if (!active || active.ws !== ws) return;
       const stats = encoder.stats();
-      setStatus(`${encoderStatusLine(stats)}\nGain: ${currentGain().toFixed(2)}x\nEncoded AAC frames: ${stats.encodedFrames}\nEncoded fps: ${stats.encodedFps.toFixed(1)} / 46.9\nAAC kbps: ${stats.encodedKbps.toFixed(0)}\nEncoder queue: ${stats.queue}\nUse in VRChat: ${vrcUrl}`);
+      setStatus(`${encoderStatusLine(stats)}${browserThrottleWarning()}\nGain: ${currentGain().toFixed(2)}x\nEncoded AAC frames: ${stats.encodedFrames}\nEncoded fps: ${stats.encodedFps.toFixed(1)} / 46.9\nAAC kbps: ${stats.encodedKbps.toFixed(0)}\nEncoder queue: ${stats.queue}\nUse in VRChat: ${vrcUrl}`);
     }, 1000);
   } catch (error) {
     if (encoder) encoder.close();
@@ -862,9 +897,13 @@ function cleanup() {
   if (current.statusTimer) clearInterval(current.statusTimer);
   try { current.captureNode.disconnect(); } catch (_) {}
   try { current.source.disconnect(); } catch (_) {}
-  try { current.muted.disconnect(); } catch (_) {}
+  try { current.monitor.disconnect(); } catch (_) {}
   current.mediaStream.getTracks().forEach(track => track.stop());
   current.encoder.close();
+  if (current.wakeLock) {
+    try { current.wakeLock.release(); } catch (_) {}
+  }
+  setMediaSessionPlaying(false);
   if (current.ws.readyState === WebSocket.OPEN || current.ws.readyState === WebSocket.CONNECTING) {
     current.ws.close(1000, "stop");
   }
@@ -895,6 +934,7 @@ customRtspEl.addEventListener("input", () => {
 gainEl.addEventListener("input", () => {
   if (active) applyCaptureGain(active.captureNode);
 });
+document.addEventListener("visibilitychange", refreshScreenWakeLock);
 
 async function init() {
   streamCode = loadCode();

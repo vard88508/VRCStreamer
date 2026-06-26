@@ -50,6 +50,8 @@ The client dropdown always also has `Custom`, where a user can enter custom API 
 
 During streaming, the status text shows whether the browser is using native WebCodecs AAC or the WASM fallback. Native AAC support is browser/platform dependent even when `AudioEncoder` exists; on Windows, Chromium may reject 320 kbps because the system AAC encoder supports a limited bitrate set. The client tries lower native bitrates before falling back to WASM 320 kbps and shows the exact reason when fallback is used.
 
+Keep the streaming tab visible for the most stable realtime output. Chromium can throttle or freeze hidden/minimized tabs at the browser's discretion. The client requests a screen wake lock and keeps a very quiet monitor output connected to reduce background throttling, but a web page cannot force realtime priority when fully minimized. For guaranteed background streaming, use a native desktop encoder instead of a browser page.
+
 If the client page is hosted over HTTPS, `apiBase` should also be HTTPS/WSS-capable; otherwise browsers may block the WebSocket/fetch as mixed content. `rtspBase` is separate because AVPro/VRChat consumes that URL, not the browser.
 
 ## Run Locally
