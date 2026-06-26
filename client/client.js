@@ -19,6 +19,7 @@ const sampleRate = 48000;
 const channels = 2;
 const framesPerChunk = 1024;
 const bitrate = 320000;
+const nativeAacBitrates = [320000, 256000, 192000, 160000, 128000, 96000];
 const expectedAacConfigHex = "1190";
 const wasmEncodeBatchFrames = 2;
 const fallbackServers = [
@@ -337,37 +338,45 @@ function limitText(text, maxLength = 220) {
   return value.length <= maxLength ? value : value.slice(0, maxLength - 1) + "...";
 }
 
+function kbps(value) {
+  return `${Math.round(value / 1000)} kbps`;
+}
+
 function nativeAacConfigs() {
-  return [
-    ["raw AAC + CBR", {
+  const configs = [];
+  for (const candidateBitrate of nativeAacBitrates) {
+    const base = {
       codec: "mp4a.40.2",
       sampleRate,
       numberOfChannels: channels,
-      bitrate,
-      bitrateMode: "constant",
-      aac: { format: "aac" }
-    }],
-    ["raw AAC", {
-      codec: "mp4a.40.2",
-      sampleRate,
-      numberOfChannels: channels,
-      bitrate,
-      aac: { format: "aac" }
-    }],
-    ["default AAC + CBR", {
-      codec: "mp4a.40.2",
-      sampleRate,
-      numberOfChannels: channels,
-      bitrate,
-      bitrateMode: "constant"
-    }],
-    ["default AAC", {
-      codec: "mp4a.40.2",
-      sampleRate,
-      numberOfChannels: channels,
-      bitrate
-    }]
-  ];
+      bitrate: candidateBitrate
+    };
+    configs.push([
+      `raw AAC + CBR ${kbps(candidateBitrate)}`,
+      { ...base, bitrateMode: "constant", aac: { format: "aac" } }
+    ]);
+    configs.push([
+      `raw AAC ${kbps(candidateBitrate)}`,
+      { ...base, aac: { format: "aac" } }
+    ]);
+    configs.push([
+      `default AAC + CBR ${kbps(candidateBitrate)}`,
+      { ...base, bitrateMode: "constant" }
+    ]);
+    configs.push([
+      `default AAC ${kbps(candidateBitrate)}`,
+      base
+    ]);
+  }
+  configs.push([
+    "raw AAC browser default bitrate",
+    { codec: "mp4a.40.2", sampleRate, numberOfChannels: channels, aac: { format: "aac" } }
+  ]);
+  configs.push([
+    "default AAC browser default bitrate",
+    { codec: "mp4a.40.2", sampleRate, numberOfChannels: channels }
+  ]);
+  return configs;
 }
 
 async function supportedNativeAacConfig() {
@@ -401,36 +410,54 @@ function copyEncodedChunk(chunk) {
   return packet;
 }
 
+function float32ToS16Buffer(buffer) {
+  const input = new Float32Array(buffer);
+  const output = new Int16Array(input.length);
+  for (let i = 0; i < input.length; i++) {
+    const sample = Math.max(-1, Math.min(1, input[i]));
+    output[i] = sample < 0 ? sample * 32768 : sample * 32767;
+  }
+  return output.buffer;
+}
+
 async function probeNativeAacEncoder(config) {
   let firstPacket = null;
   let configHex = "";
   let encoderError = null;
+  let finishProbe = null;
+  const probeDone = new Promise(resolve => { finishProbe = resolve; });
 
   const encoder = new AudioEncoder({
     output(chunk, metadata) {
       if (!firstPacket) firstPacket = copyEncodedChunk(chunk);
       const description = metadata && metadata.decoderConfig && metadata.decoderConfig.description;
       if (description && !configHex) configHex = bytesToHex(new Uint8Array(description));
+      finishProbe();
     },
     error(error) {
       encoderError = error;
+      finishProbe();
     }
   });
 
   try {
     encoder.configure(config);
-    const silence = new Float32Array(framesPerChunk * channels);
-    const audioData = new AudioData({
-      format: "f32",
-      sampleRate,
-      numberOfFrames: framesPerChunk,
-      numberOfChannels: channels,
-      timestamp: 0,
-      data: silence
-    });
-    encoder.encode(audioData);
-    audioData.close();
-    await encoder.flush();
+    for (let i = 0; i < 20 && !firstPacket && !encoderError; i++) {
+      const audioData = new AudioData({
+        format: "s16",
+        sampleRate,
+        numberOfFrames: framesPerChunk,
+        numberOfChannels: channels,
+        timestamp: Math.round(i * framesPerChunk * 1000000 / sampleRate),
+        data: new Int16Array(framesPerChunk * channels).buffer
+      });
+      encoder.encode(audioData);
+      audioData.close();
+    }
+    await Promise.race([
+      probeDone,
+      new Promise(resolve => setTimeout(resolve, 1500))
+    ]);
   } finally {
     try { encoder.close(); } catch (_) {}
   }
@@ -493,12 +520,12 @@ async function createNativeAacEncoder(onPacket, onError) {
       pcmBlocks++;
       const frameCount = buffer.byteLength / Float32Array.BYTES_PER_ELEMENT / channels;
       const audioData = new AudioData({
-        format: "f32",
+        format: "s16",
         sampleRate,
         numberOfFrames: frameCount,
         numberOfChannels: channels,
         timestamp: nextTimestampUs,
-        data: buffer
+        data: float32ToS16Buffer(buffer)
       });
       nextTimestampUs += Math.round(frameCount * 1000000 / sampleRate);
       encoder.encode(audioData);

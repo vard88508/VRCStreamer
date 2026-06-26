@@ -14,7 +14,7 @@ The Rust server intentionally does not host the client. Deploy the client and se
 ## Architecture
 
 1. Browser captures 48 kHz stereo audio with `AudioWorklet`.
-2. Browser encodes AAC-LC 320 kbps with native WebCodecs AAC when available, otherwise with the vendored WASM encoder in a module Worker.
+2. Browser encodes AAC-LC with native WebCodecs AAC when available, otherwise with the vendored WASM encoder in a module Worker. The WASM path targets 320 kbps; the native path tries 320 kbps first and may choose a lower browser-supported AAC bitrate such as 192 kbps on Windows.
 3. Browser sends raw AAC access units over WebSocket to `GET /ingest?code=...`.
 4. Server validates and relays those raw AAC frames as RTSP/RTP `mpeg4-generic`.
 
@@ -26,7 +26,7 @@ Output stream shape:
 - Codec: AAC-LC
 - Sample rate: 48000 Hz
 - Channels: stereo
-- Bitrate: 320 kbps target
+- Bitrate: 320 kbps target for WASM; native WebCodecs may use a lower browser-supported AAC bitrate
 - RTP payload: `mpeg4-generic`, payload type `96`, `trackID=0`
 - SDP config: `1190`
 
@@ -48,7 +48,7 @@ The browser uses `apiBase` for `/stats` and WebSocket `/ingest`. The generated V
 
 The client dropdown always also has `Custom`, where a user can enter custom API and RTSP addresses manually.
 
-During streaming, the status text shows whether the browser is using native WebCodecs AAC or the WASM fallback. Native AAC support is browser/platform dependent even when `AudioEncoder` exists; if native AAC is rejected, the client falls back to WASM and shows the exact reason.
+During streaming, the status text shows whether the browser is using native WebCodecs AAC or the WASM fallback. Native AAC support is browser/platform dependent even when `AudioEncoder` exists; on Windows, Chromium may reject 320 kbps because the system AAC encoder supports a limited bitrate set. The client tries lower native bitrates before falling back to WASM 320 kbps and shows the exact reason when fallback is used.
 
 If the client page is hosted over HTTPS, `apiBase` should also be HTTPS/WSS-capable; otherwise browsers may block the WebSocket/fetch as mixed content. `rtspBase` is separate because AVPro/VRChat consumes that URL, not the browser.
 
