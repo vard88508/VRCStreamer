@@ -15,7 +15,7 @@ The Rust server intentionally does not host the client. Deploy the client and se
 
 1. Browser captures 48 kHz stereo audio with `AudioWorklet`.
 2. The main page transfers PCM blocks to `client/aac-worker.js`.
-3. The Worker encodes AAC-LC with native WebCodecs AAC when available, otherwise with the vendored WASM encoder. The WASM path targets 320 kbps; the native path tries 320 kbps first and may choose a lower browser-supported AAC bitrate such as 192 kbps on Windows.
+3. The Worker encodes AAC-LC using the selected encoder mode: native WebCodecs AAC at 192 kbps, or the vendored WASM AAC encoder at 320 kbps.
 4. Browser sends raw AAC access units over WebSocket to `GET /ingest?code=...`.
 5. Server validates and relays those raw AAC frames as RTSP/RTP `mpeg4-generic`.
 
@@ -27,7 +27,7 @@ Output stream shape:
 - Codec: AAC-LC
 - Sample rate: 48000 Hz
 - Channels: stereo
-- Bitrate: 320 kbps target for WASM; native WebCodecs may use a lower browser-supported AAC bitrate
+- Bitrate: 192 kbps in native mode, 320 kbps in WASM mode
 - RTP payload: `mpeg4-generic`, payload type `96`, `trackID=0`
 - SDP config: `1190`
 
@@ -49,7 +49,14 @@ The browser uses `apiBase` for `/stats` and WebSocket `/ingest`. The generated V
 
 The client dropdown always also has `Custom`, where a user can enter custom API and RTSP addresses manually.
 
-During streaming, the status text shows whether the browser is using native WebCodecs AAC or the WASM fallback. Native AAC support is browser/platform dependent even when `AudioEncoder` exists; on Windows, Chromium may reject 320 kbps because the system AAC encoder supports a limited bitrate set. The client tries lower native bitrates before falling back to WASM 320 kbps and shows the exact reason when fallback is used.
+During streaming, the status text shows whether the browser is using native WebCodecs AAC or the WASM encoder. Native AAC support is browser/platform dependent even when `AudioEncoder` exists; on Windows, Chromium may reject 320 kbps because the system AAC encoder supports a limited bitrate set.
+
+The client has an encoder dropdown:
+
+- `Native AAC 192 kbps` - uses WebCodecs native AAC at 192 kbps only. If native 192 kbps is unavailable, streaming fails instead of silently switching encoder.
+- `WASM AAC 320 kbps` - skips native WebCodecs and uses the vendored WASM AAC encoder at 320 kbps.
+
+The selected encoder mode is saved in browser `localStorage`.
 
 Keep the streaming tab visible for the most stable realtime output. Chromium can throttle or freeze hidden/minimized tabs at the browser's discretion. The client requests a screen wake lock and keeps a very quiet monitor output connected to reduce background throttling, but a web page cannot force realtime priority when fully minimized. For guaranteed background streaming, use a native desktop encoder instead of a browser page.
 

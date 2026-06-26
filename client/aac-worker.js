@@ -72,14 +72,16 @@ function nativeAacConfigs() {
       base
     ]);
   }
-  configs.push([
-    "raw AAC browser default bitrate",
-    { codec: "mp4a.40.2", sampleRate, numberOfChannels: channels, aac: { format: "aac" } }
-  ]);
-  configs.push([
-    "default AAC browser default bitrate",
-    { codec: "mp4a.40.2", sampleRate, numberOfChannels: channels }
-  ]);
+  if (nativeAacBitrates.length === 0) {
+    configs.push([
+      "raw AAC browser default bitrate",
+      { codec: "mp4a.40.2", sampleRate, numberOfChannels: channels, aac: { format: "aac" } }
+    ]);
+    configs.push([
+      "default AAC browser default bitrate",
+      { codec: "mp4a.40.2", sampleRate, numberOfChannels: channels }
+    ]);
+  }
   return configs;
 }
 
@@ -297,7 +299,7 @@ async function initWasm(fallbackReason) {
   self.postMessage({
     type: "ready",
     name: "WASM AAC",
-    detail: "",
+    detail: kbps(bitrate),
     fallbackReason,
     configHex
   });
@@ -347,10 +349,15 @@ async function init(message) {
   expectedAacConfigHex = message.expectedAacConfigHex || expectedAacConfigHex;
   nativeAacBitrates = message.nativeAacBitrates || nativeAacBitrates;
 
+  if (message.preferNative === false) {
+    await initWasm("");
+    return;
+  }
+
   try {
-    if (message.preferNative === false) throw new Error("Native AAC disabled.");
     await initNative();
   } catch (error) {
+    if (message.allowWasmFallback === false) throw error;
     const fallbackReason = limitText(errorText(error));
     closeNative();
     await initWasm(fallbackReason);

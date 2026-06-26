@@ -13,6 +13,11 @@
 <label>RTSP URL <input id="rtspUrl" size="100" readonly></label>
 <button id="newLink" type="button">New link</button>
 <br>
+<label>Encoder <select id="encoderMode">
+  <option value="native192">Native AAC 192 kbps</option>
+  <option value="wasm320">WASM AAC 320 kbps</option>
+</select></label>
+<br>
 <label>Gain <input id="gain" type="number" min="0.25" max="4" step="0.25" value="1.5"></label>
 <br>
 <button id="mic" type="button">Stream microphone</button>

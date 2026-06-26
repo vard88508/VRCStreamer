@@ -3,6 +3,7 @@ const customServerEl = document.getElementById("customServer");
 const customApiEl = document.getElementById("customApi");
 const customRtspEl = document.getElementById("customRtsp");
 const rtspUrlEl = document.getElementById("rtspUrl");
+const encoderModeEl = document.getElementById("encoderMode");
 const gainEl = document.getElementById("gain");
 const statusEl = document.getElementById("status");
 const statsEl = document.getElementById("stats");
@@ -15,11 +16,12 @@ const codeStorageKey = "vrc-audio-streamer-code";
 const serverStorageKey = "vrc-audio-streamer-server";
 const customApiStorageKey = "vrc-audio-streamer-custom-api";
 const customRtspStorageKey = "vrc-audio-streamer-custom-rtsp";
+const encoderModeStorageKey = "vrc-audio-streamer-encoder-mode";
 const sampleRate = 48000;
 const channels = 2;
 const framesPerChunk = 1024;
 const bitrate = 320000;
-const nativeAacBitrates = [320000, 256000, 192000, 160000, 128000, 96000];
+const native192Bitrates = [192000];
 const expectedAacConfigHex = "1190";
 const monitorOutputGain = 0.0001;
 const fallbackServers = [
@@ -31,6 +33,21 @@ let urlSeq = 0;
 let active = null;
 let streamCode = "";
 let servers = fallbackServers;
+
+const encoderModes = {
+  native192: {
+    bitrate: 192000,
+    nativeAacBitrates: native192Bitrates,
+    preferNative: true,
+    allowWasmFallback: false
+  },
+  wasm320: {
+    bitrate,
+    nativeAacBitrates: [],
+    preferNative: false,
+    allowWasmFallback: true
+  }
+};
 
 function setStatus(text) {
   statusEl.textContent = text;
@@ -129,6 +146,17 @@ function renderServers() {
     customRtspEl.value = "rtsp://127.0.0.1";
   }
   updateCustomVisibility();
+}
+
+function loadEncoderMode() {
+  let saved = "native192";
+  try { saved = localStorage.getItem(encoderModeStorageKey) || saved; } catch (_) {}
+  if (!encoderModes[saved]) saved = "native192";
+  encoderModeEl.value = saved;
+}
+
+function selectedEncoderMode() {
+  return encoderModes[encoderModeEl.value] || encoderModes.native192;
 }
 
 function updateCustomVisibility() {
@@ -362,6 +390,7 @@ async function createCaptureNode(audioContext, onBlock) {
 
 function createAacEncoder(onPacket, onError) {
   const worker = new Worker(new URL("aac-worker.js", location.href), { type: "module" });
+  const encoderMode = selectedEncoderMode();
   let readySettled = false;
   let pcmBlocks = 0;
   let encodedFrames = 0;
@@ -406,9 +435,11 @@ function createAacEncoder(onPacket, onError) {
       type: "init",
       sampleRate,
       channels,
-      bitrate,
+      bitrate: encoderMode.bitrate,
       expectedAacConfigHex,
-      nativeAacBitrates
+      nativeAacBitrates: encoderMode.nativeAacBitrates,
+      preferNative: encoderMode.preferNative,
+      allowWasmFallback: encoderMode.allowWasmFallback
     });
   });
 
@@ -458,6 +489,7 @@ function setStreamingControls(streaming) {
   stopBtn.disabled = !streaming;
   newLinkBtn.disabled = streaming;
   serverSelectEl.disabled = streaming;
+  encoderModeEl.disabled = streaming;
   updateCustomVisibility();
 }
 
@@ -626,6 +658,9 @@ serverSelectEl.onchange = () => {
   updateUrl();
   refreshStats();
 };
+encoderModeEl.onchange = () => {
+  try { localStorage.setItem(encoderModeStorageKey, encoderModeEl.value); } catch (_) {}
+};
 customApiEl.addEventListener("input", () => {
   try { localStorage.setItem(customApiStorageKey, customApiEl.value); } catch (_) {}
   refreshStats();
@@ -643,6 +678,7 @@ async function init() {
   streamCode = loadCode();
   await loadServers();
   renderServers();
+  loadEncoderMode();
   updateUrl();
   refreshStats();
   setInterval(refreshStats, 2000);
