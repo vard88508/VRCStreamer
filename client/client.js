@@ -20,6 +20,7 @@ const channels = 2;
 const framesPerChunk = 1024;
 const bitrate = 320000;
 const expectedAacConfigHex = "1190";
+const wasmEncodeBatchFrames = 2;
 const fallbackServers = [
   { name: "Local 554", apiBase: "http://127.0.0.1:8081", rtspBase: "rtsp://127.0.0.1" },
   { name: "Local 8554", apiBase: "http://127.0.0.1:8081", rtspBase: "rtsp://127.0.0.1:8554" }
@@ -326,13 +327,182 @@ async function createCaptureNode(audioContext, onBlock) {
   return node;
 }
 
-function createAacEncoder(onPacket, onError) {
+async function supportedNativeAacConfig() {
+  if (!("AudioEncoder" in globalThis) || !("AudioData" in globalThis)) return null;
+  if (typeof AudioEncoder.isConfigSupported !== "function") return null;
+
+  const configs = [
+    {
+      codec: "mp4a.40.2",
+      sampleRate,
+      numberOfChannels: channels,
+      bitrate,
+      bitrateMode: "constant"
+    },
+    {
+      codec: "mp4a.40.2",
+      sampleRate,
+      numberOfChannels: channels,
+      bitrate
+    }
+  ];
+
+  for (const config of configs) {
+    try {
+      const support = await AudioEncoder.isConfigSupported(config);
+      if (support.supported) return support.config || config;
+    } catch (_) {}
+  }
+  return null;
+}
+
+function bytesToHex(bytes) {
+  return Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function copyEncodedChunk(chunk) {
+  const packet = new Uint8Array(chunk.byteLength);
+  chunk.copyTo(packet);
+  return packet;
+}
+
+async function probeNativeAacEncoder(config) {
+  let firstPacket = null;
+  let configHex = "";
+  let encoderError = null;
+
+  const encoder = new AudioEncoder({
+    output(chunk, metadata) {
+      if (!firstPacket) firstPacket = copyEncodedChunk(chunk);
+      const description = metadata && metadata.decoderConfig && metadata.decoderConfig.description;
+      if (description && !configHex) configHex = bytesToHex(new Uint8Array(description));
+    },
+    error(error) {
+      encoderError = error;
+    }
+  });
+
+  try {
+    encoder.configure(config);
+    const silence = new Float32Array(framesPerChunk * channels);
+    const audioData = new AudioData({
+      format: "f32",
+      sampleRate,
+      numberOfFrames: framesPerChunk,
+      numberOfChannels: channels,
+      timestamp: 0,
+      data: silence
+    });
+    encoder.encode(audioData);
+    audioData.close();
+    await encoder.flush();
+  } finally {
+    encoder.close();
+  }
+
+  if (encoderError) throw encoderError;
+  if (!firstPacket || firstPacket.byteLength < 4) throw new Error("Native AAC probe produced no packet.");
+  if (firstPacket[0] === 0xff && (firstPacket[1] & 0xf6) === 0xf0) {
+    throw new Error("Native AAC encoder produced ADTS instead of raw access units.");
+  }
+  if (configHex && !configHex.startsWith(expectedAacConfigHex)) {
+    throw new Error(`Native AAC config ${configHex} does not match RTSP SDP ${expectedAacConfigHex}.`);
+  }
+}
+
+async function createNativeAacEncoder(onPacket, onError) {
+  const config = await supportedNativeAacConfig();
+  if (!config) throw new Error("Native AAC encoder is not supported.");
+  await probeNativeAacEncoder(config);
+
+  let pcmBlocks = 0;
+  let encodedFrames = 0;
+  let encodedBytes = 0;
+  let firstPacketAt = 0;
+  let nextTimestampUs = 0;
+  let closed = false;
+
+  const encoder = new AudioEncoder({
+    output(chunk, metadata) {
+      if (closed) return;
+      const description = metadata && metadata.decoderConfig && metadata.decoderConfig.description;
+      if (description) {
+        const configHex = bytesToHex(new Uint8Array(description));
+        if (!configHex.startsWith(expectedAacConfigHex)) {
+          onError(new Error(`Native AAC config ${configHex} does not match RTSP SDP ${expectedAacConfigHex}.`));
+          return;
+        }
+      }
+
+      const packet = copyEncodedChunk(chunk);
+      if (packet[0] === 0xff && (packet[1] & 0xf6) === 0xf0) {
+        onError(new Error("Native AAC encoder produced ADTS instead of raw access units."));
+        return;
+      }
+
+      if (firstPacketAt === 0) firstPacketAt = performance.now();
+      encodedFrames++;
+      encodedBytes += packet.byteLength;
+      onPacket(packet.buffer);
+    },
+    error(error) {
+      if (!closed) onError(error);
+    }
+  });
+
+  encoder.configure(config);
+
+  return {
+    name: "Native WebCodecs AAC",
+    encode(buffer) {
+      pcmBlocks++;
+      const frameCount = buffer.byteLength / Float32Array.BYTES_PER_ELEMENT / channels;
+      const audioData = new AudioData({
+        format: "f32",
+        sampleRate,
+        numberOfFrames: frameCount,
+        numberOfChannels: channels,
+        timestamp: nextTimestampUs,
+        data: buffer
+      });
+      nextTimestampUs += Math.round(frameCount * 1000000 / sampleRate);
+      encoder.encode(audioData);
+      audioData.close();
+    },
+    close() {
+      closed = true;
+      try { encoder.close(); } catch (_) {}
+    },
+    stats() {
+      const elapsed = firstPacketAt === 0
+        ? 0.001
+        : Math.max((performance.now() - firstPacketAt) / 1000, 0.001);
+      return {
+        name: "Native WebCodecs AAC",
+        pcmBlocks,
+        encodedFrames,
+        encodedBytes,
+        encodedFps: encodedFrames / elapsed,
+        encodedKbps: (encodedBytes * 8 / 1000) / elapsed,
+        queue: encoder.encodeQueueSize || 0
+      };
+    }
+  };
+}
+
+function createWorkerAacEncoder(onPacket, onError) {
   const worker = new Worker(new URL("aac-worker.js", location.href), { type: "module" });
   let readySettled = false;
   let pcmBlocks = 0;
   let encodedFrames = 0;
   let encodedBytes = 0;
   let firstPacketAt = 0;
+  let pendingBatch = null;
+  let pendingBatchFrames = 0;
+
+  function sendBatch(buffer) {
+    worker.postMessage({ type: "encode", pcm: buffer }, [buffer]);
+  }
 
   const ready = new Promise((resolve, reject) => {
     worker.onmessage = event => {
@@ -374,9 +544,36 @@ function createAacEncoder(onPacket, onError) {
     ready,
     encode(buffer) {
       pcmBlocks++;
-      worker.postMessage({ type: "encode", pcm: buffer }, [buffer]);
+      if (wasmEncodeBatchFrames <= 1) {
+        sendBatch(buffer);
+        return;
+      }
+
+      if (!pendingBatch) {
+        pendingBatch = buffer;
+        pendingBatchFrames = 1;
+        return;
+      }
+
+      const joined = new Uint8Array(pendingBatch.byteLength + buffer.byteLength);
+      joined.set(new Uint8Array(pendingBatch), 0);
+      joined.set(new Uint8Array(buffer), pendingBatch.byteLength);
+      pendingBatch = joined.buffer;
+      pendingBatchFrames++;
+
+      if (pendingBatchFrames >= wasmEncodeBatchFrames) {
+        const batch = pendingBatch;
+        pendingBatch = null;
+        pendingBatchFrames = 0;
+        sendBatch(batch);
+      }
     },
     close() {
+      if (pendingBatch) {
+        sendBatch(pendingBatch);
+        pendingBatch = null;
+        pendingBatchFrames = 0;
+      }
       try { worker.postMessage({ type: "close" }); } catch (_) {}
       worker.terminate();
     },
@@ -385,12 +582,58 @@ function createAacEncoder(onPacket, onError) {
         ? 0.001
         : Math.max((performance.now() - firstPacketAt) / 1000, 0.001);
       return {
+        name: "WASM AAC",
         pcmBlocks,
         encodedFrames,
         encodedBytes,
         encodedFps: encodedFrames / elapsed,
-        encodedKbps: (encodedBytes * 8 / 1000) / elapsed
+        encodedKbps: (encodedBytes * 8 / 1000) / elapsed,
+        queue: pcmBlocks - encodedFrames
       };
+    }
+  };
+}
+
+function createAacEncoder(onPacket, onError) {
+  let impl = null;
+  let workerFallback = null;
+  const ready = createNativeAacEncoder(onPacket, onError)
+    .then(nativeEncoder => {
+      impl = nativeEncoder;
+      return { name: nativeEncoder.name };
+    })
+    .catch(() => {
+      workerFallback = createWorkerAacEncoder(onPacket, onError);
+      impl = workerFallback;
+      return workerFallback.ready.then(() => ({ name: "WASM AAC" }));
+    });
+
+  return {
+    ready,
+    encode(buffer) {
+      if (!impl) {
+        onError(new Error("AAC encoder is not ready."));
+        return;
+      }
+      impl.encode(buffer);
+    },
+    close() {
+      if (impl) impl.close();
+      else if (workerFallback) workerFallback.close();
+    },
+    stats() {
+      if (!impl) {
+        return {
+          name: "Loading AAC",
+          pcmBlocks: 0,
+          encodedFrames: 0,
+          encodedBytes: 0,
+          encodedFps: 0,
+          encodedKbps: 0,
+          queue: 0
+        };
+      }
+      return impl.stats();
     }
   };
 }
@@ -432,7 +675,7 @@ async function start(kind) {
         if (active && active.encoder === encoder) failActive(error.message || String(error));
       }
     );
-    await encoder.ready;
+    const encoderInfo = await encoder.ready;
 
     setStatus(kind === "screen"
       ? "Choose a screen/tab and enable audio sharing in the browser prompt..."
@@ -498,11 +741,11 @@ async function start(kind) {
     };
 
     const vrcUrl = rtspUrlEl.value;
-    setStatus(`Streaming browser-encoded AAC.\nUse in VRChat: ${vrcUrl}`);
+    setStatus(`Streaming ${encoderInfo.name}.\nUse in VRChat: ${vrcUrl}`);
     active.statusTimer = setInterval(() => {
       if (!active || active.ws !== ws) return;
       const stats = encoder.stats();
-      setStatus(`Streaming browser-encoded AAC.\nGain: ${currentGain().toFixed(2)}x\nEncoded AAC frames: ${stats.encodedFrames}\nEncoded fps: ${stats.encodedFps.toFixed(1)} / 46.9\nAAC kbps: ${stats.encodedKbps.toFixed(0)}\nUse in VRChat: ${vrcUrl}`);
+      setStatus(`Streaming ${stats.name}.\nGain: ${currentGain().toFixed(2)}x\nEncoded AAC frames: ${stats.encodedFrames}\nEncoded fps: ${stats.encodedFps.toFixed(1)} / 46.9\nAAC kbps: ${stats.encodedKbps.toFixed(0)}\nEncoder queue: ${stats.queue}\nUse in VRChat: ${vrcUrl}`);
     }, 1000);
   } catch (error) {
     if (encoder) encoder.close();

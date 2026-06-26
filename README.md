@@ -14,7 +14,7 @@ The Rust server intentionally does not host the client. Deploy the client and se
 ## Architecture
 
 1. Browser captures 48 kHz stereo audio with `AudioWorklet`.
-2. Browser encodes AAC-LC 320 kbps in a module Worker using the vendored WASM encoder.
+2. Browser encodes AAC-LC 320 kbps with native WebCodecs AAC when available, otherwise with the vendored WASM encoder in a module Worker.
 3. Browser sends raw AAC access units over WebSocket to `GET /ingest?code=...`.
 4. Server validates and relays those raw AAC frames as RTSP/RTP `mpeg4-generic`.
 
@@ -256,6 +256,6 @@ If `TLS_CERT_PATH` and `TLS_KEY_PATH` are not set, the API runs as plain HTTP/WS
 
 ## Vendored WASM
 
-`client/vendor/mediabunny-aac.js` is the AAC encoder build from `@mediabunny/aac-encoder`, transformed from CommonJS to a browser ESM default export so it can be loaded by `client/aac-worker.js` without a bundler.
+`client/vendor/mediabunny-aac.js` is the fallback AAC encoder build from `@mediabunny/aac-encoder`, transformed from CommonJS to a browser ESM default export so it can be loaded by `client/aac-worker.js` without a bundler.
 
 The vendored encoder is MPL-2.0 licensed; the license text is included at `client/vendor/mediabunny-aac.LICENSE.txt`.

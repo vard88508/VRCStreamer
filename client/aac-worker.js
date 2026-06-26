@@ -4,7 +4,9 @@ let modulePromise = null;
 let module = null;
 let ctx = 0;
 let frameSize = 0;
+let inputBytesPerFrame = 0;
 let nextTimestamp = 0;
+let inputChannels = 0;
 let initEncoderFn = null;
 let getEncoderFrameSizeFn = null;
 let getEncoderExtradataFn = null;
@@ -59,6 +61,8 @@ async function init({ sampleRate, channels, bitrate }) {
   if (ctx === 0) throw new Error("Failed to initialize AAC encoder.");
 
   frameSize = getEncoderFrameSizeFn(ctx);
+  inputChannels = channels;
+  inputBytesPerFrame = frameSize * inputChannels * Float32Array.BYTES_PER_ELEMENT;
   nextTimestamp = 0;
   const extradataPtr = getEncoderExtradataFn(ctx);
   const extradataSize = getEncoderExtradataSizeFn(ctx);
@@ -70,21 +74,30 @@ function encode(pcm) {
   if (!ctx) throw new Error("AAC encoder is not initialized.");
 
   const bytes = new Uint8Array(pcm);
-  const inputPtr = getEncodeInputPtrFn(ctx, bytes.byteLength);
-  if (inputPtr === 0) throw new Error("Failed to allocate AAC input buffer.");
+  if (bytes.byteLength % inputBytesPerFrame !== 0) {
+    throw new Error("PCM buffer does not contain whole AAC frames.");
+  }
 
-  module.HEAPU8.set(bytes, inputPtr);
-  const ret = sendFrameFn(ctx, BigInt(nextTimestamp));
-  if (ret < 0) throw new Error(`AAC encode failed with code ${ret}.`);
+  for (let offset = 0; offset < bytes.byteLength; offset += inputBytesPerFrame) {
+    const inputPtr = getEncodeInputPtrFn(ctx, inputBytesPerFrame);
+    if (inputPtr === 0) throw new Error("Failed to allocate AAC input buffer.");
 
-  nextTimestamp += frameSize;
-  drainPackets();
+    module.HEAPU8.set(bytes.subarray(offset, offset + inputBytesPerFrame), inputPtr);
+    const ret = sendFrameFn(ctx, BigInt(nextTimestamp));
+    if (ret < 0) throw new Error(`AAC encode failed with code ${ret}.`);
+
+    nextTimestamp += frameSize;
+    drainPackets();
+  }
 }
 
 function close() {
   if (!ctx || !closeEncoderFn) return;
   closeEncoderFn(ctx);
   ctx = 0;
+  frameSize = 0;
+  inputBytesPerFrame = 0;
+  inputChannels = 0;
 }
 
 self.onmessage = event => {
