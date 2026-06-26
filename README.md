@@ -14,9 +14,10 @@ The Rust server intentionally does not host the client. Deploy the client and se
 ## Architecture
 
 1. Browser captures 48 kHz stereo audio with `AudioWorklet`.
-2. Browser encodes AAC-LC with native WebCodecs AAC when available, otherwise with the vendored WASM encoder in a module Worker. The WASM path targets 320 kbps; the native path tries 320 kbps first and may choose a lower browser-supported AAC bitrate such as 192 kbps on Windows.
-3. Browser sends raw AAC access units over WebSocket to `GET /ingest?code=...`.
-4. Server validates and relays those raw AAC frames as RTSP/RTP `mpeg4-generic`.
+2. The main page transfers PCM blocks to `client/aac-worker.js`.
+3. The Worker encodes AAC-LC with native WebCodecs AAC when available, otherwise with the vendored WASM encoder. The WASM path targets 320 kbps; the native path tries 320 kbps first and may choose a lower browser-supported AAC bitrate such as 192 kbps on Windows.
+4. Browser sends raw AAC access units over WebSocket to `GET /ingest?code=...`.
+5. Server validates and relays those raw AAC frames as RTSP/RTP `mpeg4-generic`.
 
 The server does not run `ffmpeg`, does not transcode, and does not store stream links. The hidden code and stream URL are derived with `SHA-256(code)` on both client and server.
 
@@ -51,6 +52,8 @@ The client dropdown always also has `Custom`, where a user can enter custom API 
 During streaming, the status text shows whether the browser is using native WebCodecs AAC or the WASM fallback. Native AAC support is browser/platform dependent even when `AudioEncoder` exists; on Windows, Chromium may reject 320 kbps because the system AAC encoder supports a limited bitrate set. The client tries lower native bitrates before falling back to WASM 320 kbps and shows the exact reason when fallback is used.
 
 Keep the streaming tab visible for the most stable realtime output. Chromium can throttle or freeze hidden/minimized tabs at the browser's discretion. The client requests a screen wake lock and keeps a very quiet monitor output connected to reduce background throttling, but a web page cannot force realtime priority when fully minimized. For guaranteed background streaming, use a native desktop encoder instead of a browser page.
+
+The AAC encoder runs in a module Worker so WebCodecs/WASM work and PCM conversion stay off the page's main thread.
 
 If the client page is hosted over HTTPS, `apiBase` should also be HTTPS/WSS-capable; otherwise browsers may block the WebSocket/fetch as mixed content. `rtspBase` is separate because AVPro/VRChat consumes that URL, not the browser.
 
