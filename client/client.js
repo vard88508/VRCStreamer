@@ -236,7 +236,7 @@ async function updateUrl() {
 
 function currentGain() {
   const value = Number(gainEl.value);
-  if (!Number.isFinite(value)) return 1.5;
+  if (!Number.isFinite(value)) return 1;
   return Math.min(4, Math.max(0.25, value));
 }
 
@@ -349,12 +349,12 @@ class CaptureProcessor extends AudioWorkletProcessor {
     this.channels = ${channels};
     this.pcm = new Float32Array(this.frames * this.channels);
     this.offset = 0;
-    this.gain = 1.5;
+    this.gain = 1;
     this.forceMono = false;
     this.port.onmessage = event => {
       if (event.data && event.data.type === "settings") {
         const gain = Number(event.data.gain);
-        this.gain = Number.isFinite(gain) ? Math.min(4, Math.max(0.25, gain)) : 1.5;
+        this.gain = Number.isFinite(gain) ? Math.min(4, Math.max(0.25, gain)) : 1;
         this.forceMono = Boolean(event.data.forceMono);
       }
     };
