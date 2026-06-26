@@ -48,7 +48,6 @@ const AAC_FRAME_DURATION: Duration =
 const AAC_MAX_ACCESS_UNIT_BYTES: usize = 4 * 1024;
 const RTSP_PREBUFFER_FRAMES: usize = 12;
 const RTSP_MAX_BUFFER_FRAMES: usize = 96;
-const RTSP_LOW_WATER_FRAMES: usize = 4;
 const RTSP_MAX_LINE_BYTES: usize = 4096;
 const RTSP_MAX_HEADERS: usize = 64;
 const RTSP_MAX_BODY_BYTES: usize = 4096;
@@ -864,21 +863,10 @@ async fn rtsp_rtp_task(
             }
             _ = &mut sleep, if started => {
                 let frame = if let Some(frame) = buffer.pop_front() {
-                    if buffer.len() < RTSP_LOW_WATER_FRAMES && packets.is_multiple_of(50) {
-                        warn!(
-                            %addr,
-                            %key,
-                            queued_frames = buffer.len(),
-                            "rtsp rtp buffer low"
-                        );
-                    }
                     frame
                 } else {
                     underruns += 1;
                     silence_packets += 1;
-                    if underruns <= 5 || underruns.is_multiple_of(50) {
-                        warn!(%addr, %key, underruns, "rtsp rtp underrun; sending aac silence");
-                    }
                     Bytes::from_static(AAC_SILENCE_ACCESS_UNIT)
                 };
 
