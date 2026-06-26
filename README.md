@@ -1,5 +1,4 @@
-# VRCStreamer Server
-
+# VRCStreamer
 Minimal Rust WebSocket-to-RTSP audio server for VRChat.
 
 This install guide has only been checked on Debian 13 with the root user.
