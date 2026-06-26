@@ -77,6 +77,7 @@ struct Config {
     max_ingest_bytes_per_sec: usize,
     channel_buffer: usize,
     publisher_idle_timeout: Duration,
+    publish_passwords: Vec<String>,
     allow_any_origin: bool,
     allowed_origins: Vec<String>,
 }
@@ -128,6 +129,7 @@ impl IpLimitEntry {
 #[derive(Deserialize)]
 struct IngestQuery {
     code: String,
+    password: Option<String>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -256,6 +258,7 @@ impl Config {
                 "PUBLISHER_IDLE_TIMEOUT_SECS",
                 120,
             )),
+            publish_passwords: env_list("PUBLISH_PASSWORDS"),
             allow_any_origin: env_bool("ALLOW_ANY_ORIGIN", false),
             allowed_origins: env::var("ALLOWED_ORIGINS")
                 .unwrap_or_else(|_| "https://vard.cc".to_owned())
@@ -343,6 +346,16 @@ async fn ingest_ws(
     if !origin_allowed(&headers, &state.config) {
         warn!(%addr, "rejected publisher with invalid origin");
         return text_response(StatusCode::FORBIDDEN, "origin is not allowed\n");
+    }
+
+    if !publish_password_allowed(query.password.as_deref(), &state.config) {
+        warn!(%addr, "rejected publisher with invalid password");
+        return text_response_with_cors(
+            StatusCode::UNAUTHORIZED,
+            "invalid publish password\n",
+            &headers,
+            &state.config,
+        );
     }
 
     if let Err(reason) = validate_code(&query.code, &state.config) {
@@ -1447,6 +1460,16 @@ fn validate_code(code: &str, config: &Config) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn publish_password_allowed(password: Option<&str>, config: &Config) -> bool {
+    config.publish_passwords.is_empty()
+        || password.is_some_and(|password| {
+            config
+                .publish_passwords
+                .iter()
+                .any(|allowed| allowed == password)
+        })
+}
+
 fn valid_hash(key: &str) -> bool {
     key.len() == STREAM_ID_HEX_CHARS && key.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -1570,6 +1593,16 @@ fn env_bool(key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn env_list(key: &str) -> Vec<String> {
+    env::var(key)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn env_nonempty_or_default(key: &str, default: &str) -> Option<String> {
     match env::var(key) {
         Ok(value) if value.is_empty() => None,
@@ -1629,6 +1662,7 @@ mod tests {
             max_ingest_bytes_per_sec: 128 * 1024,
             channel_buffer: 8,
             publisher_idle_timeout: Duration::from_secs(1),
+            publish_passwords: Vec::new(),
             allow_any_origin: false,
             allowed_origins: Vec::new(),
         }
@@ -1683,6 +1717,19 @@ mod tests {
         assert!(try_acquire_publisher_ip(&state, ip).is_err());
         drop(guard);
         assert!(try_acquire_publisher_ip(&state, ip).unwrap().is_some());
+    }
+
+    #[test]
+    fn publish_passwords_are_optional_and_exact() {
+        let mut config = test_config();
+        assert!(publish_password_allowed(None, &config));
+
+        config.publish_passwords = vec!["alpha".to_owned(), "beta".to_owned()];
+        assert!(!publish_password_allowed(None, &config));
+        assert!(!publish_password_allowed(Some(""), &config));
+        assert!(!publish_password_allowed(Some("Alpha"), &config));
+        assert!(publish_password_allowed(Some("alpha"), &config));
+        assert!(publish_password_allowed(Some("beta"), &config));
     }
 
     #[test]

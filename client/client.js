@@ -2,9 +2,11 @@
 const customServerEl = document.getElementById("customServer");
 const customApiEl = document.getElementById("customApi");
 const customRtspEl = document.getElementById("customRtsp");
+const customPasswordEl = document.getElementById("customPassword");
 const rtspUrlEl = document.getElementById("rtspUrl");
 const encoderModeEl = document.getElementById("encoderMode");
 const gainEl = document.getElementById("gain");
+const forceMonoEl = document.getElementById("forceMono");
 const statusEl = document.getElementById("status");
 const statsEl = document.getElementById("stats");
 const newLinkBtn = document.getElementById("newLink");
@@ -16,7 +18,9 @@ const codeStorageKey = "vrc-audio-streamer-code";
 const serverStorageKey = "vrc-audio-streamer-server";
 const customApiStorageKey = "vrc-audio-streamer-custom-api";
 const customRtspStorageKey = "vrc-audio-streamer-custom-rtsp";
+const customPasswordStorageKey = "vrc-audio-streamer-custom-password";
 const encoderModeStorageKey = "vrc-audio-streamer-encoder-mode";
+const forceMonoStorageKey = "vrc-audio-streamer-force-mono";
 const sampleRate = 48000;
 const channels = 2;
 const framesPerChunk = 1024;
@@ -145,9 +149,11 @@ function renderServers() {
   try {
     customApiEl.value = localStorage.getItem(customApiStorageKey) || "http://127.0.0.1:8081";
     customRtspEl.value = localStorage.getItem(customRtspStorageKey) || "rtsp://127.0.0.1";
+    customPasswordEl.value = localStorage.getItem(customPasswordStorageKey) || "";
   } catch (_) {
     customApiEl.value = "http://127.0.0.1:8081";
     customRtspEl.value = "rtsp://127.0.0.1";
+    customPasswordEl.value = "";
   }
   updateCustomVisibility();
 }
@@ -168,6 +174,7 @@ function updateCustomVisibility() {
   customServerEl.hidden = !custom;
   customApiEl.disabled = Boolean(active) || !custom;
   customRtspEl.disabled = Boolean(active) || !custom;
+  customPasswordEl.disabled = Boolean(active) || !custom;
 }
 
 function selectedServer() {
@@ -175,7 +182,8 @@ function selectedServer() {
     return {
       name: "Custom",
       apiBase: customApiEl.value,
-      rtspBase: customRtspEl.value
+      rtspBase: customRtspEl.value,
+      password: customPasswordEl.value
     };
   }
   return servers[Number(serverSelectEl.value)] || servers[0] || fallbackServers[0];
@@ -218,8 +226,12 @@ function currentGain() {
   return Math.min(4, Math.max(0.25, value));
 }
 
-function applyCaptureGain(node) {
-  node.port.postMessage({ type: "gain", gain: currentGain() });
+function currentForceMono() {
+  return forceMonoEl.checked;
+}
+
+function applyCaptureSettings(node) {
+  node.port.postMessage({ type: "settings", gain: currentGain(), forceMono: currentForceMono() });
 }
 
 function browserThrottleWarning() {
@@ -255,6 +267,8 @@ function setMediaSessionPlaying(playing) {
 
 function wsUrlForCode(code) {
   const url = apiUrl(`ingest?code=${encodeURIComponent(code)}`);
+  const password = selectedServer().password || "";
+  if (password) url.searchParams.set("password", password);
   if (url.protocol === "https:") url.protocol = "wss:";
   else if (url.protocol === "http:") url.protocol = "ws:";
   else throw new Error("API server must use http:// or https://.");
@@ -322,10 +336,12 @@ class CaptureProcessor extends AudioWorkletProcessor {
     this.pcm = new Float32Array(this.frames * this.channels);
     this.offset = 0;
     this.gain = 1.5;
+    this.forceMono = false;
     this.port.onmessage = event => {
-      if (event.data && event.data.type === "gain") {
+      if (event.data && event.data.type === "settings") {
         const gain = Number(event.data.gain);
         this.gain = Number.isFinite(gain) ? Math.min(4, Math.max(0.25, gain)) : 1.5;
+        this.forceMono = Boolean(event.data.forceMono);
       }
     };
   }
@@ -346,15 +362,23 @@ class CaptureProcessor extends AudioWorkletProcessor {
       for (let i = 0; i < take; i++) {
         const dst = (this.offset + i) * this.channels;
         const src = sourceOffset + i;
-        let left = leftIn[src] * gain;
-        let right = rightIn[src] * gain;
+        let left;
+        let right;
+        if (this.forceMono) {
+          const mono = (leftIn[src] + rightIn[src]) * 0.5 * gain;
+          left = mono;
+          right = mono;
+        } else {
+          left = leftIn[src] * gain;
+          right = rightIn[src] * gain;
+        }
         if (left > 1) left = 1;
         else if (left < -1) left = -1;
         if (right > 1) right = 1;
         else if (right < -1) right = -1;
         this.pcm[dst] = left;
         this.pcm[dst + 1] = right;
-        if (monitorOut) monitorOut[src] = (leftIn[src] + rightIn[src]) * 0.5;
+        if (monitorOut) monitorOut[src] = (left + right) * 0.5;
       }
       this.offset += take;
       sourceOffset += take;
@@ -563,7 +587,7 @@ async function start(kind) {
       }
       encoder.encode(buffer);
     });
-    applyCaptureGain(captureNode);
+    applyCaptureSettings(captureNode);
     const monitor = audioContext.createGain();
     monitor.gain.value = monitorOutputGain;
     const wakeLock = await requestScreenWakeLock();
@@ -673,8 +697,15 @@ customRtspEl.addEventListener("input", () => {
   try { localStorage.setItem(customRtspStorageKey, customRtspEl.value); } catch (_) {}
   updateUrl();
 });
+customPasswordEl.addEventListener("input", () => {
+  try { localStorage.setItem(customPasswordStorageKey, customPasswordEl.value); } catch (_) {}
+});
 gainEl.addEventListener("input", () => {
-  if (active) applyCaptureGain(active.captureNode);
+  if (active) applyCaptureSettings(active.captureNode);
+});
+forceMonoEl.addEventListener("change", () => {
+  try { localStorage.setItem(forceMonoStorageKey, forceMonoEl.checked ? "1" : "0"); } catch (_) {}
+  if (active) applyCaptureSettings(active.captureNode);
 });
 document.addEventListener("visibilitychange", refreshScreenWakeLock);
 
@@ -683,6 +714,7 @@ async function init() {
   await loadServers();
   renderServers();
   loadEncoderMode();
+  try { forceMonoEl.checked = localStorage.getItem(forceMonoStorageKey) === "1"; } catch (_) {}
   updateUrl();
   refreshStats();
   setInterval(refreshStats, statsRefreshMs);
