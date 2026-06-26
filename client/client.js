@@ -23,6 +23,7 @@ const framesPerChunk = 1024;
 const bitrate = 320000;
 const native192Bitrates = [192000];
 const expectedAacConfigHex = "1190";
+const statsRefreshMs = 15000;
 const monitorOutputGain = 0.0001;
 const fallbackServers = [
   { name: "Local 554", apiBase: "http://127.0.0.1:8081", rtspBase: "rtsp://127.0.0.1" },
@@ -684,7 +685,7 @@ async function init() {
   loadEncoderMode();
   updateUrl();
   refreshStats();
-  setInterval(refreshStats, 2000);
+  setInterval(refreshStats, statsRefreshMs);
 }
 
 init().catch(error => setStatus(error.message || String(error)));

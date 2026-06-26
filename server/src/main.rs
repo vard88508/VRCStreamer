@@ -19,9 +19,9 @@ use std::{
     collections::{HashMap, VecDeque},
     env,
     io::ErrorKind,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -67,8 +67,12 @@ struct Config {
     code_min_bytes: usize,
     code_max_bytes: usize,
     max_publishers: usize,
+    max_publishers_per_ip: usize,
     max_listeners_total: usize,
     max_listeners_per_stream: usize,
+    max_http_requests_per_ip: usize,
+    http_rate_limit_window: Duration,
+    max_tracked_ips: usize,
     max_aac_frame_bytes: usize,
     max_ingest_bytes_per_sec: usize,
     channel_buffer: usize,
@@ -80,6 +84,7 @@ struct Config {
 struct AppState {
     config: Config,
     channels: Mutex<HashMap<String, Arc<Channel>>>,
+    ip_limits: StdMutex<HashMap<IpAddr, IpLimitEntry>>,
     active_publishers: AtomicUsize,
     active_listeners: AtomicUsize,
     next_rtsp_session: AtomicUsize,
@@ -102,6 +107,24 @@ impl Channel {
     }
 }
 
+struct IpLimitEntry {
+    window_started: Instant,
+    request_count: usize,
+    publishers: usize,
+    last_seen: Instant,
+}
+
+impl IpLimitEntry {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_started: now,
+            request_count: 0,
+            publishers: 0,
+            last_seen: now,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct IngestQuery {
     code: String,
@@ -120,6 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AppState {
         config,
         channels: Mutex::new(HashMap::new()),
+        ip_limits: StdMutex::new(HashMap::new()),
         active_publishers: AtomicUsize::new(0),
         active_listeners: AtomicUsize::new(0),
         next_rtsp_session: AtomicUsize::new(1),
@@ -189,8 +213,14 @@ impl Config {
             code_min_bytes: env_usize("CODE_MIN_BYTES", 8),
             code_max_bytes: env_usize("CODE_MAX_BYTES", 128),
             max_publishers: env_usize("MAX_PUBLISHERS", 500),
+            max_publishers_per_ip: env_usize("MAX_PUBLISHERS_PER_IP", 3),
             max_listeners_total: env_usize("MAX_LISTENERS_TOTAL", 2500),
             max_listeners_per_stream: env_usize("MAX_LISTENERS_PER_STREAM", 85),
+            max_http_requests_per_ip: env_usize("MAX_HTTP_REQUESTS_PER_IP", 120),
+            http_rate_limit_window: Duration::from_secs(
+                env_u64("HTTP_RATE_LIMIT_WINDOW_SECS", 60).max(1),
+            ),
+            max_tracked_ips: env_usize("MAX_TRACKED_IPS", 8192),
             max_aac_frame_bytes: env_usize("MAX_AAC_FRAME_BYTES", AAC_MAX_ACCESS_UNIT_BYTES),
             max_ingest_bytes_per_sec: env_usize("MAX_INGEST_BYTES_PER_SEC", 96 * 1024),
             channel_buffer: env_usize("CHANNEL_BUFFER", 128),
@@ -210,7 +240,20 @@ impl Config {
     }
 }
 
-async fn healthz(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+async fn healthz(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Response {
+    if !allow_http_request(&state, addr.ip()) {
+        return text_response_with_cors(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many requests\n",
+            &headers,
+            &state.config,
+        );
+    }
+
     let mut response = ([(CONTENT_TYPE, "text/plain; charset=utf-8")], "ok\n").into_response();
     apply_http_cors(response.headers_mut(), &headers, &state.config);
     response
@@ -222,7 +265,20 @@ struct StatsResponse {
     active_streams: usize,
 }
 
-async fn stats(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+async fn stats(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Response {
+    if !allow_http_request(&state, addr.ip()) {
+        return text_response_with_cors(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many requests\n",
+            &headers,
+            &state.config,
+        );
+    }
+
     let active_streams = {
         let channels = state.channels.lock().await;
         channels.len()
@@ -246,6 +302,16 @@ async fn ingest_ws(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
+    if !allow_http_request(&state, addr.ip()) {
+        warn!(%addr, "rejected publisher over http request rate limit");
+        return text_response_with_cors(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many requests\n",
+            &headers,
+            &state.config,
+        );
+    }
+
     if !origin_allowed(&headers, &state.config) {
         warn!(%addr, "rejected publisher with invalid origin");
         return text_response(StatusCode::FORBIDDEN, "origin is not allowed\n");
@@ -268,6 +334,15 @@ async fn ingest_ws(
         );
     }
 
+    let ip_guard = match try_acquire_publisher_ip(&state, addr.ip()) {
+        Ok(guard) => guard,
+        Err(reason) => {
+            channel.publisher.store(false, Ordering::Release);
+            cleanup_channel(&state, &key, &channel).await;
+            return text_response(StatusCode::TOO_MANY_REQUESTS, reason);
+        }
+    };
+
     if state
         .active_publishers
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -285,7 +360,7 @@ async fn ingest_ws(
 
     info!(%addr, %key, "aac publisher connected");
     ws.max_message_size(state.config.max_aac_frame_bytes + 1024)
-        .on_upgrade(move |socket| publisher_session(socket, state, key, channel, addr))
+        .on_upgrade(move |socket| publisher_session(socket, state, key, channel, addr, ip_guard))
         .into_response()
 }
 
@@ -295,6 +370,7 @@ async fn publisher_session(
     key: String,
     channel: Arc<Channel>,
     addr: SocketAddr,
+    _ip_guard: Option<PublisherIpGuard>,
 ) {
     let mut rate = RateWindow::new(Duration::from_secs(5));
     let mut frames = 0usize;
@@ -1195,6 +1271,108 @@ impl RateWindow {
     }
 }
 
+fn allow_http_request(state: &Arc<AppState>, ip: IpAddr) -> bool {
+    if state.config.max_http_requests_per_ip == 0 {
+        return true;
+    }
+
+    let now = Instant::now();
+    let mut limits = state
+        .ip_limits
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    prune_ip_limits(&mut limits, now, &state.config);
+
+    if !limits.contains_key(&ip)
+        && state.config.max_tracked_ips != 0
+        && limits.len() >= state.config.max_tracked_ips
+    {
+        return false;
+    }
+
+    let entry = limits.entry(ip).or_insert_with(|| IpLimitEntry::new(now));
+    if now.duration_since(entry.window_started) >= state.config.http_rate_limit_window {
+        entry.window_started = now;
+        entry.request_count = 0;
+    }
+
+    entry.last_seen = now;
+    if entry.request_count >= state.config.max_http_requests_per_ip {
+        return false;
+    }
+
+    entry.request_count += 1;
+    true
+}
+
+fn try_acquire_publisher_ip(
+    state: &Arc<AppState>,
+    ip: IpAddr,
+) -> Result<Option<PublisherIpGuard>, &'static str> {
+    if state.config.max_publishers_per_ip == 0 {
+        return Ok(None);
+    }
+
+    let now = Instant::now();
+    let mut limits = state
+        .ip_limits
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    prune_ip_limits(&mut limits, now, &state.config);
+
+    if !limits.contains_key(&ip)
+        && state.config.max_tracked_ips != 0
+        && limits.len() >= state.config.max_tracked_ips
+    {
+        return Err("too many tracked IPs\n");
+    }
+
+    let entry = limits.entry(ip).or_insert_with(|| IpLimitEntry::new(now));
+    entry.last_seen = now;
+    if entry.publishers >= state.config.max_publishers_per_ip {
+        return Err("too many active publishers from this IP\n");
+    }
+
+    entry.publishers += 1;
+    Ok(Some(PublisherIpGuard {
+        state: state.clone(),
+        ip,
+        released: false,
+    }))
+}
+
+fn prune_ip_limits(limits: &mut HashMap<IpAddr, IpLimitEntry>, now: Instant, config: &Config) {
+    let idle_timeout = config.http_rate_limit_window.saturating_mul(2);
+    limits.retain(|_, entry| {
+        entry.publishers != 0 || now.duration_since(entry.last_seen) < idle_timeout
+    });
+}
+
+struct PublisherIpGuard {
+    state: Arc<AppState>,
+    ip: IpAddr,
+    released: bool,
+}
+
+impl Drop for PublisherIpGuard {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+
+        let mut limits = self
+            .state
+            .ip_limits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = limits.get_mut(&self.ip) {
+            entry.publishers = entry.publishers.saturating_sub(1);
+            entry.last_seen = Instant::now();
+        }
+    }
+}
+
 fn validate_code(code: &str, config: &Config) -> Result<(), &'static str> {
     let len = code.len();
     if len < config.code_min_bytes {
@@ -1295,6 +1473,17 @@ fn text_response(status: StatusCode, text: &'static str) -> Response {
     (status, [(CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response()
 }
 
+fn text_response_with_cors(
+    status: StatusCode,
+    text: &'static str,
+    headers: &HeaderMap,
+    config: &Config,
+) -> Response {
+    let mut response = text_response(status, text);
+    apply_http_cors(response.headers_mut(), headers, config);
+    response
+}
+
 fn env_usize(key: &str, default: usize) -> usize {
     env::var(key)
         .ok()
@@ -1356,14 +1545,8 @@ async fn shutdown_http_server(handle: axum_server::Handle<SocketAddr>) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn hash_code_matches_sha256_128_bit_hex_prefix() {
-        assert_eq!(hash_code("abc"), "ba7816bf8f01cfea414140de5dae2223");
-    }
-
-    #[test]
-    fn code_accepts_printable_ascii_without_spaces() {
-        let config = Config {
+    fn test_config() -> Config {
+        Config {
             bind_addr: "127.0.0.1:8080".parse().unwrap(),
             rtsp_bind_addr: "127.0.0.1:8554".parse().unwrap(),
             rtsp_extra_bind_addr: None,
@@ -1372,19 +1555,70 @@ mod tests {
             code_min_bytes: 8,
             code_max_bytes: 128,
             max_publishers: 1,
+            max_publishers_per_ip: 3,
             max_listeners_total: 1,
             max_listeners_per_stream: 1,
+            max_http_requests_per_ip: 120,
+            http_rate_limit_window: Duration::from_secs(60),
+            max_tracked_ips: 16,
             max_aac_frame_bytes: AAC_MAX_ACCESS_UNIT_BYTES,
             max_ingest_bytes_per_sec: 128 * 1024,
             channel_buffer: 8,
             publisher_idle_timeout: Duration::from_secs(1),
             allow_any_origin: false,
             allowed_origins: Vec::new(),
-        };
+        }
+    }
+
+    fn test_state(config: Config) -> Arc<AppState> {
+        Arc::new(AppState {
+            config,
+            channels: Mutex::new(HashMap::new()),
+            ip_limits: StdMutex::new(HashMap::new()),
+            active_publishers: AtomicUsize::new(0),
+            active_listeners: AtomicUsize::new(0),
+            next_rtsp_session: AtomicUsize::new(1),
+        })
+    }
+
+    #[test]
+    fn hash_code_matches_sha256_128_bit_hex_prefix() {
+        assert_eq!(hash_code("abc"), "ba7816bf8f01cfea414140de5dae2223");
+    }
+
+    #[test]
+    fn code_accepts_printable_ascii_without_spaces() {
+        let config = test_config();
 
         assert!(validate_code("Abc123!@", &config).is_ok());
         assert!(validate_code("Abc 123!", &config).is_err());
         assert!(validate_code("short", &config).is_err());
+    }
+
+    #[test]
+    fn http_rate_limit_blocks_after_configured_requests() {
+        let mut config = test_config();
+        config.max_http_requests_per_ip = 2;
+        let state = test_state(config);
+        let ip = "127.0.0.1".parse().unwrap();
+
+        assert!(allow_http_request(&state, ip));
+        assert!(allow_http_request(&state, ip));
+        assert!(!allow_http_request(&state, ip));
+    }
+
+    #[test]
+    fn publisher_ip_limit_releases_when_guard_drops() {
+        let mut config = test_config();
+        config.max_publishers_per_ip = 1;
+        let state = test_state(config);
+        let ip = "127.0.0.1".parse().unwrap();
+
+        let guard = try_acquire_publisher_ip(&state, ip).unwrap();
+        assert!(guard.is_some());
+        assert!(try_acquire_publisher_ip(&state, ip).is_err());
+        drop(guard);
+        assert!(try_acquire_publisher_ip(&state, ip).unwrap().is_some());
     }
 
     #[test]

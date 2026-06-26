@@ -49,6 +49,8 @@ The browser uses `apiBase` for `/stats` and WebSocket `/ingest`. The generated V
 
 The client dropdown always also has `Custom`, where a user can enter custom API and RTSP addresses manually.
 
+The client refreshes `/stats` every 15 seconds while the page is open.
+
 During streaming, the status text shows whether the browser is using native WebCodecs AAC or the WASM encoder. Native AAC support is browser/platform dependent even when `AudioEncoder` exists; on Windows, Chromium may reject 320 kbps because the system AAC encoder supports a limited bitrate set.
 
 The client has an encoder dropdown:
@@ -156,8 +158,12 @@ RTSP_BIND_ADDR=0.0.0.0:554
 RTSP_EXTRA_BIND_ADDR=
 ALLOWED_ORIGINS=https://example.com
 MAX_PUBLISHERS=500
+MAX_PUBLISHERS_PER_IP=3
 MAX_LISTENERS_TOTAL=2500
 MAX_LISTENERS_PER_STREAM=85
+MAX_HTTP_REQUESTS_PER_IP=120
+HTTP_RATE_LIMIT_WINDOW_SECS=60
+MAX_TRACKED_IPS=8192
 MAX_AAC_FRAME_BYTES=4096
 MAX_INGEST_BYTES_PER_SEC=98304
 CHANNEL_BUFFER=128
@@ -253,8 +259,12 @@ If `TLS_CERT_PATH` and `TLS_KEY_PATH` are not set, the API runs as plain HTTP/WS
 | `RTSP_BIND_ADDR` | `0.0.0.0:8554` | RTSP listen address |
 | `RTSP_EXTRA_BIND_ADDR` | empty | Optional second RTSP listen address, useful for also binding `0.0.0.0:554` |
 | `MAX_PUBLISHERS` | `500` | Max simultaneous broadcasters |
+| `MAX_PUBLISHERS_PER_IP` | `3` | Max simultaneous broadcasters from one IP; `0` disables this limit |
 | `MAX_LISTENERS_TOTAL` | `2500` | Max simultaneous RTSP clients |
 | `MAX_LISTENERS_PER_STREAM` | `85` | Max RTSP clients per stream |
+| `MAX_HTTP_REQUESTS_PER_IP` | `120` | Max HTTP/WebSocket handshake requests from one IP per rate-limit window; `0` disables this limit |
+| `HTTP_RATE_LIMIT_WINDOW_SECS` | `60` | HTTP request rate-limit window |
+| `MAX_TRACKED_IPS` | `8192` | Max IP entries kept by the in-memory limiter; `0` disables the cap |
 | `MAX_AAC_FRAME_BYTES` | `4096` | Max WebSocket AAC access unit size |
 | `MAX_INGEST_BYTES_PER_SEC` | `98304` | Average AAC ingest byte limit per publisher |
 | `CHANNEL_BUFFER` | `128` | Per-stream AAC frame broadcast buffer |
@@ -267,6 +277,8 @@ If `TLS_CERT_PATH` and `TLS_KEY_PATH` are not set, the API runs as plain HTTP/WS
 ## Abuse Limits
 
 - One active publisher per code/hash.
+- One IP may have at most `MAX_PUBLISHERS_PER_IP` active publishers by default.
+- HTTP/API requests are rate-limited per IP with a small in-memory window.
 - Codes are printable ASCII only, 8 to 128 bytes by default.
 - Stream IDs must be 32 hex chars.
 - WebSocket publishers may send binary messages only.
