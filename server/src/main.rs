@@ -135,7 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
+        .with_env_filter(EnvFilter::from_default_env().add_directive("warn".parse()?))
         .init();
 
     let config = match Config::from_env() {
@@ -210,18 +210,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 impl Config {
     fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
         let bind_addr = env::var("BIND_ADDR")
-            .unwrap_or_else(|_| "0.0.0.0:8080".to_owned())
+            .unwrap_or_else(|_| "0.0.0.0:443".to_owned())
             .parse()?;
         let rtsp_bind_addr: SocketAddr = env::var("RTSP_BIND_ADDR")
-            .unwrap_or_else(|_| "0.0.0.0:8554".to_owned())
+            .unwrap_or_else(|_| "0.0.0.0:554".to_owned())
             .parse()?;
         let rtsp_extra_bind_addr = env::var("RTSP_EXTRA_BIND_ADDR")
             .ok()
             .filter(|value| !value.is_empty())
             .map(|value| value.parse())
             .transpose()?;
-        let tls_cert_path = env_nonempty("TLS_CERT_PATH");
-        let tls_key_path = env_nonempty("TLS_KEY_PATH");
+        let tls_cert_path = env_nonempty_or_default(
+            "TLS_CERT_PATH",
+            "/etc/letsencrypt/live/example.com/fullchain.pem",
+        );
+        let tls_key_path = env_nonempty_or_default(
+            "TLS_KEY_PATH",
+            "/etc/letsencrypt/live/example.com/privkey.pem",
+        );
         if tls_cert_path.is_some() != tls_key_path.is_some() {
             return Err("TLS_CERT_PATH and TLS_KEY_PATH must be set together".into());
         }
@@ -252,7 +258,7 @@ impl Config {
             )),
             allow_any_origin: env_bool("ALLOW_ANY_ORIGIN", false),
             allowed_origins: env::var("ALLOWED_ORIGINS")
-                .unwrap_or_default()
+                .unwrap_or_else(|_| "https://vard.cc".to_owned())
                 .split(',')
                 .map(str::trim)
                 .filter(|origin| !origin.is_empty())
@@ -985,7 +991,7 @@ async fn write_rtsp_response(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let body_len = body.map_or(0, <[u8]>::len);
     let mut response = format!(
-        "RTSP/1.0 {status}\r\nCSeq: {cseq}\r\nServer: vrc-audio-streamer\r\nCache-Control: no-cache\r\n"
+        "RTSP/1.0 {status}\r\nCSeq: {cseq}\r\nServer: VRCStreamer\r\nCache-Control: no-cache\r\n"
     );
 
     for (name, value) in headers {
@@ -1564,8 +1570,12 @@ fn env_bool(key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn env_nonempty(key: &str) -> Option<String> {
-    env::var(key).ok().filter(|value| !value.is_empty())
+fn env_nonempty_or_default(key: &str, default: &str) -> Option<String> {
+    match env::var(key) {
+        Ok(value) if value.is_empty() => None,
+        Ok(value) => Some(value),
+        Err(_) => Some(default.to_owned()),
+    }
 }
 
 async fn shutdown_signal() {

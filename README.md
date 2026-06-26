@@ -1,42 +1,35 @@
-# VRC Audio Streamer Server
+# VRCStreamer Server
 
-Minimal Rust WebSocket-to-RTSP audio relay for AVPro/VRChat.
+Minimal Rust WebSocket-to-RTSP audio server for VRChat.
 
-This server deploy guide has only been checked on Debian.
+This install guide has only been checked on Debian 13 with the root user.
 
 ## 1. Install Rust
 
 ```bash
-sudo apt install -y curl build-essential
+apt install -y curl build-essential
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 . "$HOME/.cargo/env"
 ```
 
-If `git` is not installed on the server:
-
-```bash
-sudo apt install -y git
-```
-
 ## 2. Clone And Build
 
+Clone the repo wherever you want to keep it:
+
 ```bash
-sudo mkdir -p /opt
-cd /opt
-sudo git clone https://github.com/vard88508/VRCStreamer.git vrc-audio-streamer
-sudo chown -R "$USER":"$USER" /opt/vrc-audio-streamer
-cd /opt/vrc-audio-streamer/server
+git clone https://github.com/vard88508/VRCStreamer.git
+cd VRCStreamer/server
 chmod +x build.sh create_service.sh
 ./build.sh
 ```
 
-`build.sh` compiles the Rust server and copies the executable to:
+`build.sh` compiles the Rust server and writes:
 
 ```text
-/opt/vrc-audio-streamer/server/vrc-audio-streamer
+VRCStreamer/server/VRCStreamer
 ```
 
-If the `vrc-audio-streamer` systemd service already exists, `build.sh` restarts it after a successful build.
+If the `VRCStreamer` systemd service already exists, `build.sh` restarts it after a successful build.
 
 ## 3. Configure `.env`
 
@@ -72,7 +65,7 @@ CODE_MAX_BYTES=128
 RUST_LOG=warn
 ```
 
-Use your real domain in `TLS_CERT_PATH`, `TLS_KEY_PATH`, and `ALLOWED_ORIGINS`.
+Set your real domain in `TLS_CERT_PATH`, `TLS_KEY_PATH`, and `ALLOWED_ORIGINS`.
 
 ## 4. Create Service
 
@@ -80,32 +73,33 @@ Use your real domain in `TLS_CERT_PATH`, `TLS_KEY_PATH`, and `ALLOWED_ORIGINS`.
 ./create_service.sh
 ```
 
-The script writes `/etc/systemd/system/vrc-audio-streamer.service`, enables it, and starts/restarts the service.
+The script writes `/etc/systemd/system/VRCStreamer.service`, enables it, and starts/restarts the service.
 
 Check logs:
 
 ```bash
-journalctl -u vrc-audio-streamer -f
+journalctl -u VRCStreamer -f
 ```
 
-Open firewall ports:
+## 5. Start Streaming
 
-```bash
-sudo ufw allow 443/tcp
-sudo ufw allow 554/tcp
+Open:
+
+```text
+https://vard.cc/VRCStreamer
 ```
 
-Smoke test:
+Choose `Custom` and enter your server addresses:
 
-```bash
-curl https://example.com/healthz
-curl https://example.com/stats
+```text
+API:  https://example.com
+RTSP: rtsp://example.com
 ```
 
 ## Updating
 
 ```bash
-cd /opt/vrc-audio-streamer
+cd VRCStreamer
 git pull
 cd server
 ./build.sh
@@ -115,12 +109,12 @@ cd server
 
 | Name | Default | Meaning |
 | --- | ---: | --- |
-| `BIND_ADDR` | `0.0.0.0:8080` | HTTP/HTTPS API and WebSocket ingest listen address |
-| `TLS_CERT_PATH` | empty | PEM certificate path; enables HTTPS/WSS with `TLS_KEY_PATH` |
-| `TLS_KEY_PATH` | empty | PEM private key path; enables HTTPS/WSS with `TLS_CERT_PATH` |
-| `RTSP_BIND_ADDR` | `0.0.0.0:8554` | RTSP listen address |
+| `BIND_ADDR` | `0.0.0.0:443` | HTTP/HTTPS API and WebSocket ingest listen address |
+| `TLS_CERT_PATH` | `/etc/letsencrypt/live/example.com/fullchain.pem` | PEM certificate path |
+| `TLS_KEY_PATH` | `/etc/letsencrypt/live/example.com/privkey.pem` | PEM private key path |
+| `RTSP_BIND_ADDR` | `0.0.0.0:554` | RTSP listen address |
 | `RTSP_EXTRA_BIND_ADDR` | empty | Optional second RTSP listen address |
-| `ALLOWED_ORIGINS` | empty | Comma-separated browser origins allowed to publish |
+| `ALLOWED_ORIGINS` | `https://vard.cc` | Comma-separated browser origins allowed to publish |
 | `ALLOW_ANY_ORIGIN` | `false` | Disable Origin protection when `true` |
 | `MAX_PUBLISHERS` | `500` | Max simultaneous publishers |
 | `MAX_PUBLISHERS_PER_IP` | `3` | Max simultaneous publishers from one IP; `0` disables this limit |
@@ -135,12 +129,4 @@ cd server
 | `PUBLISHER_IDLE_TIMEOUT_SECS` | `120` | Disconnect idle publishers |
 | `CODE_MIN_BYTES` | `8` | Min hidden code length |
 | `CODE_MAX_BYTES` | `128` | Max hidden code length |
-
-## Endpoints
-
-- `GET /healthz` - health check.
-- `GET /stats` - JSON counters: active listeners and streams.
-- `GET /ingest?code=<hidden-code>` - WebSocket raw AAC ingest.
-- `RTSP /<hash32>` - AVPro/VRChat playback URL.
-
-On fatal server errors and panics, the service logs the error reason plus the current listener count and stream count when available.
+| `RUST_LOG` | `warn` | Server log level |

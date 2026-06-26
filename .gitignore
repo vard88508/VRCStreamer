@@ -1,7 +1,7 @@
 # Rust build output
 /target/
 /server/target/
-/server/vrc-audio-streamer
+/server/VRCStreamer
 
 # Local env and secrets
 .env

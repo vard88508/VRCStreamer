@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SERVICE_NAME="${SERVICE_NAME:-vrc-audio-streamer}"
+SERVICE_NAME="${SERVICE_NAME:-VRCStreamer}"
 SERVER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN="$SERVER_DIR/vrc-audio-streamer"
+BIN="$SERVER_DIR/VRCStreamer"
 ENV_FILE="$SERVER_DIR/.env"
 UNIT_FILE="/etc/systemd/system/$SERVICE_NAME.service"
 
@@ -28,14 +28,14 @@ if [ ! -f "$ENV_FILE" ]; then
   exit 1
 fi
 
-SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
-  SUDO="sudo"
+  echo "Run this script as root." >&2
+  exit 1
 fi
 
-$SUDO tee "$UNIT_FILE" >/dev/null <<SERVICE
+tee "$UNIT_FILE" >/dev/null <<SERVICE
 [Unit]
-Description=VRC Audio Streamer relay
+Description=VRCStreamer
 After=network-online.target
 Wants=network-online.target
 
@@ -55,7 +55,7 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 WantedBy=multi-user.target
 SERVICE
 
-$SUDO systemctl daemon-reload
-$SUDO systemctl enable "$SERVICE_NAME"
-$SUDO systemctl restart "$SERVICE_NAME"
-$SUDO systemctl --no-pager --lines=30 status "$SERVICE_NAME"
+systemctl daemon-reload
+systemctl enable "$SERVICE_NAME"
+systemctl restart "$SERVICE_NAME"
+systemctl --no-pager --lines=30 status "$SERVICE_NAME"
