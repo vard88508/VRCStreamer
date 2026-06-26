@@ -19,11 +19,11 @@ The Rust server intentionally does not host the client. Deploy the client and se
 4. Browser sends raw AAC access units over WebSocket to `GET /ingest?code=...`.
 5. Server validates and relays those raw AAC frames as RTSP/RTP `mpeg4-generic`.
 
-The server does not run `ffmpeg`, does not transcode, and does not store stream links. The hidden code and stream URL are derived with `SHA-256(code)` on both client and server.
+The server does not run `ffmpeg`, does not transcode, and does not store stream links. The hidden code and stream URL are derived with the first 32 hex chars of `SHA-256(code)` on both client and server.
 
 Output stream shape:
 
-- RTSP path: `/live/<sha256(code)>`
+- RTSP path: `/<hash32>`
 - Codec: AAC-LC
 - Sample rate: 48000 Hz
 - Channels: stereo
@@ -101,8 +101,8 @@ http://127.0.0.1:8080/
 The default `servers.json` points to `http://127.0.0.1:8081` and can generate either:
 
 ```text
-rtsp://127.0.0.1/live/<hash>
-rtsp://127.0.0.1:8554/live/<hash>
+rtsp://127.0.0.1/<hash32>
+rtsp://127.0.0.1:8554/<hash32>
 ```
 
 If binding port `554` is not available on your OS, use the `Local 8554` option.
@@ -239,10 +239,9 @@ If `TLS_CERT_PATH` and `TLS_KEY_PATH` are not set, the API runs as plain HTTP/WS
 ## Server Endpoints
 
 - `GET /healthz` - health check.
-- `GET /stats` - JSON counters: active publishers, listeners, streams.
+- `GET /stats` - JSON counters: active listeners and streams.
 - `GET /ingest?code=<hidden-code>` - WebSocket AAC ingest.
-- `RTSP /live/<sha256>` - AVPro/VRChat playback URL.
-- `RTSP /stream/<sha256>` - alternate playback path.
+- `RTSP /<hash32>` - AVPro/VRChat playback URL.
 
 ## Server Environment
 
@@ -269,7 +268,7 @@ If `TLS_CERT_PATH` and `TLS_KEY_PATH` are not set, the API runs as plain HTTP/WS
 
 - One active publisher per code/hash.
 - Codes are printable ASCII only, 8 to 128 bytes by default.
-- Stream IDs must be 64 hex chars.
+- Stream IDs must be 32 hex chars.
 - WebSocket publishers may send binary messages only.
 - WebSocket binary messages must be raw AAC access units, not ADTS, video, or container data.
 - Input byte rate and frame size are bounded.

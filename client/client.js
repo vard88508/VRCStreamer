@@ -88,9 +88,12 @@ function rotateCode() {
   return code;
 }
 
-async function sha256Hex(text) {
+async function streamHashHex(text) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
-  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+  const bytes = new Uint8Array(digest);
+  let out = "";
+  for (let i = 0; i < 16; i++) out += bytes[i].toString(16).padStart(2, "0");
+  return out;
 }
 
 function normalizeServerEntry(entry) {
@@ -193,7 +196,7 @@ function apiUrl(path) {
 function mediaUrl(hash) {
   const base = normalizeBase(selectedServer().rtspBase, "rtsp://");
   if (!base) return "";
-  return `${base}/live/${hash}`;
+  return `${base}/${hash}`;
 }
 
 async function updateUrl() {
@@ -203,7 +206,7 @@ async function updateUrl() {
     rtspUrlEl.value = "";
     return;
   }
-  const hash = await sha256Hex(code);
+  const hash = await streamHashHex(code);
   if (seq !== urlSeq) return;
   rtspUrlEl.value = mediaUrl(hash);
 }
@@ -262,9 +265,9 @@ async function refreshStats() {
     const response = await fetch(apiUrl("stats"), { cache: "no-store" });
     if (!response.ok) throw new Error(`stats ${response.status}`);
     const stats = await response.json();
-    setStats(`Streamers: ${stats.active_publishers} Listeners: ${stats.active_listeners} Streams: ${stats.active_streams}`);
+    setStats(`Listeners: ${stats.active_listeners} Streams: ${stats.active_streams}`);
   } catch (_) {
-    setStats("Streamers: - Listeners: - Streams: -");
+    setStats("Listeners: - Streams: -");
   }
 }
 

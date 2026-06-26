@@ -52,6 +52,8 @@ const RTSP_LOW_WATER_FRAMES: usize = 4;
 const RTSP_MAX_LINE_BYTES: usize = 4096;
 const RTSP_MAX_HEADERS: usize = 64;
 const RTSP_MAX_BODY_BYTES: usize = 4096;
+const STREAM_ID_HEX_CHARS: usize = 32;
+const STREAM_ID_BYTES: usize = STREAM_ID_HEX_CHARS / 2;
 
 type SharedRtspWriter = Arc<Mutex<OwnedWriteHalf>>;
 
@@ -216,7 +218,6 @@ async fn healthz(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
 
 #[derive(Serialize)]
 struct StatsResponse {
-    active_publishers: usize,
     active_listeners: usize,
     active_streams: usize,
 }
@@ -228,7 +229,6 @@ async fn stats(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
     };
 
     let mut response = axum::Json(StatsResponse {
-        active_publishers: state.active_publishers.load(Ordering::Acquire),
         active_listeners: state.active_listeners.load(Ordering::Acquire),
         active_streams,
     })
@@ -1002,11 +1002,7 @@ fn key_from_rtsp_uri(uri: &str) -> Option<&str> {
         uri
     };
 
-    let after_live = path
-        .split_once("/live/")
-        .map(|(_, value)| value)
-        .or_else(|| path.split_once("/stream/").map(|(_, value)| value))?;
-    after_live
+    path.trim_start_matches('/')
         .split(['/', '?', '#'])
         .next()
         .filter(|value| !value.is_empty())
@@ -1214,13 +1210,13 @@ fn validate_code(code: &str, config: &Config) -> Result<(), &'static str> {
 }
 
 fn valid_hash(key: &str) -> bool {
-    key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit())
+    key.len() == STREAM_ID_HEX_CHARS && key.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn hash_code(code: &str) -> String {
     let digest = Sha256::digest(code.as_bytes());
-    let mut out = String::with_capacity(64);
-    for byte in digest {
+    let mut out = String::with_capacity(STREAM_ID_HEX_CHARS);
+    for &byte in digest.iter().take(STREAM_ID_BYTES) {
         out.push(hex_char(byte >> 4));
         out.push(hex_char(byte & 0x0f));
     }
@@ -1361,11 +1357,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hash_code_matches_sha256_hex() {
-        assert_eq!(
-            hash_code("abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
+    fn hash_code_matches_sha256_128_bit_hex_prefix() {
+        assert_eq!(hash_code("abc"), "ba7816bf8f01cfea414140de5dae2223");
     }
 
     #[test]
@@ -1436,26 +1429,27 @@ mod tests {
 
     #[test]
     fn rtsp_uri_parser_extracts_hash() {
-        let key = "a85c0211c512828c4c52dc5716a79e3acba2b62dd6575b986366fd84e0903bc1";
+        let key = "a85c0211c512828c4c52dc5716a79e3a";
 
         assert_eq!(
-            key_from_rtsp_uri(
-                "rtsp://example.com/live/a85c0211c512828c4c52dc5716a79e3acba2b62dd6575b986366fd84e0903bc1"
-            ),
+            key_from_rtsp_uri("rtsp://example.com/a85c0211c512828c4c52dc5716a79e3a"),
             Some(key)
         );
         assert_eq!(
-            key_from_rtsp_uri(
-                "/live/a85c0211c512828c4c52dc5716a79e3acba2b62dd6575b986366fd84e0903bc1/trackID=0"
-            ),
+            key_from_rtsp_uri("/a85c0211c512828c4c52dc5716a79e3a/trackID=0"),
             Some(key)
         );
         assert_eq!(
-            key_from_rtsp_uri(
-                "rtspt://example.com:8554/stream/a85c0211c512828c4c52dc5716a79e3acba2b62dd6575b986366fd84e0903bc1?x=1"
-            ),
+            key_from_rtsp_uri("rtspt://example.com:8554/a85c0211c512828c4c52dc5716a79e3a?x=1"),
             Some(key)
         );
+        assert!(valid_hash(key));
+        assert!(!valid_hash(
+            "a85c0211c512828c4c52dc5716a79e3acba2b62dd6575b986366fd84e0903bc1"
+        ));
+        assert!(!valid_hash(
+            key_from_rtsp_uri("/live/a85c0211c512828c4c52dc5716a79e3a").unwrap()
+        ));
     }
 
     #[test]
