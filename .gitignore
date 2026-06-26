@@ -1,0 +1,24 @@
+# Rust build output
+/target/
+/server/target/
+
+# Local env and secrets
+.env
+.env.*
+!.env.example
+certs/
+*.key
+*.pem
+
+# Logs and runtime output
+*.log
+
+# Temporary dependencies and caches
+node_modules/
+.cache/
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,12 @@
+[
+  {
+    "name": "Local Server Test",
+    "apiBase": "http://127.0.0.1",
+    "rtspBase": "rtsp://127.0.0.1"
+  },
+  {
+    "name": "Vard's EU Server",
+    "apiBase": "https://eu.vard.cc",
+    "rtspBase": "rtsp://eu.vard.cc"
+  }
+]
