@@ -6,9 +6,8 @@ const customRtspEl = document.getElementById("customRtsp");
 const customPasswordEl = document.getElementById("customPassword");
 const rtspUrlEl = document.getElementById("rtspUrl");
 const encoderModeEl = document.getElementById("encoderMode");
-const gainEl = document.getElementById("gain");
-const forceMonoEl = document.getElementById("forceMono");
 const micDeviceEl = document.getElementById("micDevice");
+const sourcesEl = document.getElementById("sources");
 const statusEl = document.getElementById("status");
 const statsEl = document.getElementById("stats");
 const copyUrlBtn = document.getElementById("copyUrl");
@@ -23,7 +22,6 @@ const customApiStorageKey = "vrc-audio-streamer-custom-api";
 const customRtspStorageKey = "vrc-audio-streamer-custom-rtsp";
 const customPasswordStorageKey = "vrc-audio-streamer-custom-password";
 const encoderModeStorageKey = "vrc-audio-streamer-encoder-mode";
-const forceMonoStorageKey = "vrc-audio-streamer-force-mono";
 const micDeviceStorageKey = "vrc-audio-streamer-mic-device";
 const sampleRate = 48000;
 const channels = 2;
@@ -292,28 +290,14 @@ async function updateUrl() {
   setRtspUrl(mediaUrl(hash));
 }
 
-function currentGain() {
-  const value = Number(gainEl.value);
-  if (!Number.isFinite(value)) return 1;
-  return Math.min(4, Math.max(0.25, value));
-}
-
-function currentForceMono() {
-  return forceMonoEl.checked;
-}
-
-function applyCaptureSettings(node) {
-  node.port.postMessage({ type: "settings", gain: currentGain(), forceMono: currentForceMono() });
-}
-
 function hasSource(state, kind) {
   return Boolean(state && state.sources && state.sources[kind]);
 }
 
 function sourceSummary(state = active) {
   const names = [];
-  if (hasSource(state, "mic")) names.push("Mic");
-  if (hasSource(state, "screen")) names.push("Tab/system audio");
+  if (hasSource(state, "mic")) names.push(state.sources.mic.name);
+  if (hasSource(state, "screen")) names.push(state.sources.screen.name);
   return names.join(" + ") || "none";
 }
 
@@ -325,10 +309,10 @@ function updateSourceControls() {
   stopBtn.disabled = !streaming;
   micBtn.textContent = streaming
     ? (hasSource(active, "mic") ? "Change mic" : "Add mic")
-    : "Stream mic";
+    : "Add mic";
   screenBtn.textContent = streaming
     ? (hasSource(active, "screen") ? "Change tab/system audio" : "Add tab/system audio")
-    : "Stream tab/system audio";
+    : "Add tab/system audio";
 }
 
 function setSourceRequestBusy(busy) {
@@ -494,6 +478,60 @@ async function captureAudio(kind) {
 
 function captureProcessorSource() {
   return `
+class SourceProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.gain = 1;
+    this.mute = false;
+    this.forceMono = false;
+    this.port.onmessage = event => {
+      if (event.data && event.data.type === "settings") {
+        const gain = Number(event.data.gain);
+        this.gain = Number.isFinite(gain) ? Math.min(4, Math.max(0, gain)) : 1;
+        this.mute = Boolean(event.data.mute);
+        this.forceMono = Boolean(event.data.forceMono);
+      }
+    };
+  }
+
+  process(inputs, outputs) {
+    const input = inputs[0];
+    const output = outputs[0];
+    const leftOut = output && output[0] ? output[0] : null;
+    const rightOut = output && output[1] ? output[1] : leftOut;
+    if (!leftOut) return true;
+
+    const leftIn = input && input[0] ? input[0] : null;
+    if (!leftIn || this.mute) {
+      leftOut.fill(0);
+      if (rightOut !== leftOut) rightOut.fill(0);
+      return true;
+    }
+    const rightIn = input[1] || leftIn;
+    const gain = this.gain;
+
+    for (let i = 0; i < leftOut.length; i++) {
+      let left;
+      let right;
+      if (this.forceMono) {
+        const mono = (leftIn[i] + rightIn[i]) * 0.5 * gain;
+        left = mono;
+        right = mono;
+      } else {
+        left = leftIn[i] * gain;
+        right = rightIn[i] * gain;
+      }
+      if (left > 1) left = 1;
+      else if (left < -1) left = -1;
+      if (right > 1) right = 1;
+      else if (right < -1) right = -1;
+      leftOut[i] = left;
+      if (rightOut !== leftOut) rightOut[i] = right;
+    }
+    return true;
+  }
+}
+
 class CaptureProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
@@ -501,15 +539,6 @@ class CaptureProcessor extends AudioWorkletProcessor {
     this.channels = ${channels};
     this.pcm = new Float32Array(this.frames * this.channels);
     this.offset = 0;
-    this.gain = 1;
-    this.forceMono = false;
-    this.port.onmessage = event => {
-      if (event.data && event.data.type === "settings") {
-        const gain = Number(event.data.gain);
-        this.gain = Number.isFinite(gain) ? Math.min(4, Math.max(0.25, gain)) : 1;
-        this.forceMono = Boolean(event.data.forceMono);
-      }
-    };
   }
 
   process(inputs, outputs) {
@@ -518,26 +547,17 @@ class CaptureProcessor extends AudioWorkletProcessor {
 
     const input = inputs[0];
     const leftIn = input && input[0] ? input[0] : null;
-    if (!leftIn) return true;
-    const rightIn = input[1] || leftIn;
+    const rightIn = input && input[1] ? input[1] : leftIn;
+    const frameCount = leftIn ? leftIn.length : (monitorOut ? monitorOut.length : 128);
 
     let sourceOffset = 0;
-    while (sourceOffset < leftIn.length) {
-      const take = Math.min(this.frames - this.offset, leftIn.length - sourceOffset);
-      const gain = this.gain;
+    while (sourceOffset < frameCount) {
+      const take = Math.min(this.frames - this.offset, frameCount - sourceOffset);
       for (let i = 0; i < take; i++) {
         const dst = (this.offset + i) * this.channels;
         const src = sourceOffset + i;
-        let left;
-        let right;
-        if (this.forceMono) {
-          const mono = (leftIn[src] + rightIn[src]) * 0.5 * gain;
-          left = mono;
-          right = mono;
-        } else {
-          left = leftIn[src] * gain;
-          right = rightIn[src] * gain;
-        }
+        let left = leftIn ? leftIn[src] : 0;
+        let right = rightIn ? rightIn[src] : left;
         if (left > 1) left = 1;
         else if (left < -1) left = -1;
         if (right > 1) right = 1;
@@ -560,6 +580,7 @@ class CaptureProcessor extends AudioWorkletProcessor {
     return true;
   }
 }
+registerProcessor("source-processor", SourceProcessor);
 registerProcessor("capture-processor", CaptureProcessor);
 `;
 }
@@ -691,7 +712,7 @@ function streamStatusText(info) {
 
   let text = `${encoderStatusLine(info)}${browserThrottleWarning()}\nListeners: ${active.streamListeners}\nSources: ${sourceSummary(active)}`;
   if ("encodedFrames" in info) {
-    text += `\nGain: ${currentGain().toFixed(2)}x\nEncoded AAC frames: ${info.encodedFrames}\nEncoded fps: ${info.encodedFps.toFixed(1)} / 46.9\nAAC kbps: ${info.encodedKbps.toFixed(0)}\nEncoder queue: ${info.queue}`;
+    text += `\nEncoded AAC frames: ${info.encodedFrames}\nEncoded fps: ${info.encodedFps.toFixed(1)} / 46.9\nAAC kbps: ${info.encodedKbps.toFixed(0)}\nEncoder queue: ${info.queue}`;
   }
   return text;
 }
@@ -704,16 +725,97 @@ function stopMediaStream(mediaStream) {
   if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
 }
 
-function stopAudioSource(source) {
+function sourceBaseName(kind) {
+  return kind === "mic" ? "Mic" : "Tab/system audio";
+}
+
+function sourceDisplayName(kind, mediaStream) {
+  const label = mediaStream.getAudioTracks()[0]?.label?.trim() || "";
+  return label ? `${sourceBaseName(kind)}: ${label}` : sourceBaseName(kind);
+}
+
+function sourceGain(source) {
+  const value = Number(source.gainEl.value);
+  if (!Number.isFinite(value)) return 1;
+  return Math.min(4, Math.max(0, value));
+}
+
+function applyAudioSourceSettings(source) {
+  source.processor.port.postMessage({
+    type: "settings",
+    gain: sourceGain(source),
+    mute: source.muteEl.checked,
+    forceMono: source.monoEl.checked
+  });
+}
+
+function createSourceBlock(source) {
+  const block = document.createElement("div");
+  const title = document.createElement("strong");
+  const gainLabel = document.createElement("label");
+  const gain = document.createElement("input");
+  const muteLabel = document.createElement("label");
+  const mute = document.createElement("input");
+  const monoLabel = document.createElement("label");
+  const mono = document.createElement("input");
+  const stop = document.createElement("button");
+
+  title.textContent = source.name;
+
+  gain.type = "number";
+  gain.min = "0";
+  gain.max = "4";
+  gain.step = "0.05";
+  gain.value = "1";
+  gainLabel.append(" Gain ", gain);
+
+  mute.type = "checkbox";
+  muteLabel.append(" ", mute, " Mute");
+
+  mono.type = "checkbox";
+  monoLabel.append(" ", mono, " Force Mono");
+
+  stop.type = "button";
+  stop.textContent = "Stop";
+
+  block.append(title, gainLabel, muteLabel, monoLabel, " ", stop);
+
+  source.block = block;
+  source.gainEl = gain;
+  source.muteEl = mute;
+  source.monoEl = mono;
+  source.stopBtn = stop;
+
+  gain.addEventListener("input", () => {
+    applyAudioSourceSettings(source);
+    updateStreamStatus();
+  });
+  mute.addEventListener("change", () => {
+    applyAudioSourceSettings(source);
+    updateStreamStatus();
+  });
+  mono.addEventListener("change", () => {
+    applyAudioSourceSettings(source);
+    updateStreamStatus();
+  });
+  stop.onclick = () => removeAudioSource(source.kind, source);
+
+  return block;
+}
+
+function disposeAudioSource(source) {
   if (!source) return;
   try { source.node.disconnect(); } catch (_) {}
+  try { source.processor.disconnect(); } catch (_) {}
+  try { source.processor.port.close(); } catch (_) {}
+  if (source.block) source.block.remove();
   stopMediaStream(source.mediaStream);
 }
 
 function removeAudioSource(kind, source) {
   if (!active || active.sources[kind] !== source) return;
   active.sources[kind] = null;
-  stopAudioSource(source);
+  disposeAudioSource(source);
   updateSourceControls();
   updateStreamStatus();
 }
@@ -725,12 +827,28 @@ function installAudioSource(kind, mediaStream) {
   }
 
   const node = active.audioContext.createMediaStreamSource(mediaStream);
-  const next = { mediaStream, node };
-  node.connect(active.mixer);
+  const processor = new AudioWorkletNode(active.audioContext, "source-processor", {
+    numberOfInputs: 1,
+    numberOfOutputs: 1,
+    outputChannelCount: [2]
+  });
+  const next = {
+    kind,
+    name: sourceDisplayName(kind, mediaStream),
+    mediaStream,
+    node,
+    processor
+  };
+  createSourceBlock(next);
+  applyAudioSourceSettings(next);
 
   const previous = active.sources[kind];
   active.sources[kind] = next;
-  if (previous) stopAudioSource(previous);
+  if (previous) disposeAudioSource(previous);
+
+  node.connect(processor);
+  processor.connect(active.mixer);
+  sourcesEl.appendChild(next.block);
 
   mediaStream.getAudioTracks().forEach(track => {
     track.addEventListener("ended", () => removeAudioSource(kind, next), { once: true });
@@ -851,7 +969,6 @@ async function start(kind) {
       }
       encoder.encode(buffer);
     });
-    applyCaptureSettings(captureNode);
     const mixer = audioContext.createGain();
     mixer.channelCount = channels;
     mixer.channelCountMode = "explicit";
@@ -932,8 +1049,8 @@ function cleanup() {
   try { current.captureNode.disconnect(); } catch (_) {}
   try { current.mixer.disconnect(); } catch (_) {}
   try { current.monitor.disconnect(); } catch (_) {}
-  stopAudioSource(current.sources.mic);
-  stopAudioSource(current.sources.screen);
+  disposeAudioSource(current.sources.mic);
+  disposeAudioSource(current.sources.screen);
   current.encoder.close();
   if (current.wakeLock) {
     try { current.wakeLock.release(); } catch (_) {}
@@ -997,13 +1114,6 @@ customRtspEl.addEventListener("input", () => {
 customPasswordEl.addEventListener("input", () => {
   try { localStorage.setItem(customPasswordStorageKey, customPasswordEl.value); } catch (_) {}
 });
-gainEl.addEventListener("input", () => {
-  if (active) applyCaptureSettings(active.captureNode);
-});
-forceMonoEl.addEventListener("change", () => {
-  try { localStorage.setItem(forceMonoStorageKey, forceMonoEl.checked ? "1" : "0"); } catch (_) {}
-  if (active) applyCaptureSettings(active.captureNode);
-});
 document.addEventListener("visibilitychange", refreshScreenWakeLock);
 if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
   navigator.mediaDevices.addEventListener("devicechange", () => {
@@ -1016,7 +1126,6 @@ async function init() {
   await loadServers();
   renderServers();
   loadEncoderMode();
-  try { forceMonoEl.checked = localStorage.getItem(forceMonoStorageKey) === "1"; } catch (_) {}
   try { await refreshMicDevices(savedMicDeviceId()); } catch (_) {}
   updateSourceControls();
   updateUrl();

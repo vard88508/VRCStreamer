@@ -23,15 +23,13 @@
   <option value="wasm320">🔊 WASM AAC 320 kbps</option>
 </select></label>
 <br>
-<label>Gain <input id="gain" type="number" min="0.25" max="4" step="0.25" value="1"></label>
-<br>
-<label><input id="forceMono" type="checkbox"> Force Mono</label>
-<br>
 <label>Mic <select id="micDevice"><option value="">Default microphone</option></select></label>
-<button id="mic" type="button">Stream mic</button>
+<button id="mic" type="button">Add mic</button>
 <br>
-<button id="screen" type="button">Stream tab/system audio</button>
+<button id="screen" type="button">Add tab/system audio</button>
 <button id="stop" type="button" disabled>Stop</button>
+<br>
+<div id="sources"></div>
 <br>
 <span id="stats">Listeners: - Streams: -</span>
 <pre id="status"></pre>
