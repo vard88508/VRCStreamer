@@ -50,6 +50,7 @@ let urlSeq = 0;
 let active = null;
 let streamCode = "";
 let servers = fallbackServers;
+let serverInfo = null;
 
 const encoderModes = {
   native192: {
@@ -120,11 +121,23 @@ function normalizeServerEntry(entry) {
   if (typeof apiBase !== "string" || typeof rtspBase !== "string") return null;
   if (!apiBase.trim() || !rtspBase.trim()) return null;
   return {
-    name: String(entry.name || entry.label || apiBase).trim(),
+    name: String(entry.name || entry.label || "").trim(),
     description: String(entry.description || "").trim(),
     apiBase: apiBase.trim(),
     rtspBase: rtspBase.trim()
   };
+}
+
+function hostLabel(value) {
+  try {
+    return new URL(normalizeBase(value, "https://")).host;
+  } catch (_) {
+    return String(value || "").trim() || "Server";
+  }
+}
+
+function serverDisplayName(server) {
+  return server.name || hostLabel(server.apiBase);
 }
 
 async function loadServers() {
@@ -145,7 +158,7 @@ function renderServers() {
   servers.forEach((server, index) => {
     const option = document.createElement("option");
     option.value = String(index);
-    option.textContent = server.name;
+    option.textContent = serverDisplayName(server);
     serverSelectEl.appendChild(option);
   });
 
@@ -188,7 +201,12 @@ function updateCustomVisibility() {
   customApiEl.disabled = Boolean(active) || !custom;
   customRtspEl.disabled = Boolean(active) || !custom;
   customPasswordEl.disabled = Boolean(active) || !custom;
-  serverDescriptionEl.textContent = custom ? "Use your own API and RTSP server addresses." : selectedServer().description || "";
+  const info = currentServerInfo();
+  if (info && (info.name || info.description)) {
+    serverDescriptionEl.textContent = [info.name, info.description].filter(Boolean).join(" - ");
+  } else {
+    serverDescriptionEl.textContent = custom ? "Use your own API and RTSP server addresses." : selectedServer().description || "";
+  }
 }
 
 function selectedServer() {
@@ -202,6 +220,37 @@ function selectedServer() {
     };
   }
   return servers[Number(serverSelectEl.value)] || servers[0] || fallbackServers[0];
+}
+
+function currentServerKey() {
+  const server = selectedServer();
+  const apiDefault = location.protocol === "https:" ? "https://" : "http://";
+  return `${normalizeBase(server.apiBase, apiDefault)}|${normalizeBase(server.rtspBase, "rtsp://")}`;
+}
+
+function currentServerInfo() {
+  return serverInfo && serverInfo.key === currentServerKey() ? serverInfo : null;
+}
+
+function applyServerInfo(info) {
+  if (!info || typeof info !== "object") return;
+
+  const name = typeof info.name === "string" ? info.name.trim() : "";
+  const description = typeof info.description === "string" ? info.description.trim() : "";
+  serverInfo = { key: currentServerKey(), name, description, video: Boolean(info.video) };
+
+  if (serverSelectEl.value !== "custom") {
+    const index = Number(serverSelectEl.value);
+    const server = servers[index];
+    if (server) {
+      if (name) server.name = name;
+      server.description = description;
+      const option = serverSelectEl.options[index];
+      if (option) option.textContent = serverDisplayName(server);
+    }
+  }
+
+  updateCustomVisibility();
 }
 
 function normalizeBase(value, defaultProtocol) {
@@ -300,9 +349,35 @@ async function refreshStats() {
     const response = await fetch(apiUrl("stats"), { cache: "no-store" });
     if (!response.ok) throw new Error(`stats ${response.status}`);
     const stats = await response.json();
+    applyServerInfo(stats);
     setStats(`Listeners: ${stats.active_listeners} Streams: ${stats.active_streams}`);
   } catch (_) {
     setStats("Listeners: - Streams: -");
+  }
+}
+
+function listenerCountFromMessage(message) {
+  const value = Number(message.listeners);
+  return Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+function handlePublisherMessage(event, setStreamListeners) {
+  if (typeof event.data !== "string") return;
+
+  let message = null;
+  try {
+    message = JSON.parse(event.data);
+  } catch (_) {
+    return;
+  }
+
+  if (message.type === "hello") {
+    applyServerInfo(message);
+    const listeners = listenerCountFromMessage(message);
+    if (listeners !== null) setStreamListeners(listeners);
+  } else if (message.type === "listeners") {
+    const listeners = listenerCountFromMessage(message);
+    if (listeners !== null) setStreamListeners(listeners);
   }
 }
 
@@ -554,6 +629,7 @@ async function start(kind) {
   let audioContext = null;
   let ws = null;
   let encoder = null;
+  let streamListeners = 0;
   try {
     setStatus("Preparing browser AAC encoder...");
     encoder = createAacEncoder(
@@ -590,6 +666,9 @@ async function start(kind) {
     setStatus("Connecting to relay server...");
     ws = new WebSocket(wsUrlForCode(code));
     ws.binaryType = "arraybuffer";
+    ws.onmessage = event => handlePublisherMessage(event, listeners => {
+      streamListeners = listeners;
+    });
     await waitForOpen(ws);
 
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -642,11 +721,11 @@ async function start(kind) {
       if (active && active.ws === ws) failActive("WebSocket error.");
     };
 
-    setStatus(`${encoderStatusLine(encoderInfo)}${browserThrottleWarning()}`);
+    setStatus(`${encoderStatusLine(encoderInfo)}${browserThrottleWarning()}\nListeners: ${streamListeners}`);
     active.statusTimer = setInterval(() => {
       if (!active || active.ws !== ws) return;
       const stats = encoder.stats();
-      setStatus(`${encoderStatusLine(stats)}${browserThrottleWarning()}\nGain: ${currentGain().toFixed(2)}x\nEncoded AAC frames: ${stats.encodedFrames}\nEncoded fps: ${stats.encodedFps.toFixed(1)} / 46.9\nAAC kbps: ${stats.encodedKbps.toFixed(0)}\nEncoder queue: ${stats.queue}`);
+      setStatus(`${encoderStatusLine(stats)}${browserThrottleWarning()}\nListeners: ${streamListeners}\nGain: ${currentGain().toFixed(2)}x\nEncoded AAC frames: ${stats.encodedFrames}\nEncoded fps: ${stats.encodedFps.toFixed(1)} / 46.9\nAAC kbps: ${stats.encodedKbps.toFixed(0)}\nEncoder queue: ${stats.queue}`);
     }, 1000);
   } catch (error) {
     if (encoder) encoder.close();

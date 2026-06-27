@@ -42,6 +42,8 @@ nano .env
 Example:
 
 ```env
+SERVER_NAME=VRCStreamer
+SERVER_DESCRIPTION=
 BIND_ADDR=0.0.0.0:443
 TLS_CERT_PATH=/etc/letsencrypt/live/example.com/fullchain.pem
 TLS_KEY_PATH=/etc/letsencrypt/live/example.com/privkey.pem
@@ -115,6 +117,8 @@ cd server
 
 | Name | Default | Meaning |
 | --- | ---: | --- |
+| `SERVER_NAME` | `VRCStreamer` | Public server name sent to clients |
+| `SERVER_DESCRIPTION` | empty | Public server description sent to clients |
 | `BIND_ADDR` | `0.0.0.0:443` | HTTP/HTTPS API and WebSocket ingest listen address |
 | `TLS_CERT_PATH` | `/etc/letsencrypt/live/example.com/fullchain.pem` | PEM certificate path |
 | `TLS_KEY_PATH` | `/etc/letsencrypt/live/example.com/privkey.pem` | PEM private key path |

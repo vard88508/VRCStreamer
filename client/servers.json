@@ -1,7 +1,5 @@
 [
   {
-    "name": "🔊 Vard's EU Server",
-    "description": "First VRCStreamer server with just 1 CPU core and 1 GB of RAM, hosted in the 🇳🇱 Netherlands.",
     "apiBase": "https://eu.vard.cc",
     "rtspBase": "rtsp://eu.vard.cc"
   }

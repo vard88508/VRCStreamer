@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
     env,
+    fmt::Write as _,
     io::ErrorKind,
     net::{IpAddr, SocketAddr},
     sync::{
@@ -31,7 +32,7 @@ use tokio::{
     net::{TcpListener, tcp::OwnedWriteHalf},
     sync::{Mutex, broadcast},
     task::JoinHandle,
-    time::{Instant as TokioInstant, sleep_until, timeout},
+    time::{Instant as TokioInstant, sleep_until},
 };
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -53,11 +54,14 @@ const RTSP_MAX_HEADERS: usize = 64;
 const RTSP_MAX_BODY_BYTES: usize = 4096;
 const STREAM_ID_HEX_CHARS: usize = 32;
 const STREAM_ID_BYTES: usize = STREAM_ID_HEX_CHARS / 2;
+const PUBLISHER_LISTENER_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 type SharedRtspWriter = Arc<Mutex<OwnedWriteHalf>>;
 
 #[derive(Clone)]
 struct Config {
+    server_name: String,
+    server_description: String,
     bind_addr: SocketAddr,
     rtsp_bind_addr: SocketAddr,
     rtsp_extra_bind_addr: Option<SocketAddr>,
@@ -234,6 +238,8 @@ impl Config {
         }
 
         Ok(Self {
+            server_name: env::var("SERVER_NAME").unwrap_or_else(|_| "VRCStreamer".to_owned()),
+            server_description: env::var("SERVER_DESCRIPTION").unwrap_or_default(),
             bind_addr,
             rtsp_bind_addr,
             rtsp_extra_bind_addr,
@@ -290,7 +296,10 @@ async fn healthz(
 }
 
 #[derive(Serialize)]
-struct StatsResponse {
+struct StatsResponse<'a> {
+    name: &'a str,
+    description: &'a str,
+    video: bool,
     active_listeners: usize,
     active_streams: usize,
 }
@@ -315,6 +324,9 @@ async fn stats(
     };
 
     let mut response = axum::Json(StatsResponse {
+        name: &state.config.server_name,
+        description: &state.config.server_description,
+        video: false,
         active_listeners: state.active_listeners.load(Ordering::Acquire),
         active_streams,
     })
@@ -417,19 +429,59 @@ async fn publisher_session(
     let mut bytes = 0usize;
     let started_at = Instant::now();
     let mut last_report = Instant::now();
+    let mut last_listeners = channel.listeners.load(Ordering::Acquire);
+    if socket
+        .send(Message::Text(
+            publisher_hello_message(&state.config, last_listeners).into(),
+        ))
+        .await
+        .is_err()
+    {
+        finish_publisher(&state, &key, &channel, addr, frames).await;
+        return;
+    }
+
+    let mut idle_sleep = Box::pin(sleep_until(
+        TokioInstant::now() + state.config.publisher_idle_timeout,
+    ));
+    let mut listener_sleep = Box::pin(sleep_until(
+        TokioInstant::now() + PUBLISHER_LISTENER_UPDATE_INTERVAL,
+    ));
 
     loop {
-        let message = match timeout(state.config.publisher_idle_timeout, socket.recv()).await {
-            Ok(Some(Ok(message))) => message,
-            Ok(Some(Err(error))) => {
-                warn!(%addr, %key, %error, "publisher websocket error");
-                break;
+        let message = tokio::select! {
+            message = socket.recv() => {
+                idle_sleep.as_mut().reset(TokioInstant::now() + state.config.publisher_idle_timeout);
+                match message {
+                    Some(Ok(message)) => message,
+                    Some(Err(error)) => {
+                        warn!(%addr, %key, %error, "publisher websocket error");
+                        break;
+                    }
+                    None => break,
+                }
             }
-            Ok(None) => break,
-            Err(_) => {
+            _ = &mut idle_sleep => {
                 warn!(%addr, %key, "publisher idle timeout");
                 let _ = socket.send(Message::Close(None)).await;
                 break;
+            }
+            _ = &mut listener_sleep => {
+                let listeners = channel.listeners.load(Ordering::Acquire);
+                if listeners != last_listeners {
+                    if socket
+                        .send(Message::Text(publisher_listeners_message(listeners).into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    last_listeners = listeners;
+                }
+                listener_sleep.as_mut().reset(
+                    TokioInstant::now() + PUBLISHER_LISTENER_UPDATE_INTERVAL,
+                );
+                continue;
             }
         };
 
@@ -1468,6 +1520,45 @@ fn hash_code(code: &str) -> String {
     out
 }
 
+fn publisher_hello_message(config: &Config, listeners: usize) -> String {
+    let mut out =
+        String::with_capacity(96 + config.server_name.len() + config.server_description.len());
+    out.push_str("{\"type\":\"hello\",\"name\":");
+    push_json_string(&mut out, &config.server_name);
+    out.push_str(",\"description\":");
+    push_json_string(&mut out, &config.server_description);
+    out.push_str(",\"video\":false,\"listeners\":");
+    let _ = write!(out, "{listeners}");
+    out.push('}');
+    out
+}
+
+fn publisher_listeners_message(listeners: usize) -> String {
+    let mut out = String::with_capacity(40);
+    let _ = write!(out, "{{\"type\":\"listeners\",\"listeners\":{listeners}}}");
+    out
+}
+
+fn push_json_string(out: &mut String, value: &str) {
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            ch if ch <= '\u{1f}' => {
+                let _ = write!(out, "\\u{:04x}", ch as u32);
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+}
+
 fn hex_char(nibble: u8) -> char {
     match nibble {
         0..=9 => (b'0' + nibble) as char,
@@ -1628,6 +1719,8 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
+            server_name: "VRCStreamer".to_owned(),
+            server_description: "Test server".to_owned(),
             bind_addr: "127.0.0.1:8080".parse().unwrap(),
             rtsp_bind_addr: "127.0.0.1:8554".parse().unwrap(),
             rtsp_extra_bind_addr: None,
@@ -1666,6 +1759,18 @@ mod tests {
     #[test]
     fn hash_code_matches_sha256_128_bit_hex_prefix() {
         assert_eq!(hash_code("abc"), "ba7816bf8f01cfea414140de5dae2223");
+    }
+
+    #[test]
+    fn publisher_hello_message_escapes_json_strings() {
+        let mut config = test_config();
+        config.server_name = "Name \"A\"".to_owned();
+        config.server_description = "Line\nTwo".to_owned();
+
+        assert_eq!(
+            publisher_hello_message(&config, 7),
+            "{\"type\":\"hello\",\"name\":\"Name \\\"A\\\"\",\"description\":\"Line\\nTwo\",\"video\":false,\"listeners\":7}"
+        );
     }
 
     #[test]
