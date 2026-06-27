@@ -8,6 +8,7 @@ const rtspUrlEl = document.getElementById("rtspUrl");
 const encoderModeEl = document.getElementById("encoderMode");
 const gainEl = document.getElementById("gain");
 const forceMonoEl = document.getElementById("forceMono");
+const micDeviceEl = document.getElementById("micDevice");
 const statusEl = document.getElementById("status");
 const statsEl = document.getElementById("stats");
 const copyUrlBtn = document.getElementById("copyUrl");
@@ -23,6 +24,7 @@ const customRtspStorageKey = "vrc-audio-streamer-custom-rtsp";
 const customPasswordStorageKey = "vrc-audio-streamer-custom-password";
 const encoderModeStorageKey = "vrc-audio-streamer-encoder-mode";
 const forceMonoStorageKey = "vrc-audio-streamer-force-mono";
+const micDeviceStorageKey = "vrc-audio-streamer-mic-device";
 const sampleRate = 48000;
 const channels = 2;
 const framesPerChunk = 1024;
@@ -51,6 +53,7 @@ let active = null;
 let streamCode = "";
 let servers = fallbackServers;
 let serverInfo = null;
+let sourceRequestInFlight = false;
 
 const encoderModes = {
   native192: {
@@ -303,6 +306,36 @@ function applyCaptureSettings(node) {
   node.port.postMessage({ type: "settings", gain: currentGain(), forceMono: currentForceMono() });
 }
 
+function hasSource(state, kind) {
+  return Boolean(state && state.sources && state.sources[kind]);
+}
+
+function sourceSummary(state = active) {
+  const names = [];
+  if (hasSource(state, "mic")) names.push("Mic");
+  if (hasSource(state, "screen")) names.push("Tab/system audio");
+  return names.join(" + ") || "none";
+}
+
+function updateSourceControls() {
+  const streaming = Boolean(active);
+  micBtn.disabled = sourceRequestInFlight;
+  screenBtn.disabled = sourceRequestInFlight;
+  micDeviceEl.disabled = sourceRequestInFlight;
+  stopBtn.disabled = !streaming;
+  micBtn.textContent = streaming
+    ? (hasSource(active, "mic") ? "Change mic" : "Add mic")
+    : "Stream mic";
+  screenBtn.textContent = streaming
+    ? (hasSource(active, "screen") ? "Change tab/system audio" : "Add tab/system audio")
+    : "Stream tab/system audio";
+}
+
+function setSourceRequestBusy(busy) {
+  sourceRequestInFlight = busy;
+  updateSourceControls();
+}
+
 function browserThrottleWarning() {
   return document.hidden ? "\nBrowser tab is hidden/minimized; Chrome may throttle realtime encoding." : "";
 }
@@ -332,6 +365,42 @@ function setMediaSessionPlaying(playing) {
   try {
     navigator.mediaSession.playbackState = playing ? "playing" : "none";
   } catch (_) {}
+}
+
+function savedMicDeviceId() {
+  try { return localStorage.getItem(micDeviceStorageKey) || ""; } catch (_) {}
+  return "";
+}
+
+async function refreshMicDevices(preferredId = micDeviceEl.value || savedMicDeviceId()) {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const inputs = devices.filter(device => device.kind === "audioinput");
+  micDeviceEl.textContent = "";
+
+  const defaultOption = document.createElement("option");
+  defaultOption.value = "";
+  defaultOption.textContent = "Default microphone";
+  micDeviceEl.appendChild(defaultOption);
+
+  inputs.forEach((device, index) => {
+    if (!device.deviceId) return;
+    const option = document.createElement("option");
+    option.value = device.deviceId;
+    option.textContent = device.label || `Microphone ${index + 1}`;
+    micDeviceEl.appendChild(option);
+  });
+
+  if (preferredId && ![...micDeviceEl.options].some(option => option.value === preferredId)) {
+    const savedOption = document.createElement("option");
+    savedOption.value = preferredId;
+    savedOption.textContent = "Saved microphone";
+    micDeviceEl.appendChild(savedOption);
+  }
+  if ([...micDeviceEl.options].some(option => option.value === preferredId)) {
+    micDeviceEl.value = preferredId;
+  }
 }
 
 function wsUrlForCode(code) {
@@ -418,6 +487,8 @@ async function captureAudio(kind) {
   if (kind === "screen") {
     return await navigator.mediaDevices.getDisplayMedia({ video: true, audio });
   }
+  const deviceId = micDeviceEl.value;
+  if (deviceId) audio.deviceId = { exact: deviceId };
   return await navigator.mediaDevices.getUserMedia({ video: false, audio });
 }
 
@@ -607,17 +678,115 @@ function encoderStatusLine(info) {
 }
 
 function setStreamingControls(streaming) {
-  micBtn.disabled = streaming;
-  screenBtn.disabled = streaming;
   stopBtn.disabled = !streaming;
   newLinkBtn.disabled = streaming;
   serverSelectEl.disabled = streaming;
   encoderModeEl.disabled = streaming;
   updateCustomVisibility();
+  updateSourceControls();
+}
+
+function streamStatusText(info) {
+  if (!active) return encoderStatusLine(info);
+
+  let text = `${encoderStatusLine(info)}${browserThrottleWarning()}\nListeners: ${active.streamListeners}\nSources: ${sourceSummary(active)}`;
+  if ("encodedFrames" in info) {
+    text += `\nGain: ${currentGain().toFixed(2)}x\nEncoded AAC frames: ${info.encodedFrames}\nEncoded fps: ${info.encodedFps.toFixed(1)} / 46.9\nAAC kbps: ${info.encodedKbps.toFixed(0)}\nEncoder queue: ${info.queue}`;
+  }
+  return text;
+}
+
+function updateStreamStatus(info) {
+  if (active) setStatus(streamStatusText(info || active.encoder.stats()));
+}
+
+function stopMediaStream(mediaStream) {
+  if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
+}
+
+function stopAudioSource(source) {
+  if (!source) return;
+  try { source.node.disconnect(); } catch (_) {}
+  stopMediaStream(source.mediaStream);
+}
+
+function removeAudioSource(kind, source) {
+  if (!active || active.sources[kind] !== source) return;
+  active.sources[kind] = null;
+  stopAudioSource(source);
+  updateSourceControls();
+  updateStreamStatus();
+}
+
+function installAudioSource(kind, mediaStream) {
+  if (!active) {
+    stopMediaStream(mediaStream);
+    return;
+  }
+
+  const node = active.audioContext.createMediaStreamSource(mediaStream);
+  const next = { mediaStream, node };
+  node.connect(active.mixer);
+
+  const previous = active.sources[kind];
+  active.sources[kind] = next;
+  if (previous) stopAudioSource(previous);
+
+  mediaStream.getAudioTracks().forEach(track => {
+    track.addEventListener("ended", () => removeAudioSource(kind, next), { once: true });
+  });
+
+  updateSourceControls();
+  updateStreamStatus();
+}
+
+async function requestAudioSource(kind) {
+  setStatus(kind === "screen"
+    ? "Choose a screen/tab and enable audio sharing in the browser prompt..."
+    : "Allow microphone access in the browser prompt...");
+  const mediaStream = await withTimeout(
+    captureAudio(kind),
+    45000,
+    "Timed out waiting for browser audio permission/selection."
+  );
+  if (mediaStream.getAudioTracks().length === 0) {
+    stopMediaStream(mediaStream);
+    throw new Error("No audio track selected");
+  }
+  if (kind === "mic") {
+    try { await refreshMicDevices(micDeviceEl.value); } catch (_) {}
+  }
+  return mediaStream;
+}
+
+async function addOrReplaceSource(kind) {
+  if (!active || sourceRequestInFlight) return;
+
+  let mediaStream = null;
+  setSourceRequestBusy(true);
+  try {
+    mediaStream = await requestAudioSource(kind);
+    if (!active) {
+      stopMediaStream(mediaStream);
+      return;
+    }
+    installAudioSource(kind, mediaStream);
+    mediaStream = null;
+    updateStreamStatus();
+  } catch (error) {
+    setStatus(error.message || String(error));
+  } finally {
+    stopMediaStream(mediaStream);
+    setSourceRequestBusy(false);
+  }
 }
 
 async function start(kind) {
-  if (active) stop();
+  if (active) {
+    await addOrReplaceSource(kind);
+    return;
+  }
+  if (sourceRequestInFlight) return;
 
   const code = streamCode;
   if (code.length < 8) {
@@ -629,8 +798,11 @@ async function start(kind) {
   let audioContext = null;
   let ws = null;
   let encoder = null;
-  let streamListeners = 0;
+  let pendingStreamListeners = 0;
+  setSourceRequestBusy(true);
   try {
+    mediaStream = await requestAudioSource(kind);
+
     setStatus("Preparing browser AAC encoder...");
     encoder = createAacEncoder(
       packet => {
@@ -650,16 +822,6 @@ async function start(kind) {
       encoderReadyError = error;
       return null;
     });
-
-    setStatus(kind === "screen"
-      ? "Choose a screen/tab and enable audio sharing in the browser prompt..."
-      : "Allow microphone access in the browser prompt...");
-    mediaStream = await withTimeout(
-      captureAudio(kind),
-      45000,
-      "Timed out waiting for browser audio permission/selection."
-    );
-    if (mediaStream.getAudioTracks().length === 0) throw new Error("No audio track selected");
     const encoderInfo = await encoderReady;
     if (encoderReadyError) throw encoderReadyError;
 
@@ -667,7 +829,11 @@ async function start(kind) {
     ws = new WebSocket(wsUrlForCode(code));
     ws.binaryType = "arraybuffer";
     ws.onmessage = event => handlePublisherMessage(event, listeners => {
-      streamListeners = listeners;
+      pendingStreamListeners = listeners;
+      if (active && active.ws === ws) {
+        active.streamListeners = listeners;
+        updateStreamStatus();
+      }
     });
     await waitForOpen(ws);
 
@@ -677,7 +843,6 @@ async function start(kind) {
       throw new Error(`AudioContext returned ${audioContext.sampleRate} Hz, expected ${sampleRate} Hz.`);
     }
 
-    const source = audioContext.createMediaStreamSource(mediaStream);
     const captureNode = await createCaptureNode(audioContext, buffer => {
       if (!active || active.encoder !== encoder) return;
       if (encoder.lagFrames() > 128) {
@@ -687,24 +852,31 @@ async function start(kind) {
       encoder.encode(buffer);
     });
     applyCaptureSettings(captureNode);
+    const mixer = audioContext.createGain();
+    mixer.channelCount = channels;
+    mixer.channelCountMode = "explicit";
+    mixer.channelInterpretation = "speakers";
     const monitor = audioContext.createGain();
     monitor.gain.value = monitorOutputGain;
     const wakeLock = await requestScreenWakeLock();
     setMediaSessionPlaying(true);
 
     active = {
-      mediaStream,
       audioContext,
       ws,
       encoder,
-      source,
+      mixer,
       captureNode,
       monitor,
       wakeLock,
-      statusTimer: null
+      statusTimer: null,
+      sources: { mic: null, screen: null },
+      streamListeners: pendingStreamListeners
     };
 
-    source.connect(captureNode);
+    installAudioSource(kind, mediaStream);
+    mediaStream = null;
+    mixer.connect(captureNode);
     captureNode.connect(monitor);
     monitor.connect(audioContext.destination);
     await audioContext.resume();
@@ -721,11 +893,10 @@ async function start(kind) {
       if (active && active.ws === ws) failActive("WebSocket error.");
     };
 
-    setStatus(`${encoderStatusLine(encoderInfo)}${browserThrottleWarning()}\nListeners: ${streamListeners}`);
+    setStatus(streamStatusText(encoderInfo));
     active.statusTimer = setInterval(() => {
       if (!active || active.ws !== ws) return;
-      const stats = encoder.stats();
-      setStatus(`${encoderStatusLine(stats)}${browserThrottleWarning()}\nListeners: ${streamListeners}\nGain: ${currentGain().toFixed(2)}x\nEncoded AAC frames: ${stats.encodedFrames}\nEncoded fps: ${stats.encodedFps.toFixed(1)} / 46.9\nAAC kbps: ${stats.encodedKbps.toFixed(0)}\nEncoder queue: ${stats.queue}`);
+      setStatus(streamStatusText(encoder.stats()));
     }, 1000);
   } catch (error) {
     if (encoder) encoder.close();
@@ -733,9 +904,11 @@ async function start(kind) {
     if (audioContext) {
       try { audioContext.close(); } catch (_) {}
     }
-    if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
+    stopMediaStream(mediaStream);
     cleanup();
     setStatus(error.message || String(error));
+  } finally {
+    setSourceRequestBusy(false);
   }
 }
 
@@ -757,9 +930,10 @@ function cleanup() {
 
   if (current.statusTimer) clearInterval(current.statusTimer);
   try { current.captureNode.disconnect(); } catch (_) {}
-  try { current.source.disconnect(); } catch (_) {}
+  try { current.mixer.disconnect(); } catch (_) {}
   try { current.monitor.disconnect(); } catch (_) {}
-  current.mediaStream.getTracks().forEach(track => track.stop());
+  stopAudioSource(current.sources.mic);
+  stopAudioSource(current.sources.screen);
   current.encoder.close();
   if (current.wakeLock) {
     try { current.wakeLock.release(); } catch (_) {}
@@ -799,6 +973,10 @@ newLinkBtn.onclick = () => {
 micBtn.onclick = () => start("mic");
 screenBtn.onclick = () => start("screen");
 stopBtn.onclick = stop;
+micDeviceEl.onchange = () => {
+  try { localStorage.setItem(micDeviceStorageKey, micDeviceEl.value); } catch (_) {}
+  if (active) addOrReplaceSource("mic");
+};
 serverSelectEl.onchange = () => {
   try { localStorage.setItem(serverStorageKey, serverSelectEl.value); } catch (_) {}
   updateCustomVisibility();
@@ -827,6 +1005,11 @@ forceMonoEl.addEventListener("change", () => {
   if (active) applyCaptureSettings(active.captureNode);
 });
 document.addEventListener("visibilitychange", refreshScreenWakeLock);
+if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+  navigator.mediaDevices.addEventListener("devicechange", () => {
+    refreshMicDevices().catch(() => {});
+  });
+}
 
 async function init() {
   streamCode = loadCode();
@@ -834,6 +1017,8 @@ async function init() {
   renderServers();
   loadEncoderMode();
   try { forceMonoEl.checked = localStorage.getItem(forceMonoStorageKey) === "1"; } catch (_) {}
+  try { await refreshMicDevices(savedMicDeviceId()); } catch (_) {}
+  updateSourceControls();
   updateUrl();
   refreshStats();
   setInterval(refreshStats, statsRefreshMs);
