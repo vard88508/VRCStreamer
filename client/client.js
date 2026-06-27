@@ -307,12 +307,8 @@ function updateSourceControls() {
   screenBtn.disabled = sourceRequestInFlight;
   micDeviceEl.disabled = sourceRequestInFlight;
   stopBtn.disabled = !streaming;
-  micBtn.textContent = streaming
-    ? (hasSource(active, "mic") ? "Change mic" : "Add mic")
-    : "Add mic";
-  screenBtn.textContent = streaming
-    ? (hasSource(active, "screen") ? "Change tab/system audio" : "Add tab/system audio")
-    : "Add tab/system audio";
+  micBtn.textContent = "Add Mic";
+  screenBtn.textContent = "Add tab/system audio";
 }
 
 function setSourceRequestBusy(busy) {
@@ -752,15 +748,19 @@ function applyAudioSourceSettings(source) {
 function createSourceBlock(source) {
   const block = document.createElement("div");
   const title = document.createElement("strong");
+  const change = document.createElement("button");
   const gainLabel = document.createElement("label");
   const gain = document.createElement("input");
   const muteLabel = document.createElement("label");
   const mute = document.createElement("input");
   const monoLabel = document.createElement("label");
   const mono = document.createElement("input");
-  const stop = document.createElement("button");
+  const remove = document.createElement("button");
 
   title.textContent = source.name;
+
+  change.type = "button";
+  change.textContent = "Change";
 
   gain.type = "number";
   gain.min = "0";
@@ -775,17 +775,19 @@ function createSourceBlock(source) {
   mono.type = "checkbox";
   monoLabel.append(" ", mono, " Force Mono");
 
-  stop.type = "button";
-  stop.textContent = "Stop";
+  remove.type = "button";
+  remove.textContent = "Remove";
 
-  block.append(title, gainLabel, muteLabel, monoLabel, " ", stop);
+  block.append(title, " ", change, gainLabel, muteLabel, monoLabel, " ", remove);
 
   source.block = block;
+  source.changeBtn = change;
   source.gainEl = gain;
   source.muteEl = mute;
   source.monoEl = mono;
-  source.stopBtn = stop;
+  source.removeBtn = remove;
 
+  change.onclick = () => addOrReplaceSource(source.kind);
   gain.addEventListener("input", () => {
     applyAudioSourceSettings(source);
     updateStreamStatus();
@@ -798,7 +800,7 @@ function createSourceBlock(source) {
     applyAudioSourceSettings(source);
     updateStreamStatus();
   });
-  stop.onclick = () => removeAudioSource(source.kind, source);
+  remove.onclick = () => removeAudioSource(source.kind, source);
 
   return block;
 }
