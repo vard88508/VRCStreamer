@@ -2,6 +2,7 @@ const $ = id => document.getElementById(id);
 const mainEl = document.querySelector("main");
 const serverSelectEl = $("serverSelect");
 const serverHintEl = $("serverHint");
+const messageBoxEl = $("messageBox");
 const customServerEl = $("customServer");
 const customApiLabelEl = $("customApiLabel");
 const customApiEl = $("customApi");
@@ -52,13 +53,15 @@ const sourceSettingsStorageKey = "vrc-audio-streamer-source-settings";
 const sampleRate = 48000;
 const channels = 2;
 const framesPerChunk = 1024;
-const bitrate = 320000;
+const wasm192Bitrate = 192000;
+const wasm320Bitrate = 320000;
 const expectedEncodedFps = sampleRate / framesPerChunk;
 const expectedEncodedFpsLabel = expectedEncodedFps.toFixed(1);
 const redEncodedFps = 42;
 const native192Bitrates = [192000];
 const expectedAacConfigHex = "1190";
 const statsRefreshMs = 15000;
+const messageRefreshMs = 60000;
 const monitorOutputGain = 0.0001;
 const fallbackServers = [
   {
@@ -87,6 +90,7 @@ let micDeviceSelectionReady = false;
 let sourceRequestInFlight = false;
 let linkRestartInFlight = false;
 let rtspHintResetTimer = 0;
+let messagePayload = null;
 
 const encoderModes = {
   native192: {
@@ -95,8 +99,14 @@ const encoderModes = {
     preferNative: true,
     allowWasmFallback: false
   },
+  wasm192: {
+    bitrate: wasm192Bitrate,
+    nativeAacBitrates: [],
+    preferNative: false,
+    allowWasmFallback: true
+  },
   wasm320: {
-    bitrate,
+    bitrate: wasm320Bitrate,
     nativeAacBitrates: [],
     preferNative: false,
     allowWasmFallback: true
@@ -130,6 +140,7 @@ const translations = {
     tabSystem: "Tab/System",
     addMicInput: "Add Mic/Input Device Audio",
     addTabSystem: "Add Tab/System Audio",
+    wasm192Encoder: "🔊 WASM AAC 192 kbps",
     wasmEncoder: "🔊 WASM AAC 320 kbps"
   },
   ja: {
@@ -158,6 +169,7 @@ const translations = {
     tabSystem: "タブ/システム",
     addMicInput: "マイク/入力デバイス音声を追加",
     addTabSystem: "タブ/システム音声を追加",
+    wasm192Encoder: "🔊 WASM AAC 192 kbps",
     wasmEncoder: "🔊 WASM AAC 320 kbps"
   },
   ru: {
@@ -186,6 +198,7 @@ const translations = {
     tabSystem: "Вкладки/системы",
     addMicInput: "Добавить звук из микрофона/устройства ввода",
     addTabSystem: "Добавить звук из вкладки/системы",
+    wasm192Encoder: "🔊 WASM AAC 192 kbps",
     wasmEncoder: "🔊 WASM AAC 320 kbps"
   }
 };
@@ -252,9 +265,47 @@ function loadLanguage() {
 
 function updateEncoderLabels() {
   const nativeOption = encoderModeEl.querySelector('option[value="native192"]');
+  const wasm192Option = encoderModeEl.querySelector('option[value="wasm192"]');
   const wasmOption = encoderModeEl.querySelector('option[value="wasm320"]');
   if (nativeOption) nativeOption.textContent = tr("nativeEncoder");
+  if (wasm192Option) wasm192Option.textContent = tr("wasm192Encoder");
   if (wasmOption) wasmOption.textContent = tr("wasmEncoder");
+}
+
+function normalizeMessageText(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function localizedMessageText(message) {
+  if (!message || typeof message !== "object" || Array.isArray(message)) return "";
+  const direct = normalizeMessageText(message[currentLanguage]);
+  if (direct) return direct;
+  const english = normalizeMessageText(message.en);
+  if (english) return english;
+  for (const value of Object.values(message)) {
+    const text = normalizeMessageText(value);
+    if (text) return text;
+  }
+  return "";
+}
+
+function renderMessage() {
+  const text = localizedMessageText(messagePayload);
+  messageBoxEl.textContent = text;
+  messageBoxEl.hidden = !text;
+}
+
+async function refreshMessage() {
+  const url = new URL("message.json", location.href);
+  url.searchParams.set("t", String(Date.now()));
+  try {
+    const response = await fetch(url, { cache: "no-store" });
+    if (!response.ok) throw new Error(`message.json ${response.status}`);
+    messagePayload = await response.json();
+  } catch (_) {
+    messagePayload = null;
+  }
+  renderMessage();
 }
 
 function applyLanguage() {
@@ -277,6 +328,7 @@ function applyLanguage() {
   updateEncoderLabels();
   if (rtspHintEl.textContent && rtspHintEl.textContent !== tr("copied")) setRtspHint(tr("clickToCopy"));
   for (const el of document.querySelectorAll("[data-i18n]")) el.textContent = tr(el.dataset.i18n);
+  renderMessage();
   updateCustomOption();
   updateServerHint();
   renderAddSourceButtons();
@@ -550,6 +602,7 @@ function renderServers() {
 
 function loadEncoderMode() {
   let saved = readStorage(encoderModeStorageKey, "native192") || "native192";
+  if (saved === "wasm190") saved = "wasm192";
   if (!encoderModes[saved]) saved = "native192";
   encoderModeEl.value = saved;
 }
@@ -593,7 +646,7 @@ async function selectWasmWhenNativeUnsupported() {
   if (encoderModeEl.value !== "native192") return;
   const supported = await nativeEncoderSupported();
   if (supported || encoderModeEl.value !== "native192") return;
-  encoderModeEl.value = "wasm320";
+  encoderModeEl.value = "wasm192";
   writeStorage(encoderModeStorageKey, encoderModeEl.value);
 }
 
@@ -2033,7 +2086,9 @@ async function init() {
   try { await refreshMicDevices(savedMicDeviceId()); } catch (_) {}
   setStreamingControls(false);
   updateUrl();
+  refreshMessage();
   refreshStats();
+  setInterval(refreshMessage, messageRefreshMs);
   setInterval(refreshStats, statsRefreshMs);
 }
 

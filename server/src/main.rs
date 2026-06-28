@@ -459,7 +459,11 @@ async fn publisher_session(
                 match message {
                     Some(Ok(message)) => message,
                     Some(Err(error)) => {
-                        warn!(%peer, %key, %error, "publisher websocket error");
+                        if is_websocket_disconnect_noise(&error) {
+                            debug!(%peer, %key, %error, "publisher websocket disconnected");
+                        } else {
+                            warn!(%peer, %key, %error, "publisher websocket error");
+                        }
                         break;
                     }
                     None => break,
@@ -1325,6 +1329,13 @@ fn looks_like_adts_frame(frame: &[u8]) -> bool {
     frame_len == frame.len() && frame_len >= header_len
 }
 
+fn is_websocket_disconnect_noise(error: &dyn std::fmt::Display) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    text.contains("connection reset without closing handshake")
+        || text.contains("connection reset by peer")
+        || text.contains("broken pipe")
+}
+
 struct RateWindow {
     started: Instant,
     bytes: usize,
@@ -1806,6 +1817,18 @@ mod tests {
         assert!(peer.starts_with("peer:"));
         assert_eq!(peer, peer_id(&state, ip));
         assert!(!peer.contains("203.0.113.42"));
+    }
+
+    #[test]
+    fn websocket_disconnect_noise_is_not_warning_worthy() {
+        assert!(is_websocket_disconnect_noise(
+            &"WebSocket protocol error: Connection reset without closing handshake"
+        ));
+        assert!(is_websocket_disconnect_noise(&"connection reset by peer"));
+        assert!(is_websocket_disconnect_noise(&"Broken pipe"));
+        assert!(!is_websocket_disconnect_noise(
+            &"WebSocket protocol error: invalid frame opcode"
+        ));
     }
 
     #[test]
