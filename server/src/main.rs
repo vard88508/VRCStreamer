@@ -21,11 +21,12 @@ use std::{
     fmt::Write as _,
     io::ErrorKind,
     net::{IpAddr, SocketAddr},
+    process,
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -92,6 +93,7 @@ struct AppState {
     active_publishers: AtomicUsize,
     active_listeners: AtomicUsize,
     next_rtsp_session: AtomicUsize,
+    log_salt: [u8; 16],
 }
 
 struct Channel {
@@ -163,6 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         active_publishers: AtomicUsize::new(0),
         active_listeners: AtomicUsize::new(0),
         next_rtsp_session: AtomicUsize::new(1),
+        log_salt: make_log_salt(),
     });
     install_panic_hook(state.clone());
 
@@ -187,13 +190,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = async {
         if let (Some(cert_path), Some(key_path)) = (tls_cert_path, tls_key_path) {
             let tls_config = RustlsConfig::from_pem_file(cert_path, key_path).await?;
-            info!("listening on https://{bind_addr}");
+            info!(port = bind_addr.port(), "listening on https");
             axum_server::tls_rustls::bind_rustls(bind_addr, tls_config)
                 .handle(handle)
                 .serve(service)
                 .await?;
         } else {
-            info!("listening on http://{bind_addr}");
+            info!(port = bind_addr.port(), "listening on http");
             axum_server::bind(bind_addr)
                 .handle(handle)
                 .serve(service)
@@ -344,8 +347,9 @@ async fn ingest_ws(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
+    let peer = peer_id(&state, addr.ip());
     if !allow_http_request(&state, addr.ip()) {
-        warn!(%addr, "rejected publisher over http request rate limit");
+        warn!(%peer, "rejected publisher over http request rate limit");
         return text_response_with_cors(
             StatusCode::TOO_MANY_REQUESTS,
             "too many requests\n",
@@ -355,12 +359,12 @@ async fn ingest_ws(
     }
 
     if !origin_allowed(&headers, &state.config) {
-        warn!(%addr, "rejected publisher with invalid origin");
+        warn!(%peer, "rejected publisher with invalid origin");
         return text_response(StatusCode::FORBIDDEN, "origin is not allowed\n");
     }
 
     if !password_allowed(query.password.as_deref(), &state.config) {
-        warn!(%addr, "rejected publisher with invalid password");
+        warn!(%peer, "rejected publisher with invalid password");
         return text_response_with_cors(
             StatusCode::UNAUTHORIZED,
             "invalid publish password\n",
@@ -410,9 +414,9 @@ async fn ingest_ws(
         );
     }
 
-    info!(%addr, %key, "aac publisher connected");
+    info!(%peer, %key, "aac publisher connected");
     ws.max_message_size(state.config.max_aac_frame_bytes + 1024)
-        .on_upgrade(move |socket| publisher_session(socket, state, key, channel, addr, ip_guard))
+        .on_upgrade(move |socket| publisher_session(socket, state, key, channel, peer, ip_guard))
         .into_response()
 }
 
@@ -421,7 +425,7 @@ async fn publisher_session(
     state: Arc<AppState>,
     key: String,
     channel: Arc<Channel>,
-    addr: SocketAddr,
+    peer: String,
     _ip_guard: Option<PublisherIpGuard>,
 ) {
     let mut rate = RateWindow::new(Duration::from_secs(5));
@@ -437,7 +441,7 @@ async fn publisher_session(
         .await
         .is_err()
     {
-        finish_publisher(&state, &key, &channel, addr, frames).await;
+        finish_publisher(&state, &key, &channel, &peer, frames).await;
         return;
     }
 
@@ -455,14 +459,14 @@ async fn publisher_session(
                 match message {
                     Some(Ok(message)) => message,
                     Some(Err(error)) => {
-                        warn!(%addr, %key, %error, "publisher websocket error");
+                        warn!(%peer, %key, %error, "publisher websocket error");
                         break;
                     }
                     None => break,
                 }
             }
             _ = &mut idle_sleep => {
-                warn!(%addr, %key, "publisher idle timeout");
+                warn!(%peer, %key, "publisher idle timeout");
                 let _ = socket.send(Message::Close(None)).await;
                 break;
             }
@@ -488,17 +492,17 @@ async fn publisher_session(
         match message {
             Message::Binary(frame) => {
                 if frame.len() > state.config.max_aac_frame_bytes {
-                    warn!(%addr, %key, len = frame.len(), "aac frame too large");
+                    warn!(%peer, %key, len = frame.len(), "aac frame too large");
                     let _ = socket.send(Message::Close(None)).await;
                     break;
                 }
                 if !rate.allow(frame.len(), state.config.max_ingest_bytes_per_sec) {
-                    warn!(%addr, %key, "publisher exceeded aac ingest rate");
+                    warn!(%peer, %key, "publisher exceeded aac ingest rate");
                     let _ = socket.send(Message::Close(None)).await;
                     break;
                 }
                 if let Err(reason) = validate_aac_access_unit(&frame) {
-                    warn!(%addr, %key, %reason, "publisher sent invalid aac");
+                    warn!(%peer, %key, %reason, "publisher sent invalid aac");
                     let _ = socket.send(Message::Close(None)).await;
                     break;
                 }
@@ -508,12 +512,12 @@ async fn publisher_session(
                 frames += 1;
                 bytes = bytes.saturating_add(frame_len);
                 if frames == 1 {
-                    info!(%addr, %key, "publisher sent first aac frame");
+                    info!(%peer, %key, "publisher sent first aac frame");
                 }
                 if frames.is_multiple_of(250) || last_report.elapsed() >= Duration::from_secs(5) {
                     let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
                     info!(
-                        %addr,
+                        %peer,
                         %key,
                         frames,
                         bytes,
@@ -533,48 +537,49 @@ async fn publisher_session(
                 break;
             }
             Message::Text(_) => {
-                warn!(%addr, %key, "publisher sent text message");
+                warn!(%peer, %key, "publisher sent text message");
                 let _ = socket.send(Message::Close(None)).await;
                 break;
             }
         }
     }
 
-    finish_publisher(&state, &key, &channel, addr, frames).await;
+    finish_publisher(&state, &key, &channel, &peer, frames).await;
 }
 
 async fn finish_publisher(
     state: &Arc<AppState>,
     key: &str,
     channel: &Arc<Channel>,
-    addr: SocketAddr,
+    peer: &str,
     frames: usize,
 ) {
     let _ = channel.tx.send(Bytes::new());
     channel.publisher.store(false, Ordering::Release);
     state.active_publishers.fetch_sub(1, Ordering::AcqRel);
     cleanup_channel(state, key, channel).await;
-    info!(%addr, %key, frames, "aac publisher disconnected");
+    info!(%peer, %key, frames, "aac publisher disconnected");
 }
 
 async fn rtsp_server(state: Arc<AppState>, bind_addr: SocketAddr) {
     let listener = match TcpListener::bind(bind_addr).await {
         Ok(listener) => listener,
         Err(error) => {
-            warn!(%error, %bind_addr, "failed to bind rtsp listener");
+            warn!(%error, port = bind_addr.port(), "failed to bind rtsp listener");
             return;
         }
     };
 
-    info!("listening on rtsp://{bind_addr}");
+    info!(port = bind_addr.port(), "listening on rtsp");
 
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
                 let state = state.clone();
+                let peer = peer_id(&state, addr.ip());
                 tokio::spawn(async move {
-                    if let Err(error) = handle_rtsp_client(stream, addr, state).await {
-                        warn!(%addr, %error, "rtsp client error");
+                    if let Err(error) = handle_rtsp_client(stream, peer.clone(), state).await {
+                        warn!(%peer, %error, "rtsp client error");
                     }
                 });
             }
@@ -585,7 +590,7 @@ async fn rtsp_server(state: Arc<AppState>, bind_addr: SocketAddr) {
 
 async fn handle_rtsp_client(
     stream: tokio::net::TcpStream,
-    addr: SocketAddr,
+    peer: String,
     state: Arc<AppState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     stream.set_nodelay(true)?;
@@ -598,13 +603,13 @@ async fn handle_rtsp_client(
         let Some(request) = read_rtsp_request(&mut reader).await? else {
             break;
         };
-        if handle_rtsp_request(&request, &writer, &state, &mut session, addr).await? {
+        if handle_rtsp_request(&request, &writer, &state, &mut session, &peer).await? {
             break;
         }
     }
 
     session.stop();
-    info!(%addr, "rtsp client disconnected");
+    info!(%peer, "rtsp client disconnected");
     Ok(())
 }
 
@@ -613,10 +618,10 @@ async fn handle_rtsp_request(
     writer: &SharedRtspWriter,
     state: &Arc<AppState>,
     session: &mut RtspSession,
-    addr: SocketAddr,
+    peer: &str,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let cseq = request.header("cseq").unwrap_or("0");
-    info!(%addr, method = %request.method, uri = %request.uri, "rtsp request");
+    info!(%peer, method = %request.method, uri = %request.uri, "rtsp request");
 
     match request.method.as_str() {
         "OPTIONS" => {
@@ -724,7 +729,7 @@ async fn handle_rtsp_request(
                 None,
             )
             .await?;
-            info!(%addr, %key, rtp_channel, "rtsp audio setup");
+            info!(%peer, %key, rtp_channel, "rtsp audio setup");
         }
         "PLAY" => {
             if !session.audio_setup {
@@ -781,7 +786,7 @@ async fn handle_rtsp_request(
                     rx,
                     guard,
                     key,
-                    addr,
+                    peer.to_owned(),
                     channel,
                     rtp,
                 )));
@@ -863,7 +868,7 @@ async fn rtsp_rtp_task(
     mut rx: broadcast::Receiver<Bytes>,
     _guard: ListenerGuard,
     key: String,
-    addr: SocketAddr,
+    peer: String,
     channel: u8,
     mut rtp: RtpState,
 ) {
@@ -883,7 +888,7 @@ async fn rtsp_rtp_task(
             started = true;
             next_send_at = TokioInstant::now();
             sleep.as_mut().reset(next_send_at);
-            info!(%addr, %key, buffered_frames = buffer.len(), "rtsp rtp prebuffer ready");
+            info!(%peer, %key, buffered_frames = buffer.len(), "rtsp rtp prebuffer ready");
         }
 
         if ended && buffer.is_empty() {
@@ -902,13 +907,13 @@ async fn rtsp_rtp_task(
                             dropped += 1;
                         }
                         if dropped != 0 && dropped.is_multiple_of(50) {
-                            debug!(%addr, %key, dropped, "rtsp client dropped queued aac frames to keep latency bounded");
+                            debug!(%peer, %key, dropped, "rtsp client dropped queued aac frames to keep latency bounded");
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         rtp.skip_samples(AAC_SAMPLES_PER_FRAME.saturating_mul(skipped as u32));
                         dropped = dropped.saturating_add(skipped as usize);
-                        warn!(%addr, %key, skipped, "rtsp client lagged behind publisher");
+                        warn!(%peer, %key, skipped, "rtsp client lagged behind publisher");
                     }
                     Err(broadcast::error::RecvError::Closed) => ended = true,
                 }
@@ -923,7 +928,7 @@ async fn rtsp_rtp_task(
                 };
 
                 if let Err(error) = sender.send_aac(&writer, &frame, &mut rtp).await {
-                    warn!(%addr, %key, %error, "rtsp rtp writer failed");
+                    warn!(%peer, %key, %error, "rtsp rtp writer failed");
                     break;
                 }
 
@@ -938,7 +943,7 @@ async fn rtsp_rtp_task(
         }
     }
 
-    info!(%addr, %key, packets, underruns, silence_packets, dropped, "rtsp rtp ended");
+    info!(%peer, %key, packets, underruns, silence_packets, dropped, "rtsp rtp ended");
 }
 
 async fn read_rtsp_request<R>(
@@ -1513,11 +1518,41 @@ fn valid_hash(key: &str) -> bool {
 fn hash_code(code: &str) -> String {
     let digest = Sha256::digest(code.as_bytes());
     let mut out = String::with_capacity(STREAM_ID_HEX_CHARS);
-    for &byte in digest.iter().take(STREAM_ID_BYTES) {
+    push_hex_prefix(&mut out, &digest, STREAM_ID_BYTES);
+    out
+}
+
+fn make_log_salt() -> [u8; 16] {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let seed = Sha256::digest(format!("{}:{now}", process::id()).as_bytes());
+    let mut salt = [0u8; 16];
+    salt.copy_from_slice(&seed[..16]);
+    salt
+}
+
+fn peer_id(state: &AppState, ip: IpAddr) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"VRCStreamer peer log id v1");
+    hasher.update(state.log_salt);
+    match ip {
+        IpAddr::V4(ip) => hasher.update(ip.octets()),
+        IpAddr::V6(ip) => hasher.update(ip.octets()),
+    }
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(17);
+    out.push_str("peer:");
+    push_hex_prefix(&mut out, &digest, 6);
+    out
+}
+
+fn push_hex_prefix(out: &mut String, bytes: &[u8], take: usize) {
+    for &byte in bytes.iter().take(take) {
         out.push(hex_char(byte >> 4));
         out.push(hex_char(byte & 0x0f));
     }
-    out
 }
 
 fn publisher_hello_message(config: &Config, listeners: usize) -> String {
@@ -1753,12 +1788,24 @@ mod tests {
             active_publishers: AtomicUsize::new(0),
             active_listeners: AtomicUsize::new(0),
             next_rtsp_session: AtomicUsize::new(1),
+            log_salt: [7; 16],
         })
     }
 
     #[test]
     fn hash_code_matches_sha256_128_bit_hex_prefix() {
         assert_eq!(hash_code("abc"), "ba7816bf8f01cfea414140de5dae2223");
+    }
+
+    #[test]
+    fn peer_id_hides_raw_ip() {
+        let state = test_state(test_config());
+        let ip: IpAddr = "203.0.113.42".parse().unwrap();
+        let peer = peer_id(&state, ip);
+
+        assert!(peer.starts_with("peer:"));
+        assert_eq!(peer, peer_id(&state, ip));
+        assert!(!peer.contains("203.0.113.42"));
     }
 
     #[test]
