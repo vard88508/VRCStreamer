@@ -34,7 +34,7 @@ use tokio::{
     task::JoinHandle,
     time::{Instant as TokioInstant, sleep_until},
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
 const RTP_AUDIO_PAYLOAD_TYPE: u8 = 96;
@@ -902,7 +902,7 @@ async fn rtsp_rtp_task(
                             dropped += 1;
                         }
                         if dropped != 0 && dropped.is_multiple_of(50) {
-                            warn!(%addr, %key, dropped, "rtsp client dropped queued aac frames to keep latency bounded");
+                            debug!(%addr, %key, dropped, "rtsp client dropped queued aac frames to keep latency bounded");
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
