@@ -1,37 +1,118 @@
 <!doctype html>
-<meta charset="utf-8">
-<title>VRC Audio Streamer</title>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>VRCStreamer - Easy low-latency streaming into VRChat</title>
+  <meta name="description" content="Stream audio into VRChat directly from your browser. Low latency, no setup, and no extra software required.">
+  <link rel="icon" href="static/logo.webp" type="image/webp">
+  <link rel="stylesheet" href="style.css">
+  <script src="client.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <a class="logo" href="">
+        <img src="static/logo.webp" alt="">
+        <p>VRCStreamer</p>
+        <p class="version">1.0</p>
+      </a>
 
-<label>Server <select id="serverSelect"><option value="">Loading...</option></select></label>
-<br>
-<span id="serverDescription"></span>
-<br>
-<span id="customServer" hidden>
-  <label>Custom API <input id="customApi" size="64" autocomplete="off" spellcheck="false"></label>
-  <br>
-  <label>Custom RTSP <input id="customRtsp" size="64" autocomplete="off" spellcheck="false"></label>
-  <br>
-  <label>Custom password <input id="customPassword" type="password" size="32" autocomplete="off" spellcheck="false"></label>
-  <br>
-</span>
-<label>URL <input id="rtspUrl" size="64" readonly></label>
-<button id="copyUrl" type="button" disabled>Copy</button>
-<button id="newLink" type="button">New link</button>
-<br>
-<label>Encoder <select id="encoderMode">
-  <option value="native192">🔊 Native AAC 192 kbps</option>
-  <option value="wasm320">🔊 WASM AAC 320 kbps</option>
-</select></label>
-<br>
-<label>Mic <select id="micDevice"><option value="">Default microphone</option></select></label>
-<button id="mic" type="button">Add Mic</button>
-<br>
-<button id="screen" type="button">Add tab/system audio</button>
-<button id="stop" type="button" disabled>Stop</button>
-<br>
-<div id="sources"></div>
-<br>
-<span id="stats">Listeners: - Streams: -</span>
-<pre id="status"></pre>
+      <div class="server-selection">
+        <div class="server-select-row">
+          <select id="serverSelect">
+            <option value="">Loading...</option>
+          </select>
+          <span id="serverHint" class="server-hint" hidden></span>
+        </div>
+        <section class="server-stats">
+          <p id="stats" class="srv-stats">🟡 Loading...</p>
+        </section>
+      </div>
+    </header>
 
-<script src="client.js"></script>
+    <section id="customServer" class="custom-server" hidden>
+      <label>
+        <span id="customApiLabel">API</span>
+        <input id="customApi" autocomplete="off" spellcheck="false">
+      </label>
+      <label>
+        <span id="customRtspLabel">RTSP</span>
+        <input id="customRtsp" autocomplete="off" spellcheck="false">
+      </label>
+      <label>
+        <span id="customPasswordLabel">Password</span>
+        <input id="customPassword" type="password" autocomplete="off" spellcheck="false">
+      </label>
+      <div>
+        <button id="customConnect" type="button">Connect</button>
+        <button id="customBookmark" type="button">Bookmark</button>
+      </div>
+    </section>
+
+    <section id="firstSourceSelection" class="first-source-selection">
+      <h2 id="startTitle">Stream Audio From</h2>
+      <div>
+        <div class="source-choice">
+          <button id="mic" type="button">
+            <img src="static/mic.webp" alt="Mic">
+            <span id="micDeviceLabel">Mic/Input Device</span>
+          </button>
+          <select id="micDevice" class="source-label-select" hidden>
+            <option value="">Mic/Input Device</option>
+          </select>
+        </div>
+        <div class="source-choice">
+          <button id="screen" type="button">
+            <img src="static/tab.webp" alt="Tab/PC">
+            <span id="screenLabel">Tab/System</span>
+          </button>
+        </div>
+      </div>
+      <p id="startTip" class="start-tip">
+        Tip: You can mute browser tabs by right-clicking them, so you do not get annoyed by echo while streaming into VRChat.
+      </p>
+      <div class="start-bottom">
+        <select id="encoderMode">
+          <option value="native192">🔊 Native AAC 192 kbps</option>
+          <option value="wasm320">🔊 WASM AAC 320 kbps</option>
+        </select>
+      </div>
+    </section>
+
+    <section id="streamPanel" class="stream-panel" hidden>
+      <h2 id="streamToTitle">Streaming To</h2>
+      <div class="url-wrap">
+        <input id="rtspUrl" readonly aria-label="Stream URL">
+        <span id="rtspHint" class="stream-hint" hidden>Click to Copy</span>
+      </div>
+      <div class="link-actions">
+        <span id="pasteHint">Paste this link into video player</span>
+        <button id="newLink" type="button">Generate Another Link</button>
+      </div>
+      <button id="stop" type="button" disabled>⏹ Stop Streaming</button>
+      <div id="sources"></div>
+      <div id="addSources" class="add-sources"></div>
+      <div class="stream-bottom">
+        <div id="streamInfoWrap" class="stream-info-wrap" tabindex="0">
+          <div id="streamInfo" class="stream-info"></div>
+          <span id="streamInfoHint" class="stream-hint" hidden></span>
+        </div>
+      </div>
+      <pre id="status"></pre>
+    </section>
+
+    <footer class="main-footer">
+      <a id="sourceCodeLink" href="https://github.com/vard88508/VRCStreamer">Source Code</a>
+      <span>•</span>
+      <a id="contactAdminLink" href="mailto:vard@disroot.org">Contact Admin</a>
+      <span class="footer-spacer"></span>
+      <select id="languageSelect" aria-label="Language">
+        <option value="en">English</option>
+        <option value="ja">日本語</option>
+        <option value="ru">Русский</option>
+      </select>
+    </footer>
+  </main>
+</body>
+</html>
