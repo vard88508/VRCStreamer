@@ -39,7 +39,9 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
 const RTP_AUDIO_PAYLOAD_TYPE: u8 = 96;
+const RTP_VIDEO_PAYLOAD_TYPE: u8 = 97;
 const RTP_AUDIO_SSRC: u32 = 0x5652_4341;
+const RTP_VIDEO_SSRC: u32 = 0x5652_4356;
 const AAC_SAMPLE_RATE: u32 = 48_000;
 const AAC_CHANNELS: u8 = 2;
 const AAC_SAMPLES_PER_FRAME: u32 = 1024;
@@ -48,8 +50,19 @@ const AAC_SILENCE_ACCESS_UNIT: &[u8] = &[0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c];
 const AAC_FRAME_DURATION: Duration =
     Duration::from_micros((AAC_SAMPLES_PER_FRAME as u64 * 1_000_000) / AAC_SAMPLE_RATE as u64);
 const AAC_MAX_ACCESS_UNIT_BYTES: usize = 4 * 1024;
+const H264_CLOCK_RATE: u32 = 90_000;
+const H264_WIDTH: u16 = 1280;
+const H264_HEIGHT: u16 = 720;
+const H264_FPS: u32 = 30;
+const H264_TIMESTAMP_DELTA: u32 = H264_CLOCK_RATE / H264_FPS;
+const H264_FRAME_DURATION: Duration = Duration::from_nanos(1_000_000_000 / H264_FPS as u64);
+const H264_MAX_ACCESS_UNIT_BYTES: usize = 512 * 1024;
+const H264_MAX_NAL_UNITS: usize = 64;
+const RTP_MAX_PAYLOAD_BYTES: usize = 1200;
 const RTSP_PREBUFFER_FRAMES: usize = 12;
 const RTSP_MAX_BUFFER_FRAMES: usize = 96;
+const RTSP_VIDEO_PREBUFFER_FRAMES: usize = 2;
+const RTSP_VIDEO_MAX_BUFFER_FRAMES: usize = 6;
 const RTSP_MAX_LINE_BYTES: usize = 4096;
 const RTSP_MAX_HEADERS: usize = 64;
 const RTSP_MAX_BODY_BYTES: usize = 4096;
@@ -79,6 +92,8 @@ struct Config {
     max_tracked_ips: usize,
     max_aac_frame_bytes: usize,
     max_ingest_bytes_per_sec: usize,
+    max_h264_frame_bytes: usize,
+    max_video_ingest_bytes_per_sec: usize,
     channel_buffer: usize,
     publisher_idle_timeout: Duration,
     passwords: Vec<String>,
@@ -97,20 +112,40 @@ struct AppState {
 }
 
 struct Channel {
-    tx: broadcast::Sender<Bytes>,
+    audio_tx: broadcast::Sender<Bytes>,
+    video_tx: broadcast::Sender<Bytes>,
     publisher: AtomicBool,
     listeners: AtomicUsize,
+    resync_epoch: AtomicUsize,
 }
 
 impl Channel {
     fn new(buffer: usize) -> Self {
-        let (tx, _) = broadcast::channel(buffer);
+        let (audio_tx, _) = broadcast::channel(buffer);
+        let (video_tx, _) = broadcast::channel(buffer);
         Self {
-            tx,
+            audio_tx,
+            video_tx,
             publisher: AtomicBool::new(false),
             listeners: AtomicUsize::new(0),
+            resync_epoch: AtomicUsize::new(0),
         }
     }
+}
+
+enum PublisherMediaFrame {
+    Audio(Bytes),
+    Video { access_unit: Bytes, keyframe: bool },
+}
+
+enum PublisherTextCommand {
+    ForceResync,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RtspTrack {
+    Audio,
+    Video,
 }
 
 struct IpLimitEntry {
@@ -261,6 +296,11 @@ impl Config {
             max_tracked_ips: env_usize("MAX_TRACKED_IPS", 8192),
             max_aac_frame_bytes: env_usize("MAX_AAC_FRAME_BYTES", AAC_MAX_ACCESS_UNIT_BYTES),
             max_ingest_bytes_per_sec: env_usize("MAX_INGEST_BYTES_PER_SEC", 96 * 1024),
+            max_h264_frame_bytes: env_usize("MAX_H264_FRAME_BYTES", H264_MAX_ACCESS_UNIT_BYTES),
+            max_video_ingest_bytes_per_sec: env_usize(
+                "MAX_VIDEO_INGEST_BYTES_PER_SEC",
+                1024 * 1024,
+            ),
             channel_buffer: env_usize("CHANNEL_BUFFER", 128),
             publisher_idle_timeout: Duration::from_secs(env_u64(
                 "PUBLISHER_IDLE_TIMEOUT_SECS",
@@ -329,7 +369,7 @@ async fn stats(
     let mut response = axum::Json(StatsResponse {
         name: &state.config.server_name,
         description: &state.config.server_description,
-        video: false,
+        video: true,
         active_listeners: state.active_listeners.load(Ordering::Acquire),
         active_streams,
     })
@@ -415,9 +455,15 @@ async fn ingest_ws(
     }
 
     info!(%peer, %key, "aac publisher connected");
-    ws.max_message_size(state.config.max_aac_frame_bytes + 1024)
-        .on_upgrade(move |socket| publisher_session(socket, state, key, channel, peer, ip_guard))
-        .into_response()
+    ws.max_message_size(
+        state
+            .config
+            .max_h264_frame_bytes
+            .max(state.config.max_aac_frame_bytes)
+            + 1024,
+    )
+    .on_upgrade(move |socket| publisher_session(socket, state, key, channel, peer, ip_guard))
+    .into_response()
 }
 
 async fn publisher_session(
@@ -429,8 +475,11 @@ async fn publisher_session(
     _ip_guard: Option<PublisherIpGuard>,
 ) {
     let mut rate = RateWindow::new(Duration::from_secs(5));
+    let mut video_rate = RateWindow::new(Duration::from_secs(5));
     let mut frames = 0usize;
+    let mut video_frames = 0usize;
     let mut bytes = 0usize;
+    let mut video_bytes = 0usize;
     let started_at = Instant::now();
     let mut last_report = Instant::now();
     let mut last_listeners = channel.listeners.load(Ordering::Acquire);
@@ -495,39 +544,66 @@ async fn publisher_session(
 
         match message {
             Message::Binary(frame) => {
-                if frame.len() > state.config.max_aac_frame_bytes {
-                    warn!(%peer, %key, len = frame.len(), "aac frame too large");
-                    let _ = socket.send(Message::Close(None)).await;
-                    break;
-                }
-                if !rate.allow(frame.len(), state.config.max_ingest_bytes_per_sec) {
-                    warn!(%peer, %key, "publisher exceeded aac ingest rate");
-                    let _ = socket.send(Message::Close(None)).await;
-                    break;
-                }
-                if let Err(reason) = validate_aac_access_unit(&frame) {
-                    warn!(%peer, %key, %reason, "publisher sent invalid aac");
-                    let _ = socket.send(Message::Close(None)).await;
-                    break;
+                match parse_publisher_media_frame(frame, &state.config) {
+                    Ok(PublisherMediaFrame::Audio(access_unit)) => {
+                        if !rate.allow(access_unit.len(), state.config.max_ingest_bytes_per_sec) {
+                            warn!(%peer, %key, "publisher exceeded aac ingest rate");
+                            let _ = socket.send(Message::Close(None)).await;
+                            break;
+                        }
+
+                        let frame_len = access_unit.len();
+                        let _ = channel.audio_tx.send(access_unit);
+                        frames += 1;
+                        bytes = bytes.saturating_add(frame_len);
+                        if frames == 1 {
+                            info!(%peer, %key, "publisher sent first aac frame");
+                        }
+                    }
+                    Ok(PublisherMediaFrame::Video {
+                        access_unit,
+                        keyframe,
+                    }) => {
+                        if !video_rate.allow(
+                            access_unit.len(),
+                            state.config.max_video_ingest_bytes_per_sec,
+                        ) {
+                            warn!(%peer, %key, "publisher exceeded h264 ingest rate");
+                            let _ = socket.send(Message::Close(None)).await;
+                            break;
+                        }
+
+                        let frame_len = access_unit.len();
+                        let _ = channel.video_tx.send(access_unit);
+                        video_frames += 1;
+                        video_bytes = video_bytes.saturating_add(frame_len);
+                        if video_frames == 1 {
+                            info!(%peer, %key, keyframe, "publisher sent first h264 frame");
+                        }
+                    }
+                    Err(reason) => {
+                        warn!(%peer, %key, %reason, "publisher sent invalid media frame");
+                        let _ = socket.send(Message::Close(None)).await;
+                        break;
+                    }
                 }
 
-                let frame_len = frame.len();
-                let _ = channel.tx.send(frame);
-                frames += 1;
-                bytes = bytes.saturating_add(frame_len);
-                if frames == 1 {
-                    info!(%peer, %key, "publisher sent first aac frame");
-                }
-                if frames.is_multiple_of(250) || last_report.elapsed() >= Duration::from_secs(5) {
+                if (frames + video_frames).is_multiple_of(250)
+                    || last_report.elapsed() >= Duration::from_secs(5)
+                {
                     let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
                     info!(
                         %peer,
                         %key,
-                        frames,
-                        bytes,
-                        fps = frames as f64 / elapsed,
-                        kbps = (bytes as f64 * 8.0 / 1000.0) / elapsed,
-                        "aac publisher rate"
+                        audio_frames = frames,
+                        audio_bytes = bytes,
+                        audio_fps = frames as f64 / elapsed,
+                        audio_kbps = (bytes as f64 * 8.0 / 1000.0) / elapsed,
+                        video_frames,
+                        video_bytes,
+                        video_fps = video_frames as f64 / elapsed,
+                        video_kbps = (video_bytes as f64 * 8.0 / 1000.0) / elapsed,
+                        "publisher media rate"
                     );
                     last_report = Instant::now();
                 }
@@ -540,11 +616,18 @@ async fn publisher_session(
                 let _ = socket.send(Message::Close(frame)).await;
                 break;
             }
-            Message::Text(_) => {
-                warn!(%peer, %key, "publisher sent text message");
-                let _ = socket.send(Message::Close(None)).await;
-                break;
-            }
+            Message::Text(text) => match publisher_text_command(text.as_str()) {
+                Some(PublisherTextCommand::ForceResync) => {
+                    let epoch = force_resync_channel(&channel);
+                    let listeners = channel.listeners.load(Ordering::Acquire);
+                    info!(%peer, %key, epoch, listeners, "publisher forced rtsp resync");
+                }
+                None => {
+                    warn!(%peer, %key, "publisher sent text message");
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
+            },
         }
     }
 
@@ -558,7 +641,8 @@ async fn finish_publisher(
     peer: &str,
     frames: usize,
 ) {
-    let _ = channel.tx.send(Bytes::new());
+    let _ = channel.audio_tx.send(Bytes::new());
+    let _ = channel.video_tx.send(Bytes::new());
     channel.publisher.store(false, Ordering::Release);
     state.active_publishers.fetch_sub(1, Ordering::AcqRel);
     cleanup_channel(state, key, channel).await;
@@ -685,11 +769,12 @@ async fn handle_rtsp_request(
                 return Ok(false);
             }
 
-            if session.rx.is_none() {
+            if session.guard.is_none() {
                 match subscribe_listener(state, &key).await {
-                    Ok((rx, guard)) => {
-                        session.rx = Some(rx);
-                        session.guard = Some(guard);
+                    Ok(subscription) => {
+                        session.audio_rx = Some(subscription.audio_rx);
+                        session.video_rx = Some(subscription.video_rx);
+                        session.guard = Some(subscription.guard);
                     }
                     Err(status) => {
                         write_rtsp_response(writer, status, cseq, &[], None).await?;
@@ -714,13 +799,24 @@ async fn handle_rtsp_request(
             }
 
             let rtp_channel = parse_interleaved_channel(transport).unwrap_or(0);
+            let track = rtsp_track_from_uri(&request.uri);
             session.key = Some(key.clone());
-            session.audio_setup = true;
-            session.audio_channel = rtp_channel;
+            let (track_name, ssrc) = match track {
+                RtspTrack::Audio => {
+                    session.audio_setup = true;
+                    session.audio_channel = rtp_channel;
+                    ("audio", RTP_AUDIO_SSRC)
+                }
+                RtspTrack::Video => {
+                    session.video_setup = true;
+                    session.video_channel = rtp_channel;
+                    ("video", RTP_VIDEO_SSRC)
+                }
+            };
 
             let transport_header = format!(
-                "RTP/AVP/TCP;unicast;interleaved={rtp_channel}-{};ssrc={RTP_AUDIO_SSRC:08X}",
-                rtp_channel + 1
+                "RTP/AVP/TCP;unicast;interleaved={rtp_channel}-{};ssrc={ssrc:08X}",
+                rtp_channel + 1,
             );
             write_rtsp_response(
                 writer,
@@ -733,10 +829,10 @@ async fn handle_rtsp_request(
                 None,
             )
             .await?;
-            info!(%peer, %key, rtp_channel, "rtsp audio setup");
+            info!(%peer, %key, track = track_name, rtp_channel, "rtsp media setup");
         }
         "PLAY" => {
-            if !session.audio_setup {
+            if !session.audio_setup && !session.video_setup {
                 write_rtsp_response(
                     writer,
                     "455 Method Not Valid In This State",
@@ -748,29 +844,39 @@ async fn handle_rtsp_request(
                 return Ok(false);
             }
 
-            let start_rtp = if session.rtp_task.is_none() {
-                let Some(rx) = session.rx.take() else {
-                    write_rtsp_response(writer, "454 Session Not Found", cseq, &[], None).await?;
-                    return Ok(false);
-                };
-                let Some(guard) = session.guard.take() else {
+            let start_audio = if session.audio_setup && session.audio_rtp_task.is_none() {
+                let Some(rx) = session.audio_rx.take() else {
                     write_rtsp_response(writer, "454 Session Not Found", cseq, &[], None).await?;
                     return Ok(false);
                 };
                 let key = session.key.clone().unwrap_or_default();
-                let rtp = session.rtp;
+                let rtp = session.audio_rtp;
                 let channel = session.audio_channel;
-                Some((rx, guard, key, channel, rtp))
+                Some((rx, key, channel, rtp))
+            } else {
+                None
+            };
+            let start_video = if session.video_setup && session.video_rtp_task.is_none() {
+                let Some(rx) = session.video_rx.take() else {
+                    write_rtsp_response(writer, "454 Session Not Found", cseq, &[], None).await?;
+                    return Ok(false);
+                };
+                let key = session.key.clone().unwrap_or_default();
+                let rtp = session.video_rtp;
+                let channel = session.video_channel;
+                Some((rx, key, channel, rtp))
             } else {
                 None
             };
 
-            let rtp_info = format!(
-                "url={}/trackID=0;seq={};rtptime={}",
-                rtsp_content_base(&request.uri).trim_end_matches('/'),
-                session.rtp.sequence,
-                session.rtp.timestamp
-            );
+            let Some(guard) = session.guard.take() else {
+                write_rtsp_response(writer, "454 Session Not Found", cseq, &[], None).await?;
+                return Ok(false);
+            };
+            let stream = guard.channel.clone();
+            session.guard = Some(guard);
+
+            let rtp_info = rtsp_rtp_info(&request.uri, session);
             write_rtsp_response(
                 writer,
                 "200 OK",
@@ -784,11 +890,22 @@ async fn handle_rtsp_request(
             )
             .await?;
 
-            if let Some((rx, guard, key, channel, rtp)) = start_rtp {
-                session.rtp_task = Some(tokio::spawn(rtsp_rtp_task(
+            if let Some((rx, key, channel, rtp)) = start_audio {
+                session.audio_rtp_task = Some(tokio::spawn(rtsp_audio_rtp_task(
                     writer.clone(),
                     rx,
-                    guard,
+                    stream.clone(),
+                    key,
+                    peer.to_owned(),
+                    channel,
+                    rtp,
+                )));
+            }
+            if let Some((rx, key, channel, rtp)) = start_video {
+                session.video_rtp_task = Some(tokio::spawn(rtsp_video_rtp_task(
+                    writer.clone(),
+                    rx,
+                    stream,
                     key,
                     peer.to_owned(),
                     channel,
@@ -828,7 +945,7 @@ async fn handle_rtsp_request(
 async fn subscribe_listener(
     state: &Arc<AppState>,
     key: &str,
-) -> Result<(broadcast::Receiver<Bytes>, ListenerGuard), &'static str> {
+) -> Result<ListenerSubscription, &'static str> {
     let channel = {
         let channels = state.channels.lock().await;
         match channels.get(key) {
@@ -858,19 +975,30 @@ async fn subscribe_listener(
         return Err("453 Not Enough Bandwidth");
     }
 
-    let rx = channel.tx.subscribe();
+    let audio_rx = channel.audio_tx.subscribe();
+    let video_rx = channel.video_tx.subscribe();
     let guard = ListenerGuard {
         state: state.clone(),
         key: key.to_owned(),
         channel,
     };
-    Ok((rx, guard))
+    Ok(ListenerSubscription {
+        audio_rx,
+        video_rx,
+        guard,
+    })
 }
 
-async fn rtsp_rtp_task(
+struct ListenerSubscription {
+    audio_rx: broadcast::Receiver<Bytes>,
+    video_rx: broadcast::Receiver<Bytes>,
+    guard: ListenerGuard,
+}
+
+async fn rtsp_audio_rtp_task(
     writer: SharedRtspWriter,
     mut rx: broadcast::Receiver<Bytes>,
-    _guard: ListenerGuard,
+    stream: Arc<Channel>,
     key: String,
     peer: String,
     channel: u8,
@@ -879,6 +1007,7 @@ async fn rtsp_rtp_task(
     let mut buffer = VecDeque::<Bytes>::new();
     let mut ended = false;
     let mut started = false;
+    let mut resync_epoch = stream.resync_epoch.load(Ordering::Acquire);
     let mut next_send_at = TokioInstant::now();
     let mut sleep = Box::pin(sleep_until(next_send_at));
     let mut packets = 0usize;
@@ -888,6 +1017,20 @@ async fn rtsp_rtp_task(
     let mut sender = RtpPacketWriter::new(channel);
 
     loop {
+        let current_resync_epoch = stream.resync_epoch.load(Ordering::Acquire);
+        if current_resync_epoch != resync_epoch {
+            let cleared = buffer.len();
+            buffer.clear();
+            rx = stream.audio_tx.subscribe();
+            rtp.skip_samples(AAC_SAMPLES_PER_FRAME.saturating_mul(cleared as u32));
+            dropped = dropped.saturating_add(cleared);
+            started = false;
+            next_send_at = TokioInstant::now();
+            sleep.as_mut().reset(next_send_at);
+            resync_epoch = current_resync_epoch;
+            debug!(%peer, %key, epoch = current_resync_epoch, cleared, "rtsp listener force resynced");
+        }
+
         if !started && !buffer.is_empty() && (buffer.len() >= RTSP_PREBUFFER_FRAMES || ended) {
             started = true;
             next_send_at = TokioInstant::now();
@@ -948,6 +1091,106 @@ async fn rtsp_rtp_task(
     }
 
     info!(%peer, %key, packets, underruns, silence_packets, dropped, "rtsp rtp ended");
+}
+
+async fn rtsp_video_rtp_task(
+    writer: SharedRtspWriter,
+    mut rx: broadcast::Receiver<Bytes>,
+    stream: Arc<Channel>,
+    key: String,
+    peer: String,
+    channel: u8,
+    mut rtp: RtpState,
+) {
+    let mut buffer = VecDeque::<Bytes>::new();
+    let mut ended = false;
+    let mut started = false;
+    let mut resync_epoch = stream.resync_epoch.load(Ordering::Acquire);
+    let mut next_send_at = TokioInstant::now();
+    let mut sleep = Box::pin(sleep_until(next_send_at));
+    let mut packets = 0usize;
+    let mut dropped = 0usize;
+    let mut underruns = 0usize;
+    let mut sender = RtpPacketWriter::new(channel);
+
+    loop {
+        let current_resync_epoch = stream.resync_epoch.load(Ordering::Acquire);
+        if current_resync_epoch != resync_epoch {
+            let cleared = buffer.len();
+            buffer.clear();
+            rx = stream.video_tx.subscribe();
+            rtp.skip_samples(H264_TIMESTAMP_DELTA.saturating_mul(cleared as u32));
+            dropped = dropped.saturating_add(cleared);
+            started = false;
+            next_send_at = TokioInstant::now();
+            sleep.as_mut().reset(next_send_at);
+            resync_epoch = current_resync_epoch;
+            debug!(%peer, %key, epoch = current_resync_epoch, cleared, "rtsp video listener force resynced");
+        }
+
+        if !started
+            && !buffer.is_empty()
+            && (buffer.len() >= RTSP_VIDEO_PREBUFFER_FRAMES || ended)
+        {
+            started = true;
+            next_send_at = TokioInstant::now();
+            sleep.as_mut().reset(next_send_at);
+            debug!(%peer, %key, buffered_frames = buffer.len(), "rtsp video prebuffer ready");
+        }
+
+        if ended && buffer.is_empty() {
+            break;
+        }
+
+        tokio::select! {
+            frame = rx.recv(), if !ended => {
+                match frame {
+                    Ok(frame) if frame.is_empty() => ended = true,
+                    Ok(frame) => {
+                        buffer.push_back(frame);
+                        while buffer.len() > RTSP_VIDEO_MAX_BUFFER_FRAMES {
+                            buffer.pop_front();
+                            rtp.skip_samples(H264_TIMESTAMP_DELTA);
+                            dropped += 1;
+                        }
+                        if dropped != 0 && dropped.is_multiple_of(50) {
+                            debug!(%peer, %key, dropped, "rtsp video dropped queued frames to keep latency bounded");
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        rtp.skip_samples(H264_TIMESTAMP_DELTA.saturating_mul(skipped as u32));
+                        dropped = dropped.saturating_add(skipped as usize);
+                        warn!(%peer, %key, skipped, "rtsp video client lagged behind publisher");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => ended = true,
+                }
+            }
+            _ = &mut sleep, if started => {
+                if let Some(frame) = buffer.pop_front() {
+                    if let Err(error) = sender
+                        .send_h264_access_unit(&writer, &frame, &mut rtp)
+                        .await
+                    {
+                        warn!(%peer, %key, %error, "rtsp video rtp writer failed");
+                        break;
+                    }
+                    packets += 1;
+                } else {
+                    underruns += 1;
+                    rtp.skip_samples(H264_TIMESTAMP_DELTA);
+                }
+
+                next_send_at += H264_FRAME_DURATION;
+                let now = TokioInstant::now();
+                if now.saturating_duration_since(next_send_at) > Duration::from_millis(250) {
+                    next_send_at = now + H264_FRAME_DURATION;
+                }
+                sleep.as_mut().reset(next_send_at);
+            }
+        }
+    }
+
+    info!(%peer, %key, packets, underruns, dropped, "rtsp video rtp ended");
 }
 
 async fn read_rtsp_request<R>(
@@ -1130,6 +1373,123 @@ impl RtpPacketWriter {
         rtp.advance_by(AAC_SAMPLES_PER_FRAME);
         Ok(())
     }
+
+    async fn send_h264_access_unit(
+        &mut self,
+        writer: &SharedRtspWriter,
+        access_unit: &[u8],
+        rtp: &mut RtpState,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let nal_count = h264_nal_count(access_unit)?;
+        let mut nal_index = 0usize;
+        let mut nal_start = start_h264_payload(access_unit)?;
+        let mut locked = writer.lock().await;
+
+        loop {
+            let next = find_h264_start_code(access_unit, nal_start);
+            let nal_end = next.map_or(access_unit.len(), |(index, _)| index);
+            if nal_end > nal_start {
+                nal_index += 1;
+                self.send_h264_nal(
+                    &mut locked,
+                    &access_unit[nal_start..nal_end],
+                    nal_index == nal_count,
+                    rtp,
+                )
+                .await?;
+            }
+            let Some((start, len)) = next else {
+                break;
+            };
+            nal_start = start + len;
+        }
+
+        rtp.timestamp = rtp.timestamp.wrapping_add(H264_TIMESTAMP_DELTA);
+        Ok(())
+    }
+
+    async fn send_h264_nal(
+        &mut self,
+        writer: &mut OwnedWriteHalf,
+        nal: &[u8],
+        marker_on_last_packet: bool,
+        rtp: &mut RtpState,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if nal.len() <= RTP_MAX_PAYLOAD_BYTES {
+            self.packet.clear();
+            self.push_rtp_interleaved_header(
+                nal.len(),
+                RTP_VIDEO_PAYLOAD_TYPE,
+                marker_on_last_packet,
+                rtp.sequence,
+                rtp.timestamp,
+                RTP_VIDEO_SSRC,
+            );
+            self.packet.extend_from_slice(nal);
+            writer.write_all(&self.packet).await?;
+            rtp.sequence = rtp.sequence.wrapping_add(1);
+            return Ok(());
+        }
+
+        let nal_header = nal[0];
+        let nal_type = nal_header & 0x1f;
+        let fu_indicator = (nal_header & 0xe0) | 28;
+        let max_chunk = RTP_MAX_PAYLOAD_BYTES - 2;
+        let mut offset = 1usize;
+
+        while offset < nal.len() {
+            let end = (offset + max_chunk).min(nal.len());
+            let start = offset == 1;
+            let last = end == nal.len();
+            let mut fu_header = nal_type;
+            if start {
+                fu_header |= 0x80;
+            }
+            if last {
+                fu_header |= 0x40;
+            }
+
+            self.packet.clear();
+            self.push_rtp_interleaved_header(
+                2 + end - offset,
+                RTP_VIDEO_PAYLOAD_TYPE,
+                marker_on_last_packet && last,
+                rtp.sequence,
+                rtp.timestamp,
+                RTP_VIDEO_SSRC,
+            );
+            self.packet.push(fu_indicator);
+            self.packet.push(fu_header);
+            self.packet.extend_from_slice(&nal[offset..end]);
+            writer.write_all(&self.packet).await?;
+            rtp.sequence = rtp.sequence.wrapping_add(1);
+            offset = end;
+        }
+
+        Ok(())
+    }
+
+    fn push_rtp_interleaved_header(
+        &mut self,
+        payload_len: usize,
+        payload_type: u8,
+        marker: bool,
+        sequence: u16,
+        timestamp: u32,
+        ssrc: u32,
+    ) {
+        let packet_len = 12 + payload_len;
+        self.packet.push(b'$');
+        self.packet.push(self.channel);
+        self.packet
+            .extend_from_slice(&(packet_len as u16).to_be_bytes());
+        self.packet.push(0x80);
+        self.packet
+            .push((if marker { 0x80 } else { 0 }) | payload_type);
+        self.packet.extend_from_slice(&sequence.to_be_bytes());
+        self.packet.extend_from_slice(&timestamp.to_be_bytes());
+        self.packet.extend_from_slice(&ssrc.to_be_bytes());
+    }
 }
 
 fn rtsp_sdp() -> String {
@@ -1142,7 +1502,12 @@ fn rtsp_sdp() -> String {
          m=audio 0 RTP/AVP {RTP_AUDIO_PAYLOAD_TYPE}\r\n\
          a=control:trackID=0\r\n\
          a=rtpmap:{RTP_AUDIO_PAYLOAD_TYPE} mpeg4-generic/{AAC_SAMPLE_RATE}/{AAC_CHANNELS}\r\n\
-         a=fmtp:{RTP_AUDIO_PAYLOAD_TYPE} config={AAC_AUDIO_SPECIFIC_CONFIG}; indexdeltalength=3; indexlength=3; mode=AAC-hbr; profile-level-id=1; sizelength=13; streamtype=5\r\n"
+         a=fmtp:{RTP_AUDIO_PAYLOAD_TYPE} config={AAC_AUDIO_SPECIFIC_CONFIG}; indexdeltalength=3; indexlength=3; mode=AAC-hbr; profile-level-id=1; sizelength=13; streamtype=5\r\n\
+         m=video 0 RTP/AVP {RTP_VIDEO_PAYLOAD_TYPE}\r\n\
+         a=control:trackID=1\r\n\
+         a=rtpmap:{RTP_VIDEO_PAYLOAD_TYPE} H264/{H264_CLOCK_RATE}\r\n\
+         a=fmtp:{RTP_VIDEO_PAYLOAD_TYPE} packetization-mode=1; profile-level-id=42e01f; max-fs=3600; max-mbps=108000\r\n\
+         a=framesize:{RTP_VIDEO_PAYLOAD_TYPE} {H264_WIDTH}-{H264_HEIGHT}\r\n"
     )
 }
 
@@ -1173,27 +1538,87 @@ fn key_from_rtsp_uri(uri: &str) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+fn rtsp_track_from_uri(uri: &str) -> RtspTrack {
+    if uri
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(uri)
+        .rsplit('/')
+        .next()
+        .is_some_and(|segment| segment.eq_ignore_ascii_case("trackID=1"))
+    {
+        return RtspTrack::Video;
+    }
+    RtspTrack::Audio
+}
+
+fn rtsp_rtp_info(uri: &str, session: &RtspSession) -> String {
+    let base = rtsp_content_base(uri);
+    let base = base.trim_end_matches('/');
+    let mut out = String::with_capacity(128);
+    if session.audio_setup {
+        let _ = write!(
+            out,
+            "url={base}/trackID=0;seq={};rtptime={}",
+            session.audio_rtp.sequence, session.audio_rtp.timestamp
+        );
+    }
+    if session.video_setup {
+        if !out.is_empty() {
+            out.push(',');
+        }
+        let _ = write!(
+            out,
+            "url={base}/trackID=1;seq={};rtptime={}",
+            session.video_rtp.sequence, session.video_rtp.timestamp
+        );
+    }
+    out
+}
+
 fn parse_interleaved_channel(transport: &str) -> Option<u8> {
     let lower = transport.to_ascii_lowercase();
     let value = lower.split("interleaved=").nth(1)?;
     value.split(['-', ';']).next()?.trim().parse().ok()
 }
 
+fn publisher_text_command(text: &str) -> Option<PublisherTextCommand> {
+    if text.trim().eq_ignore_ascii_case("force_resync") {
+        return Some(PublisherTextCommand::ForceResync);
+    }
+    None
+}
+
+fn force_resync_channel(channel: &Channel) -> usize {
+    channel
+        .resync_epoch
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1)
+}
+
 #[derive(Default)]
 struct RtspSession {
     id: Option<String>,
     key: Option<String>,
-    rx: Option<broadcast::Receiver<Bytes>>,
+    audio_rx: Option<broadcast::Receiver<Bytes>>,
+    video_rx: Option<broadcast::Receiver<Bytes>>,
     guard: Option<ListenerGuard>,
-    rtp_task: Option<JoinHandle<()>>,
+    audio_rtp_task: Option<JoinHandle<()>>,
+    video_rtp_task: Option<JoinHandle<()>>,
     audio_setup: bool,
+    video_setup: bool,
     audio_channel: u8,
-    rtp: RtpState,
+    video_channel: u8,
+    audio_rtp: RtpState,
+    video_rtp: RtpState,
 }
 
 impl RtspSession {
     fn stop(&mut self) {
-        if let Some(task) = self.rtp_task.take() {
+        if let Some(task) = self.audio_rtp_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.video_rtp_task.take() {
             task.abort();
         }
     }
@@ -1291,7 +1716,156 @@ fn validate_aac_access_unit(access_unit: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn parse_publisher_media_frame(
+    frame: Bytes,
+    config: &Config,
+) -> Result<PublisherMediaFrame, &'static str> {
+    let Some((&kind, _)) = frame.split_first() else {
+        return Err("media frame is empty");
+    };
+
+    match kind {
+        0x00 => {
+            let access_unit = frame.slice(1..);
+            if access_unit.len() > config.max_aac_frame_bytes {
+                return Err("aac frame is too large");
+            }
+            validate_aac_access_unit(&access_unit)?;
+            Ok(PublisherMediaFrame::Audio(access_unit))
+        }
+        0x01 | 0x02 => {
+            let keyframe = kind == 0x01;
+            let access_unit = frame.slice(1..);
+            validate_h264_access_unit(&access_unit, keyframe, config.max_h264_frame_bytes)?;
+            Ok(PublisherMediaFrame::Video {
+                access_unit,
+                keyframe,
+            })
+        }
+        _ => {
+            if frame.len() > config.max_aac_frame_bytes {
+                return Err("aac frame is too large");
+            }
+            validate_aac_access_unit(&frame)?;
+            Ok(PublisherMediaFrame::Audio(frame))
+        }
+    }
+}
+
+fn validate_h264_access_unit(
+    access_unit: &[u8],
+    keyframe: bool,
+    max_bytes: usize,
+) -> Result<(), &'static str> {
+    if access_unit.len() < 5 {
+        return Err("h264 access unit is too small");
+    }
+    if access_unit.len() > max_bytes {
+        return Err("h264 access unit is too large");
+    }
+    if let Some(reason) = rejected_container_signature(access_unit) {
+        return Err(reason);
+    }
+
+    let mut saw_slice = false;
+    let mut saw_idr = false;
+    for_each_h264_nal(access_unit, |nal| {
+        if nal[0] & 0x80 != 0 {
+            return Err("h264 forbidden zero bit is set");
+        }
+        match nal[0] & 0x1f {
+            1 => saw_slice = true,
+            5 => {
+                saw_slice = true;
+                saw_idr = true;
+            }
+            6 | 7 | 8 | 9 => {}
+            _ => return Err("unsupported h264 nal unit"),
+        }
+        Ok(())
+    })?;
+
+    if !saw_slice {
+        return Err("h264 access unit has no video slice");
+    }
+    if keyframe && !saw_idr {
+        return Err("h264 keyframe has no idr slice");
+    }
+    Ok(())
+}
+
+fn h264_nal_count(access_unit: &[u8]) -> Result<usize, &'static str> {
+    let mut count = 0usize;
+    for_each_h264_nal(access_unit, |_| {
+        count += 1;
+        Ok(())
+    })?;
+    Ok(count)
+}
+
+fn for_each_h264_nal<F>(access_unit: &[u8], mut f: F) -> Result<(), &'static str>
+where
+    F: FnMut(&[u8]) -> Result<(), &'static str>,
+{
+    let mut nal_start = start_h264_payload(access_unit)?;
+    let mut count = 0usize;
+
+    loop {
+        let next = find_h264_start_code(access_unit, nal_start);
+        let nal_end = next.map_or(access_unit.len(), |(index, _)| index);
+        if nal_end > nal_start {
+            count += 1;
+            if count > H264_MAX_NAL_UNITS {
+                return Err("too many h264 nal units");
+            }
+            f(&access_unit[nal_start..nal_end])?;
+        }
+
+        let Some((start, len)) = next else {
+            break;
+        };
+        nal_start = start + len;
+    }
+
+    if count == 0 {
+        return Err("h264 access unit has no nal units");
+    }
+    Ok(())
+}
+
+fn start_h264_payload(access_unit: &[u8]) -> Result<usize, &'static str> {
+    find_h264_start_code(access_unit, 0)
+        .map(|(start, len)| start + len)
+        .ok_or("expected annex-b h264 start code")
+}
+
+fn find_h264_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut i = from;
+    while i + 3 <= data.len() {
+        if data[i] == 0 && data[i + 1] == 0 {
+            if data[i + 2] == 1 {
+                return Some((i, 3));
+            }
+            if i + 4 <= data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
+                return Some((i, 4));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 fn rejected_media_signature(frame: &[u8]) -> Option<&'static str> {
+    if let Some(reason) = rejected_container_signature(frame) {
+        return Some(reason);
+    }
+    if frame.starts_with(&[0x00, 0x00, 0x01]) || frame.starts_with(&[0x00, 0x00, 0x00, 0x01]) {
+        return Some("video codecs are not accepted");
+    }
+    None
+}
+
+fn rejected_container_signature(frame: &[u8]) -> Option<&'static str> {
     if frame.starts_with(b"ftyp") || frame.get(4..8) == Some(b"ftyp") {
         return Some("container formats are not accepted");
     }
@@ -1302,9 +1876,6 @@ fn rejected_media_signature(frame: &[u8]) -> Option<&'static str> {
         || frame.starts_with(&[0x1a, 0x45, 0xdf, 0xa3])
     {
         return Some("container formats are not accepted");
-    }
-    if frame.starts_with(&[0x00, 0x00, 0x01]) || frame.starts_with(&[0x00, 0x00, 0x00, 0x01]) {
-        return Some("video codecs are not accepted");
     }
     if frame[0] == 0x47 && frame.len() >= 188 && frame.get(188) == Some(&0x47) {
         return Some("mpeg-ts is not accepted");
@@ -1573,7 +2144,7 @@ fn publisher_hello_message(config: &Config, listeners: usize) -> String {
     push_json_string(&mut out, &config.server_name);
     out.push_str(",\"description\":");
     push_json_string(&mut out, &config.server_description);
-    out.push_str(",\"video\":false,\"listeners\":");
+    out.push_str(",\"video\":true,\"listeners\":");
     let _ = write!(out, "{listeners}");
     out.push('}');
     out
@@ -1726,7 +2297,7 @@ fn env_list(key: &str) -> Vec<String> {
 
 fn env_nonempty_or_default(key: &str, default: &str) -> Option<String> {
     match env::var(key) {
-        Ok(value) if value.is_empty() => None,
+        Ok(value) if value.is_empty() || value.eq_ignore_ascii_case("none") => None,
         Ok(value) => Some(value),
         Err(_) => Some(default.to_owned()),
     }
@@ -1783,6 +2354,8 @@ mod tests {
             max_tracked_ips: 16,
             max_aac_frame_bytes: AAC_MAX_ACCESS_UNIT_BYTES,
             max_ingest_bytes_per_sec: 128 * 1024,
+            max_h264_frame_bytes: H264_MAX_ACCESS_UNIT_BYTES,
+            max_video_ingest_bytes_per_sec: 1024 * 1024,
             channel_buffer: 8,
             publisher_idle_timeout: Duration::from_secs(1),
             passwords: Vec::new(),
@@ -1832,6 +2405,28 @@ mod tests {
     }
 
     #[test]
+    fn publisher_text_command_accepts_force_resync() {
+        assert!(matches!(
+            publisher_text_command("force_resync"),
+            Some(PublisherTextCommand::ForceResync)
+        ));
+        assert!(matches!(
+            publisher_text_command(" FORCE_RESYNC "),
+            Some(PublisherTextCommand::ForceResync)
+        ));
+        assert!(publisher_text_command("hello").is_none());
+    }
+
+    #[test]
+    fn force_resync_channel_advances_epoch() {
+        let channel = Channel::new(8);
+        assert_eq!(channel.resync_epoch.load(Ordering::Acquire), 0);
+        assert_eq!(force_resync_channel(&channel), 1);
+        assert_eq!(channel.resync_epoch.load(Ordering::Acquire), 1);
+        assert_eq!(force_resync_channel(&channel), 2);
+    }
+
+    #[test]
     fn publisher_hello_message_escapes_json_strings() {
         let mut config = test_config();
         config.server_name = "Name \"A\"".to_owned();
@@ -1839,7 +2434,7 @@ mod tests {
 
         assert_eq!(
             publisher_hello_message(&config, 7),
-            "{\"type\":\"hello\",\"name\":\"Name \\\"A\\\"\",\"description\":\"Line\\nTwo\",\"video\":false,\"listeners\":7}"
+            "{\"type\":\"hello\",\"name\":\"Name \\\"A\\\"\",\"description\":\"Line\\nTwo\",\"video\":true,\"listeners\":7}"
         );
     }
 
@@ -1932,6 +2527,23 @@ mod tests {
     }
 
     #[test]
+    fn validator_accepts_annex_b_h264_keyframe() {
+        let access_unit = [
+            0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x1f, 0, 0, 1, 0x65, 0x88, 0x84,
+        ];
+        assert!(validate_h264_access_unit(&access_unit, true, H264_MAX_ACCESS_UNIT_BYTES).is_ok());
+    }
+
+    #[test]
+    fn validator_rejects_h264_keyframe_without_idr() {
+        let access_unit = [0, 0, 0, 1, 0x41, 0x9a, 0x22];
+        assert_eq!(
+            validate_h264_access_unit(&access_unit, true, H264_MAX_ACCESS_UNIT_BYTES),
+            Err("h264 keyframe has no idr slice")
+        );
+    }
+
+    #[test]
     fn rtsp_uri_parser_extracts_hash() {
         let key = "a85c0211c512828c4c52dc5716a79e3a";
 
@@ -1972,6 +2584,9 @@ mod tests {
         assert!(sdp.contains("a=control:trackID=0\r\n"));
         assert!(sdp.contains("a=rtpmap:96 mpeg4-generic/48000/2\r\n"));
         assert!(sdp.contains("config=1190"));
-        assert!(!sdp.contains("m=video"));
+        assert!(sdp.contains("m=video 0 RTP/AVP 97\r\n"));
+        assert!(sdp.contains("a=control:trackID=1\r\n"));
+        assert!(sdp.contains("a=rtpmap:97 H264/90000\r\n"));
+        assert!(sdp.contains("packetization-mode=1"));
     }
 }

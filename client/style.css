@@ -511,6 +511,16 @@ header{
 .source-settings>label{
   white-space:nowrap
 }
+.source-preview{
+  aspect-ratio:16/9;
+  background:#050805;
+  border:1px solid color-mix(in srgb,var(--source-soft,#3ba85e) 45%,#071008);
+  border-radius:5px;
+  display:block;
+  max-height:8rem;
+  object-fit:contain;
+  width:100%
+}
 .source-gain{
   align-items:center;
   display:flex;
@@ -591,7 +601,7 @@ header{
   min-width:2.35rem;
   text-align:right
 }
-.source-mono{
+.source-mono,.source-video{
   align-items:center;
   display:flex;
   font-size:.82rem;

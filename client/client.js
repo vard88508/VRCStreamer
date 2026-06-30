@@ -63,6 +63,13 @@ const expectedAacConfigHex = "1190";
 const statsRefreshMs = 15000;
 const messageRefreshMs = 60000;
 const monitorOutputGain = 0.0001;
+const videoWidth = 1280;
+const videoHeight = 720;
+const videoFps = 30;
+const videoCaptureFps = 60;
+const videoBitrate = 2500000;
+const videoKeyframeInterval = videoFps * 2;
+const videoFramePeriodUs = Math.round(1000000 / videoFps);
 const fallbackServers = [
   {
     name: "Local 554",
@@ -138,6 +145,7 @@ const translations = {
     streamAudioFrom: "Stream Audio From",
     streamingTo: "Streaming To",
     tabSystem: "Tab/System",
+    video: "Video",
     addMicInput: "Add Mic/Input Device Audio",
     addTabSystem: "Add Tab/System Audio",
     wasm192Encoder: "🔊 WASM AAC 192 kbps",
@@ -167,6 +175,7 @@ const translations = {
     streamAudioFrom: "音声の配信元",
     streamingTo: "配信先",
     tabSystem: "タブ/システム",
+    video: "映像",
     addMicInput: "マイク/入力デバイス音声を追加",
     addTabSystem: "タブ/システム音声を追加",
     wasm192Encoder: "🔊 WASM AAC 192 kbps",
@@ -196,6 +205,7 @@ const translations = {
     streamAudioFrom: "Транслировать звук из",
     streamingTo: "Транслируется на",
     tabSystem: "Вкладки/системы",
+    video: "Видео",
     addMicInput: "Добавить звук из микрофона/устройства ввода",
     addTabSystem: "Добавить звук из вкладки/системы",
     wasm192Encoder: "🔊 WASM AAC 192 kbps",
@@ -842,6 +852,7 @@ function sourceSummary(state = active) {
   const names = [];
   if (hasSource(state, "mic")) names.push(state.sources.mic.name);
   if (hasSource(state, "screen")) names.push(state.sources.screen.name);
+  if (state && state.video) names.push("H.264 video");
   return names.join(" + ") || "none";
 }
 
@@ -849,14 +860,16 @@ function sourceSettings(source) {
   return {
     gain: sourceGain(source),
     mute: Boolean(source.muteEl.checked),
-    forceMono: Boolean(source.monoEl.checked)
+    forceMono: Boolean(source.monoEl.checked),
+    video: Boolean(source.videoEl && source.videoEl.checked)
   };
 }
 
 function defaultSourceSettings(kind) {
   return {
     gain: 1,
-    forceMono: kind === "mic"
+    forceMono: kind === "mic",
+    video: false
   };
 }
 
@@ -867,7 +880,8 @@ function normalizeRuntimeSourceSettings(kind, value) {
   return {
     gain,
     mute: Boolean(value && value.mute),
-    forceMono: typeof (value && value.forceMono) === "boolean" ? value.forceMono : defaults.forceMono
+    forceMono: typeof (value && value.forceMono) === "boolean" ? value.forceMono : defaults.forceMono,
+    video: kind === "screen" && typeof (value && value.video) === "boolean" ? value.video : defaults.video
   };
 }
 
@@ -875,7 +889,8 @@ function normalizeStoredSourceSettings(kind, value) {
   const settings = normalizeRuntimeSourceSettings(kind, value);
   return {
     gain: Math.min(1, settings.gain),
-    forceMono: settings.forceMono
+    forceMono: settings.forceMono,
+    video: kind === "screen" ? settings.video : false
   };
 }
 
@@ -892,7 +907,8 @@ function saveSourceSettings(source) {
   const stored = readStoredSourceSettings();
   stored[source.kind] = normalizeStoredSourceSettings(source.kind, {
     gain: sourceGain(source),
-    forceMono: Boolean(source.monoEl.checked)
+    forceMono: Boolean(source.monoEl.checked),
+    video: Boolean(source.videoEl && source.videoEl.checked)
   });
   writeJsonStorage(sourceSettingsStorageKey, stored);
 }
@@ -1162,7 +1178,14 @@ async function captureAudio(kind, deviceIdOverride = null) {
     sampleRate
   };
   if (kind === "screen") {
-    return await navigator.mediaDevices.getDisplayMedia({ video: true, audio });
+    return await navigator.mediaDevices.getDisplayMedia({
+      video: {
+        width: { ideal: videoWidth },
+        height: { ideal: videoHeight },
+        frameRate: { ideal: videoCaptureFps, max: videoCaptureFps }
+      },
+      audio
+    });
   }
   const deviceId = deviceIdOverride ?? micDeviceEl.value;
   if (deviceId) audio.deviceId = { exact: deviceId };
@@ -1404,6 +1427,213 @@ function createAacEncoder(onPacket, onError) {
   };
 }
 
+function createVideoWorker(ws, onError) {
+  const worker = new Worker(new URL("video-worker.js", location.href));
+  let closed = false;
+  let framePending = false;
+  let readySettled = false;
+  let latestStats = {
+    submitted: 0,
+    encoded: 0,
+    dropped: 0,
+    sourceFrames: 0,
+    fps: 0,
+    sourceFps: 0,
+    kbps: 0,
+    queue: 0
+  };
+
+  const ready = new Promise((resolve, reject) => {
+    const failReady = error => {
+      if (!readySettled) {
+        readySettled = true;
+        reject(error);
+      } else if (!closed) {
+        onError(error);
+      }
+    };
+    worker.onmessage = event => {
+      const message = event.data || {};
+      if (message.type === "ready") {
+        readySettled = true;
+        resolve();
+      } else if (message.type === "packet") {
+        if (closed || !active || active.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+        if (ws.bufferedAmount > 4 * 1024 * 1024) return;
+        ws.send(message.packet);
+      } else if (message.type === "stats") {
+        latestStats = message.stats || latestStats;
+      } else if (message.type === "frame") {
+        framePending = false;
+      } else if (message.type === "error") {
+        failReady(new Error(message.message || "Video worker failed."));
+      }
+    };
+    worker.onerror = event => {
+      failReady(new Error(event.message || "Video worker failed."));
+    };
+  });
+
+  return {
+    ready,
+    init(message, transfer = []) {
+      worker.postMessage({
+        type: "init",
+        width: videoWidth,
+        height: videoHeight,
+        fps: videoFps,
+        bitrate: videoBitrate,
+        keyframeInterval: videoKeyframeInterval,
+        framePeriodUs: videoFramePeriodUs,
+        ...message
+      }, transfer);
+    },
+    frame(frame) {
+      if (framePending) {
+        frame.close();
+        return false;
+      }
+      try {
+        framePending = true;
+        worker.postMessage({ type: "frame", frame }, [frame]);
+        return true;
+      } catch (error) {
+        framePending = false;
+        frame.close();
+        throw error;
+      }
+    },
+    close() {
+      closed = true;
+      try { worker.postMessage({ type: "close" }); } catch (_) {}
+      worker.terminate();
+    },
+    stats() {
+      return latestStats;
+    }
+  };
+}
+
+function videoTrackFrameRate(track) {
+  try {
+    const value = Number(track && track.getSettings && track.getSettings().frameRate);
+    return Number.isFinite(value) && value > 0 ? value : 0;
+  } catch (_) {
+    return 0;
+  }
+}
+
+function videoStats(worker, mode, track, captureFps = 0) {
+  const stats = worker.stats();
+  return {
+    ...stats,
+    mode,
+    captureFps: captureFps || stats.sourceFps,
+    trackFps: videoTrackFrameRate(track),
+    workerInputFps: stats.sourceFps
+  };
+}
+
+async function createTrackVideoStreamer(source, ws, onError) {
+  const track = source.mediaStream.getVideoTracks()[0];
+  const worker = createVideoWorker(ws, onError);
+  const workerTrack = track.clone();
+  try {
+    worker.init({ track: workerTrack }, [workerTrack]);
+    await worker.ready;
+    return {
+      source,
+      close() {
+        worker.close();
+      },
+      stats() {
+        return videoStats(worker, "track", track);
+      }
+    };
+  } catch (error) {
+    worker.close();
+    try { workerTrack.stop(); } catch (_) {}
+    throw error;
+  }
+}
+
+async function createProcessorVideoStreamer(source, ws, onError) {
+  if (!("MediaStreamTrackProcessor" in window)) {
+    throw new Error("MediaStreamTrackProcessor is not available on main thread.");
+  }
+  const track = source.mediaStream.getVideoTracks()[0];
+  const workerTrack = track.clone();
+  const worker = createVideoWorker(ws, onError);
+  const processor = new MediaStreamTrackProcessor({ track: workerTrack });
+  const reader = processor.readable.getReader();
+  let closed = false;
+  let captureFrames = 0;
+  let captureFps = 0;
+  let captureStatsAt = performance.now();
+
+  const readFrames = async () => {
+    try {
+      while (!closed) {
+        const { done, value } = await reader.read();
+        if (done || !value) break;
+        captureFrames++;
+        const now = performance.now();
+        const elapsed = now - captureStatsAt;
+        if (elapsed >= 1000) {
+          captureFps = (captureFrames * 1000) / elapsed;
+          captureFrames = 0;
+          captureStatsAt = now;
+        }
+        worker.frame(value);
+      }
+    } catch (error) {
+      if (!closed) onError(error);
+    }
+  };
+
+  try {
+    worker.init({});
+    await worker.ready;
+    readFrames();
+    return {
+      source,
+      close() {
+        closed = true;
+        try { reader.cancel(); } catch (_) {}
+        try { reader.releaseLock(); } catch (_) {}
+        try { workerTrack.stop(); } catch (_) {}
+        worker.close();
+      },
+      stats() {
+        return videoStats(worker, "processor", track, captureFps);
+      }
+    };
+  } catch (error) {
+    closed = true;
+    try { reader.cancel(); } catch (_) {}
+    try { reader.releaseLock(); } catch (_) {}
+    try { workerTrack.stop(); } catch (_) {}
+    worker.close();
+    throw error;
+  }
+}
+
+async function createVideoStreamer(source, ws, onError) {
+  if (!window.Worker) throw new Error("Video workers are not available.");
+  const track = source.mediaStream.getVideoTracks()[0];
+  if (!track) throw new Error("Selected source has no video track.");
+
+  try {
+    return await createTrackVideoStreamer(source, ws, onError);
+  } catch (trackError) {
+    try {
+      return await createProcessorVideoStreamer(source, ws, onError);
+    } catch (processorError) {
+      throw new Error(`Video worker failed: ${processorError.message || processorError}. Track path: ${trackError.message || trackError}`);
+    }
+  }
+}
+
 function encoderStatusLine(info) {
   let line = `Encoder: ${info.name}`;
   if (info.detail) line += ` (${info.detail})`;
@@ -1428,12 +1658,33 @@ function setStreamingControls(streaming) {
   updateSourceControls();
 }
 
+function videoFpsLabel(value) {
+  return Number.isFinite(value) && value > 0 ? value.toFixed(1) : "-";
+}
+
+function videoStatusLines(video) {
+  return `Video: H.264 ${videoWidth}x${videoHeight}@${videoFps}`
+    + `\nVideo mode: ${video.mode || "worker"}`
+    + `\nVideo fps: ${videoFpsLabel(video.fps)}`
+    + `\nCapture target fps: ${videoCaptureFps}`
+    + `\nBrowser capture fps: ${videoFpsLabel(video.captureFps)}`
+    + `\nTrack setting fps: ${videoFpsLabel(video.trackFps)}`
+    + `\nWorker input fps: ${videoFpsLabel(video.workerInputFps || video.sourceFps)}`
+    + `\nVideo kbps: ${video.kbps.toFixed(0)}`
+    + `\nVideo queue: ${video.queue}`
+    + `\nVideo dropped: ${video.dropped}`;
+}
+
 function streamStatusText(info) {
   if (!active) return encoderStatusLine(info);
 
   let text = `${encoderStatusLine(info)}${browserThrottleWarning()}\nListeners: ${active.streamListeners}\nSources: ${sourceSummary(active)}`;
   if ("encodedFrames" in info) {
     text += `\nEncoded AAC frames: ${info.encodedFrames}\nEncoded fps: ${info.encodedFps.toFixed(1)}/${expectedEncodedFpsLabel}\nAAC kbps: ${info.encodedKbps.toFixed(0)}\nEncoder queue: ${info.queue}`;
+  }
+  if (active.video) {
+    const video = active.video.stats();
+    text += `\n${videoStatusLines(video)}`;
   }
   return text;
 }
@@ -1444,6 +1695,10 @@ function streamHintText(info) {
   let text = `${encoderStatusLine(info)}${browserThrottleWarning()}`;
   if ("encodedFrames" in info) {
     text += `\nEncoded AAC frames: ${info.encodedFrames}\nEncoder queue: ${info.queue}`;
+  }
+  if (active.video) {
+    const video = active.video.stats();
+    text += `\n${videoStatusLines(video)}`;
   }
   return text;
 }
@@ -1545,6 +1800,22 @@ function applySourceTheme(block, source) {
   block.style.setProperty("--source-accent", `hsl(${hue} 62% 60%)`);
 }
 
+function updateSourceVideoPreview(source) {
+  if (!source.previewEl) return;
+  const track = source.mediaStream.getVideoTracks()[0];
+  const enabled = Boolean(source.videoEl && source.videoEl.checked && track);
+  source.previewEl.hidden = !enabled;
+  if (!enabled) {
+    source.previewEl.pause();
+    source.previewEl.srcObject = null;
+    return;
+  }
+  if (!source.previewEl.srcObject) {
+    source.previewEl.srcObject = new MediaStream([track]);
+  }
+  source.previewEl.play().catch(() => {});
+}
+
 function createMicSourceSelect(source) {
   const select = document.createElement("select");
   let selectedOption = null;
@@ -1583,6 +1854,10 @@ function createSourceBlock(source) {
   const monoLabel = document.createElement("label");
   const monoText = document.createElement("span");
   const mono = document.createElement("input");
+  const videoLabel = document.createElement("label");
+  const videoText = document.createElement("span");
+  const video = document.createElement("input");
+  const preview = document.createElement("video");
   const remove = document.createElement("button");
 
   block.className = "source-card";
@@ -1629,6 +1904,16 @@ function createSourceBlock(source) {
   monoLabel.className = "source-mono";
   monoLabel.append(monoText, mono);
 
+  video.type = "checkbox";
+  videoText.dataset.i18n = "video";
+  videoText.textContent = tr("video");
+  videoLabel.className = "source-video";
+  videoLabel.append(videoText, video);
+  preview.className = "source-preview";
+  preview.hidden = true;
+  preview.muted = true;
+  preview.playsInline = true;
+
   remove.type = "button";
   remove.className = "source-remove";
   remove.textContent = "×";
@@ -1637,7 +1922,9 @@ function createSourceBlock(source) {
   iconWrap.append(icon, iconHint);
   head.append(sourceControl, remove);
   settings.append(gainLabel, monoLabel);
+  if (source.kind === "screen") settings.append(videoLabel);
   body.append(head, settings);
+  if (source.kind === "screen") body.append(preview);
   block.append(iconWrap, body);
 
   source.block = block;
@@ -1647,6 +1934,8 @@ function createSourceBlock(source) {
   source.gainValueEl = gainValue;
   source.muteEl = mute;
   source.monoEl = mono;
+  source.videoEl = source.kind === "screen" ? video : null;
+  source.previewEl = source.kind === "screen" ? preview : null;
   source.removeBtn = remove;
 
   iconWrap.onclick = () => {
@@ -1680,13 +1969,57 @@ function createSourceBlock(source) {
     saveSourceSettings(source);
     updateStreamStatus();
   });
+  video.addEventListener("change", () => {
+    saveSourceSettings(source);
+    updateSourceVideoPreview(source);
+    syncVideoSource().catch(error => {
+      video.checked = false;
+      updateSourceVideoPreview(source);
+      saveSourceSettings(source);
+      setStatus(error.message || String(error));
+    });
+  });
   remove.onclick = () => removeAudioSource(source.kind, source);
 
   return block;
 }
 
+function stopActiveVideo() {
+  if (!active || !active.video) return;
+  active.video.close();
+  active.video = null;
+}
+
+async function syncVideoSource() {
+  if (!active) return;
+  const source = active.sources.screen;
+  const wantsVideo = Boolean(source && source.videoEl && source.videoEl.checked);
+  if (!wantsVideo) {
+    stopActiveVideo();
+    if (source) updateSourceVideoPreview(source);
+    return;
+  }
+  if (active.video && active.video.source === source) return;
+  stopActiveVideo();
+  active.video = await createVideoStreamer(source, active.ws, error => {
+    if (active) {
+      stopActiveVideo();
+      if (source.videoEl) source.videoEl.checked = false;
+      updateSourceVideoPreview(source);
+      saveSourceSettings(source);
+      setStatus(error.message || String(error));
+    }
+  });
+  updateStreamStatus();
+}
+
 function disposeAudioSource(source, stopStream = true) {
   if (!source) return;
+  if (active && active.video && active.video.source === source) stopActiveVideo();
+  if (source.previewEl) {
+    source.previewEl.pause();
+    source.previewEl.srcObject = null;
+  }
   try { source.node.disconnect(); } catch (_) {}
   try { source.processor.disconnect(); } catch (_) {}
   try { source.processor.port.close(); } catch (_) {}
@@ -1733,6 +2066,8 @@ function installAudioSource(kind, mediaStream, deviceId = kind === "mic" ? micDe
   next.gainEl.value = String(initialSettings.gain);
   next.muteEl.checked = Boolean(initialSettings.mute);
   next.monoEl.checked = Boolean(initialSettings.forceMono);
+  if (next.videoEl) next.videoEl.checked = Boolean(initialSettings.video);
+  updateSourceVideoPreview(next);
   applyAudioSourceSettings(next);
   saveSourceSettings(next);
 
@@ -1747,6 +2082,14 @@ function installAudioSource(kind, mediaStream, deviceId = kind === "mic" ? micDe
     sourcesEl.appendChild(next.block);
   }
   if (previous) disposeAudioSource(previous);
+  if (next.kind === "screen") {
+    syncVideoSource().catch(error => {
+      if (next.videoEl) next.videoEl.checked = false;
+      updateSourceVideoPreview(next);
+      saveSourceSettings(next);
+      setStatus(error.message || String(error));
+    });
+  }
 
   mediaStream.getAudioTracks().forEach(track => {
     track.addEventListener("ended", () => removeAudioSource(kind, next), { once: true });
@@ -1880,6 +2223,7 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
       audioContext,
       ws,
       encoder,
+      video: null,
       mixer,
       captureNode,
       monitor,
@@ -1937,6 +2281,12 @@ function stop() {
   setStatus("Stopped.");
 }
 
+function forceResync() {
+  if (!active || active.ws.readyState !== WebSocket.OPEN) return false;
+  active.ws.send("force_resync");
+  return true;
+}
+
 function cleanup({ stopStreams = true, updateControls = true } = {}) {
   const current = active;
   active = null;
@@ -1949,6 +2299,7 @@ function cleanup({ stopStreams = true, updateControls = true } = {}) {
   try { current.monitor.disconnect(); } catch (_) {}
   disposeAudioSource(current.sources.mic, stopStreams);
   disposeAudioSource(current.sources.screen, stopStreams);
+  if (current.video) current.video.close();
   current.encoder.close();
   if (current.wakeLock) {
     try { current.wakeLock.release(); } catch (_) {}
@@ -2017,6 +2368,7 @@ newLinkBtn.onclick = newLink;
 micBtn.onclick = () => start("mic");
 screenBtn.onclick = () => start("screen");
 stopBtn.onclick = stop;
+window.force_resync = forceResync;
 streamInfoWrapEl.addEventListener("mouseenter", showStreamInfoHint);
 streamInfoWrapEl.addEventListener("mouseleave", hideStreamInfoHint);
 streamInfoWrapEl.addEventListener("focusin", showStreamInfoHint);
