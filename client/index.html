@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>VRCStreamer - Easy low-latency streaming into VRChat</title>
-  <meta name="description" content="Stream audio into VRChat directly from your browser. Low latency, no setup, and no extra software required.">
+  <meta name="description" content="Stream audio/video into VRChat directly from your browser. Low latency, no setup, and no extra software required.">
   <link rel="icon" href="static/logo.webp" type="image/webp">
   <link rel="stylesheet" href="style.css">
   <script src="client.js" defer></script>
@@ -15,7 +15,7 @@
       <a class="logo" href="">
         <img src="static/logo.webp" alt="">
         <p>VRCStreamer</p>
-        <p class="version">1.0</p>
+        <p class="version">2.0</p>
       </a>
 
       <div class="server-selection">
@@ -34,21 +34,10 @@
     <section id="messageBox" class="message-box" hidden></section>
 
     <section id="customServer" class="custom-server" hidden>
-      <label>
-        <span id="customApiLabel">API</span>
-        <input id="customApi" autocomplete="off" spellcheck="false">
-      </label>
-      <label>
-        <span id="customRtspLabel">RTSP</span>
-        <input id="customRtsp" autocomplete="off" spellcheck="false">
-      </label>
-      <label>
-        <span id="customPasswordLabel">Password</span>
-        <input id="customPassword" type="password" autocomplete="off" spellcheck="false">
-      </label>
+      <input id="customApi" autocomplete="off" spellcheck="false" placeholder="HTTP API Address">
+      <input id="customPassword" type="password" autocomplete="off" spellcheck="false" placeholder="Password (optional)">
       <div>
         <button id="customConnect" type="button">Connect</button>
-        <button id="customBookmark" type="button">Bookmark</button>
       </div>
     </section>
 
@@ -58,29 +47,32 @@
         <div class="source-choice">
           <button id="mic" type="button">
             <img src="static/mic.webp" alt="Mic">
-            <span id="micDeviceLabel">Mic/Input Device</span>
+            <span id="micDeviceLabel">▾ Mic/Input Device</span>
           </button>
-          <select id="micDevice" class="source-label-select" hidden>
-            <option value="">Mic/Input Device</option>
-          </select>
+          <div id="micDeviceWrap" class="source-label-select-wrap" hidden>
+            <span id="micDeviceSelectedLabel" class="source-label-select-display">Mic/Input Device</span>
+            <select id="micDevice" class="source-label-select">
+              <option value="">Mic/Input Device</option>
+            </select>
+          </div>
         </div>
         <div class="source-choice">
           <button id="screen" type="button">
-            <img src="static/tab.webp" alt="Tab/PC">
-            <span id="screenLabel">Tab/System</span>
+            <img src="static/audio.webp" alt="Tab/System Audio">
+            <span id="screenLabel">Tab/System Audio</span>
+          </button>
+        </div>
+        <div id="videoChoice" class="source-choice" hidden>
+          <button id="videoSource" type="button">
+            <img src="static/video.webp" alt="Tab/System Video">
+            <span id="videoSourceLabel">Tab/System Video</span>
           </button>
         </div>
       </div>
+      <p id="tabAudioHint" class="tab-audio-hint"></p>
       <p id="startTip" class="start-tip">
         Tip: You can mute browser tabs by right-clicking them, so you do not get annoyed by echo while streaming into VRChat.
       </p>
-      <div class="start-bottom">
-        <select id="encoderMode">
-          <option value="native192">🔊 Native AAC 192 kbps</option>
-          <option value="wasm192">🔊 WASM AAC 192 kbps</option>
-          <option value="wasm320">🔊 WASM AAC 320 kbps</option>
-        </select>
-      </div>
     </section>
 
     <section id="streamPanel" class="stream-panel" hidden>
@@ -97,18 +89,22 @@
       <div id="sources"></div>
       <div id="addSources" class="add-sources"></div>
       <div class="stream-bottom">
+        <select id="encoderMode">
+          <option value="native192">🔊 Native AAC 192 kbps</option>
+          <option value="wasm192">🔊 WASM AAC 192 kbps</option>
+          <option value="wasm320">🔊 WASM AAC 320 kbps</option>
+        </select>
         <div id="streamInfoWrap" class="stream-info-wrap" tabindex="0">
           <div id="streamInfo" class="stream-info"></div>
           <span id="streamInfoHint" class="stream-hint" hidden></span>
         </div>
       </div>
-      <pre id="status"></pre>
     </section>
 
     <footer class="main-footer">
       <a id="sourceCodeLink" href="https://github.com/vard88508/VRCStreamer">Source Code</a>
       <span>•</span>
-      <a id="contactAdminLink" href="mailto:vard@disroot.org">Contact Admin</a>
+      <a id="reportBugLink" href="https://github.com/vard88508/VRCStreamer/issues">Report bug</a>
       <span class="footer-spacer"></span>
       <select id="languageSelect" aria-label="Language">
         <option value="en">English</option>

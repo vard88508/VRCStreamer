@@ -1,6 +1,5 @@
 [
   {
-    "apiBase": "https://eu.vard.cc",
-    "rtspBase": "rtsp://eu.vard.cc"
+    "apiBase": "https://eu.vard.cc"
   }
 ]

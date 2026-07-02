@@ -7,6 +7,10 @@ let latestFrame = null;
 let timer = 0;
 let statsTimer = 0;
 let closed = true;
+let placeholder = false;
+let placeholderImage = null;
+let placeholderImageUrl = "";
+let readToken = 0;
 let width = 1280;
 let height = 720;
 let fps = 30;
@@ -25,6 +29,7 @@ let lastEncoded = 0;
 let lastSourceFrames = 0;
 let lastEncodedBytes = 0;
 let avcHeader = null;
+let forceNextKeyframe = false;
 
 function fail(error) {
   postMessage({ type: "error", message: error && error.message ? error.message : String(error) });
@@ -92,21 +97,50 @@ function drawFrame(frame) {
   ctx.drawImage(frame, x, y, drawWidth, drawHeight);
 }
 
+function drawPlaceholder() {
+  if (placeholderImage) {
+    ctx.drawImage(placeholderImage, 0, 0, width, height);
+  } else {
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, width, height);
+    forceNextKeyframe = true;
+  }
+}
+
+async function loadPlaceholderImage(url) {
+  if (!url) throw new Error("Video placeholder image URL is missing.");
+  if (!("createImageBitmap" in self)) throw new Error("createImageBitmap is not available in worker.");
+  const response = await fetch(url, { cache: "force-cache" });
+  if (!response.ok) throw new Error(`Video placeholder image failed to load: ${response.status}`);
+  const image = await createImageBitmap(await response.blob());
+  if (closed || url !== placeholderImageUrl) {
+    try { image.close(); } catch (_) {}
+    return;
+  }
+  if (placeholderImage) {
+    try { placeholderImage.close(); } catch (_) {}
+  }
+  placeholderImage = image;
+  forceNextKeyframe = true;
+}
+
 function encodeLatest() {
   if (closed) return;
   try {
-    if (latestFrame && encoder && encoder.state === "configured") {
+    if (encoder && encoder.state === "configured") {
       if (encoder.encodeQueueSize > 2) {
         dropped++;
       } else {
-        drawFrame(latestFrame);
+        if (latestFrame && !placeholder) drawFrame(latestFrame);
+        else drawPlaceholder();
         let frame = null;
         try {
           frame = new VideoFrame(canvas, {
             timestamp: submitted * framePeriodUs,
             duration: framePeriodUs
           });
-          const keyFrame = submitted % keyframeInterval === 0;
+          const keyFrame = forceNextKeyframe || submitted % keyframeInterval === 0;
+          forceNextKeyframe = false;
           submitted++;
           encoder.encode(frame, { keyFrame });
         } finally {
@@ -126,18 +160,24 @@ function encodeLatest() {
   timer = setTimeout(encodeLatest, nextEncodeAt - now);
 }
 
-async function readFrames() {
+async function readFrames(token) {
   try {
     while (!closed) {
+      if (token !== readToken) break;
       const { done, value } = await reader.read();
+      if (token !== readToken) {
+        if (value) value.close();
+        break;
+      }
       if (done || !value) break;
       sourceFrames++;
       const previous = latestFrame;
       latestFrame = value;
       if (previous) previous.close();
+      placeholder = false;
     }
   } catch (error) {
-    if (!closed) fail(error);
+    if (!closed && token === readToken) fail(error);
   }
 }
 
@@ -146,7 +186,51 @@ function setLatestFrame(frame) {
   const previous = latestFrame;
   latestFrame = frame;
   if (previous) previous.close();
+  placeholder = false;
   postMessage({ type: "frame" });
+}
+
+function closeReader() {
+  readToken++;
+  if (reader) {
+    try { reader.cancel(); } catch (_) {}
+    try { reader.releaseLock(); } catch (_) {}
+    reader = null;
+  }
+  if (track) {
+    try { track.stop(); } catch (_) {}
+    track = null;
+  }
+}
+
+function closeLatestFrame() {
+  if (latestFrame) {
+    try { latestFrame.close(); } catch (_) {}
+    latestFrame = null;
+  }
+}
+
+function usePlaceholder() {
+  closeReader();
+  closeLatestFrame();
+  placeholder = true;
+  forceNextKeyframe = true;
+}
+
+function useTrack(nextTrack) {
+  if (!nextTrack) throw new Error("Video track is missing.");
+  if (!("MediaStreamTrackProcessor" in self)) {
+    throw new Error("MediaStreamTrackProcessor is not available in worker.");
+  }
+  closeReader();
+  closeLatestFrame();
+  placeholder = true;
+  forceNextKeyframe = true;
+  track = nextTrack;
+  const processor = new MediaStreamTrackProcessor({ track });
+  reader = processor.readable.getReader();
+  const token = ++readToken;
+  readFrames(token);
 }
 
 function postStats() {
@@ -177,7 +261,8 @@ function postStats() {
 async function init(message) {
   closeAll();
   closed = false;
-  track = message.track;
+  const initialTrack = message.track;
+  track = null;
   width = message.width;
   height = message.height;
   fps = message.fps;
@@ -196,6 +281,10 @@ async function init(message) {
   lastSourceFrames = 0;
   lastEncodedBytes = 0;
   avcHeader = null;
+  forceNextKeyframe = false;
+  placeholder = !initialTrack;
+  placeholderImageUrl = message.placeholderUrl || "";
+  readToken = 0;
 
   if (!("VideoEncoder" in self) || !("VideoFrame" in self)) {
     throw new Error("Native H.264 WebCodecs video encoder is not available in worker.");
@@ -203,10 +292,6 @@ async function init(message) {
   if (!("OffscreenCanvas" in self)) {
     throw new Error("OffscreenCanvas is not available in worker.");
   }
-  if (track && !("MediaStreamTrackProcessor" in self)) {
-    throw new Error("MediaStreamTrackProcessor is not available in worker.");
-  }
-
   const config = {
     codec: "avc1.42E01F",
     width,
@@ -239,11 +324,9 @@ async function init(message) {
   });
   encoder.configure(config);
 
-  if (track) {
-    const processor = new MediaStreamTrackProcessor({ track });
-    reader = processor.readable.getReader();
-    readFrames();
-  }
+  await loadPlaceholderImage(placeholderImageUrl);
+  if (initialTrack) useTrack(initialTrack);
+  else forceNextKeyframe = true;
   timer = setTimeout(encodeLatest, Math.max(0, nextEncodeAt - performance.now()));
   statsTimer = setInterval(postStats, 1000);
   postMessage({ type: "ready" });
@@ -255,22 +338,15 @@ function closeAll() {
   clearInterval(statsTimer);
   timer = 0;
   statsTimer = 0;
-  if (reader) {
-    try { reader.cancel(); } catch (_) {}
-    try { reader.releaseLock(); } catch (_) {}
-    reader = null;
-  }
-  if (latestFrame) {
-    try { latestFrame.close(); } catch (_) {}
-    latestFrame = null;
+  closeReader();
+  closeLatestFrame();
+  if (placeholderImage) {
+    try { placeholderImage.close(); } catch (_) {}
+    placeholderImage = null;
   }
   if (encoder) {
     try { encoder.close(); } catch (_) {}
     encoder = null;
-  }
-  if (track) {
-    try { track.stop(); } catch (_) {}
-    track = null;
   }
 }
 
@@ -280,6 +356,10 @@ self.onmessage = event => {
     init(message).catch(fail);
   } else if (message.type === "frame" && message.frame && !closed) {
     setLatestFrame(message.frame);
+  } else if (message.type === "track" && message.track && !closed) {
+    try { useTrack(message.track); } catch (error) { fail(error); }
+  } else if (message.type === "placeholder" && !closed) {
+    usePlaceholder();
   } else if (message.type === "close") {
     closeAll();
   }

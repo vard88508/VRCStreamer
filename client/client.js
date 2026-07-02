@@ -4,18 +4,15 @@ const serverSelectEl = $("serverSelect");
 const serverHintEl = $("serverHint");
 const messageBoxEl = $("messageBox");
 const customServerEl = $("customServer");
-const customApiLabelEl = $("customApiLabel");
 const customApiEl = $("customApi");
-const customRtspLabelEl = $("customRtspLabel");
-const customRtspEl = $("customRtsp");
-const customPasswordLabelEl = $("customPasswordLabel");
 const customPasswordEl = $("customPassword");
 const customConnectBtn = $("customConnect");
-const customBookmarkBtn = $("customBookmark");
 const rtspUrlEl = $("rtspUrl");
 const rtspHintEl = $("rtspHint");
 const encoderModeEl = $("encoderMode");
 const micDeviceEl = $("micDevice");
+const micDeviceWrapEl = $("micDeviceWrap");
+const micDeviceSelectedLabelEl = $("micDeviceSelectedLabel");
 const micDeviceLabelEl = $("micDeviceLabel");
 const sourcesEl = $("sources");
 const addSourcesEl = $("addSources");
@@ -23,12 +20,15 @@ const firstSourceSelectionEl = $("firstSourceSelection");
 const startTitleEl = $("startTitle");
 const startTipEl = $("startTip");
 const screenLabelEl = $("screenLabel");
+const tabAudioHintEl = $("tabAudioHint");
+const videoChoiceEl = $("videoChoice");
+const videoSourceBtn = $("videoSource");
+const videoSourceLabelEl = $("videoSourceLabel");
 const streamPanelEl = $("streamPanel");
 const streamToTitleEl = $("streamToTitle");
 const streamInfoWrapEl = $("streamInfoWrap");
 const streamInfoEl = $("streamInfo");
 const streamInfoHintEl = $("streamInfoHint");
-const statusEl = $("status");
 const statsEl = $("stats");
 const pasteHintEl = $("pasteHint");
 const newLinkBtn = $("newLink");
@@ -36,13 +36,16 @@ const micBtn = $("mic");
 const screenBtn = $("screen");
 const stopBtn = $("stop");
 const sourceCodeLinkEl = $("sourceCodeLink");
-const contactAdminLinkEl = $("contactAdminLink");
+const reportBugLinkEl = $("reportBugLink");
 const languageSelectEl = $("languageSelect");
 const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&()*+,-./:;<=>?@[]^_{|}~";
+const streamCodeLength = 32;
+const storagePrefix = "vrc-audio-streamer-";
+const storageVersion = "2";
+const storageVersionKey = `${storagePrefix}storage-version`;
 const codeStorageKey = "vrc-audio-streamer-code";
 const serverStorageKey = "vrc-audio-streamer-server";
 const customApiStorageKey = "vrc-audio-streamer-custom-api";
-const customRtspStorageKey = "vrc-audio-streamer-custom-rtsp";
 const customPasswordStorageKey = "vrc-audio-streamer-custom-password";
 const bookmarkedServersStorageKey = "vrc-audio-streamer-bookmarked-servers";
 const serverMetaStorageKey = "vrc-audio-streamer-server-meta";
@@ -57,7 +60,6 @@ const wasm192Bitrate = 192000;
 const wasm320Bitrate = 320000;
 const expectedEncodedFps = sampleRate / framesPerChunk;
 const expectedEncodedFpsLabel = expectedEncodedFps.toFixed(1);
-const redEncodedFps = 42;
 const native192Bitrates = [192000];
 const expectedAacConfigHex = "1190";
 const statsRefreshMs = 15000;
@@ -66,22 +68,26 @@ const monitorOutputGain = 0.0001;
 const videoWidth = 1280;
 const videoHeight = 720;
 const videoFps = 30;
-const videoCaptureFps = 60;
+const videoCaptureFps = 30;
 const videoBitrate = 2500000;
 const videoKeyframeInterval = videoFps * 2;
 const videoFramePeriodUs = Math.round(1000000 / videoFps);
+const videoPlaceholderHoldMs = 15000;
+const maxAudioWsBufferedBytes = 256 * 1024;
+const maxVideoWsBufferedBytes = 1024 * 1024;
+const isFirefoxBased = /\b(Firefox|FxiOS|Waterfox|LibreWolf|Iceweasel)\b/i.test(navigator.userAgent);
 const fallbackServers = [
   {
     name: "Local 554",
     description: "Local test server on default RTSP port 554.",
     apiBase: "http://127.0.0.1:8081",
-    rtspBase: "rtsp://127.0.0.1"
+    rtspBase: "rtspt://127.0.0.1"
   },
   {
     name: "Local 8554",
     description: "Local test server on RTSP port 8554.",
     apiBase: "http://127.0.0.1:8081",
-    rtspBase: "rtsp://127.0.0.1:8554"
+    rtspBase: "rtspt://127.0.0.1:8554"
   }
 ];
 
@@ -98,6 +104,7 @@ let sourceRequestInFlight = false;
 let linkRestartInFlight = false;
 let rtspHintResetTimer = 0;
 let messagePayload = null;
+let nativeAacAvailable = true;
 
 const encoderModes = {
   native192: {
@@ -122,92 +129,107 @@ const encoderModes = {
 
 const translations = {
   en: {
-    api: "API",
-    bookmark: "Bookmark",
+    api: "HTTP API Address",
     clickToCopy: "Click to Copy",
     connect: "Connect",
-    contactAdmin: "Contact Admin",
     copied: "Copied!",
     customOption: "Custom Server",
-    customServerHint: "Use your own API and RTSP server addresses.",
+    customServerHint: "Use your own API server address.",
     generateNewLink: "Generate Another Link",
     micInput: "Mic/Input Device",
     mono: "Mono",
     mute: "Mute",
+    hideMuteVideo: "Hide+Mute Video",
     nativeEncoder: "🔊 Native AAC 192 kbps",
-    or: "or",
-    password: "Password",
+    password: "Password (optional)",
     pasteVideoHint: "Paste this link into video player",
-    rtsp: "RTSP",
     sourceCode: "Source Code",
+    reportBug: "Report bug",
     stopStreaming: "Stop Streaming",
     startTip: "Tip: You can mute browser tabs by right-clicking them, so you do not get annoyed by echo while streaming into VRChat.",
     streamAudioFrom: "Stream Audio From",
+    streamFrom: "Stream From",
     streamingTo: "Streaming To",
-    tabSystem: "Tab/System",
-    video: "Video",
-    addMicInput: "Add Mic/Input Device Audio",
-    addTabSystem: "Add Tab/System Audio",
+    tabSystem: "Tab/System Audio",
+    tabAudioHint: "Make sure \"Share Audio\" is enabled in the browser picker.",
+    chromiumRequired: "Requires Chromium-based browser.",
+    tabSystemCard: "Tab/System Audio",
+    tabVideoCard: "Tab/System Video",
+    tabVideoAudioCard: "Tab/System Video + Audio",
+    videoSource: "Tab/System Video",
+    addMicInput: "Mic/Input Device Audio",
+    addTabSystem: "Tab/System Audio",
+    addVideoSource: "Tab/System Video",
     wasm192Encoder: "🔊 WASM AAC 192 kbps",
     wasmEncoder: "🔊 WASM AAC 320 kbps"
   },
   ja: {
-    api: "API",
-    bookmark: "ブックマーク",
+    api: "HTTP API アドレス",
     clickToCopy: "クリックでコピー",
     connect: "接続",
-    contactAdmin: "管理者に連絡",
     copied: "コピーしました",
     customOption: "カスタムサーバー",
-    customServerHint: "独自の API と RTSP サーバーアドレスを使います。",
+    customServerHint: "独自の API サーバーアドレスを使います。",
     generateNewLink: "別のリンクを生成",
     micInput: "マイク/入力デバイス",
     mono: "モノラル",
     mute: "ミュート",
+    hideMuteVideo: "映像を隠す+ミュート",
     nativeEncoder: "🔊 Native AAC 192 kbps",
-    or: "または",
-    password: "パスワード",
+    password: "パスワード（任意）",
     pasteVideoHint: "このリンクをビデオプレイヤーに貼り付け",
-    rtsp: "RTSP",
     sourceCode: "ソースコード",
+    reportBug: "バグを報告",
     stopStreaming: "配信を停止",
     startTip: "ヒント: ブラウザのタブは右クリックでミュートできます。VRChat に配信中の音の二重再生を防げます。",
     streamAudioFrom: "音声の配信元",
+    streamFrom: "配信元",
     streamingTo: "配信先",
-    tabSystem: "タブ/システム",
-    video: "映像",
-    addMicInput: "マイク/入力デバイス音声を追加",
-    addTabSystem: "タブ/システム音声を追加",
+    tabSystem: "タブ/システム音声",
+    tabAudioHint: "ブラウザの選択画面で「音声を共有」を有効にしてください。",
+    chromiumRequired: "Chromium 系ブラウザが必要です。",
+    tabSystemCard: "タブ/システム音声",
+    tabVideoCard: "タブ/システム映像",
+    tabVideoAudioCard: "タブ/システム映像 + 音声",
+    videoSource: "タブ/システム映像",
+    addMicInput: "マイク/入力デバイス音声",
+    addTabSystem: "タブ/システム音声",
+    addVideoSource: "タブ/システム映像",
     wasm192Encoder: "🔊 WASM AAC 192 kbps",
     wasmEncoder: "🔊 WASM AAC 320 kbps"
   },
   ru: {
-    api: "API",
-    bookmark: "Сохранить",
+    api: "HTTP API адрес",
     clickToCopy: "Нажми, чтобы скопировать",
     connect: "Подключить",
-    contactAdmin: "Связаться с администратором",
     copied: "Скопировано!",
     customOption: "Свой сервер",
-    customServerHint: "Использовать свои адреса API и RTSP сервера.",
+    customServerHint: "Использовать свой адрес API сервера.",
     generateNewLink: "Сгенерировать другую ссылку",
     micInput: "Микрофона/Устройства ввода",
     mono: "Моно",
     mute: "Заглушить",
+    hideMuteVideo: "Скрыть+заглушить видео",
     nativeEncoder: "🔊 Native AAC 192 kbps",
-    or: "или",
-    password: "Пароль",
+    password: "Пароль (необязательно)",
     pasteVideoHint: "Вставь эту ссылку в видеоплеер",
-    rtsp: "RTSP",
     sourceCode: "Исходный код",
+    reportBug: "Зарепортить баг",
     stopStreaming: "Остановить стрим",
     startTip: "Совет: Ты можешь выключить звук из вкладки, нажав по ней правой кнопкой мыши. Так у тебя не будет двоиться звук при стриме в VRChat.",
     streamAudioFrom: "Транслировать звук из",
+    streamFrom: "Транслировать из",
     streamingTo: "Транслируется на",
-    tabSystem: "Вкладки/системы",
-    video: "Видео",
-    addMicInput: "Добавить звук из микрофона/устройства ввода",
-    addTabSystem: "Добавить звук из вкладки/системы",
+    tabSystem: "Вкладки/системы аудио",
+    tabAudioHint: "Убедись, что в окне выбора вкладки включено «Поделиться аудио».",
+    chromiumRequired: "Требуется Chromium-based браузер.",
+    tabSystemCard: "Вкладка/система аудио",
+    tabVideoCard: "Вкладка/система видео",
+    tabVideoAudioCard: "Вкладка/система видео + аудио",
+    videoSource: "Вкладки/системы видео",
+    addMicInput: "Звук из микрофона/устройства ввода",
+    addTabSystem: "Звук из вкладки/системы",
+    addVideoSource: "Видео из вкладки/системы",
     wasm192Encoder: "🔊 WASM AAC 192 kbps",
     wasmEncoder: "🔊 WASM AAC 320 kbps"
   }
@@ -233,6 +255,19 @@ function writeStorage(key, value) {
   try { localStorage.setItem(key, value); } catch (_) {}
 }
 
+function resetStorageIfVersionChanged() {
+  try {
+    if (localStorage.getItem(storageVersionKey) === storageVersion) return;
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith(storagePrefix) && key !== bookmarkedServersStorageKey) keys.push(key);
+    }
+    keys.forEach(key => localStorage.removeItem(key));
+    localStorage.setItem(storageVersionKey, storageVersion);
+  } catch (_) {}
+}
+
 function readJsonStorage(key, fallback) {
   try {
     const value = JSON.parse(readStorage(key, ""));
@@ -246,12 +281,18 @@ function writeJsonStorage(key, value) {
   writeStorage(key, JSON.stringify(value));
 }
 
+resetStorageIfVersionChanged();
+
 function setElementText(el, key) {
   if (el) el.textContent = tr(key);
 }
 
 function micDeviceLabel() {
   return tr("micInput");
+}
+
+function micDeviceStartLabel() {
+  return `▾ ${micDeviceLabel()}`;
 }
 
 function preferredBrowserLanguage() {
@@ -280,6 +321,16 @@ function updateEncoderLabels() {
   if (nativeOption) nativeOption.textContent = tr("nativeEncoder");
   if (wasm192Option) wasm192Option.textContent = tr("wasm192Encoder");
   if (wasmOption) wasmOption.textContent = tr("wasmEncoder");
+  updateNativeEncoderOption();
+}
+
+function updateNativeEncoderOption() {
+  const nativeOption = encoderModeEl.querySelector('option[value="native192"]');
+  if (nativeOption) nativeOption.hidden = !nativeAacAvailable;
+  if (!nativeAacAvailable && encoderModeEl.value === "native192") {
+    encoderModeEl.value = "wasm192";
+    writeStorage(encoderModeStorageKey, encoderModeEl.value);
+  }
 }
 
 function normalizeMessageText(value) {
@@ -320,18 +371,20 @@ async function refreshMessage() {
 
 function applyLanguage() {
   document.documentElement.lang = currentLanguage === "ja" ? "ja" : currentLanguage === "ru" ? "ru" : "en";
-  setElementText(startTitleEl, "streamAudioFrom");
+  updateStartTitle();
   setElementText(startTipEl, "startTip");
   setElementText(screenLabelEl, "tabSystem");
+  tabAudioHintEl.textContent = tr("tabAudioHint");
+  setElementText(videoSourceLabelEl, "videoSource");
   setElementText(streamToTitleEl, "streamingTo");
-  setElementText(customApiLabelEl, "api");
-  setElementText(customRtspLabelEl, "rtsp");
-  setElementText(customPasswordLabelEl, "password");
+  customApiEl.placeholder = tr("api");
+  customPasswordEl.placeholder = tr("password");
   setElementText(sourceCodeLinkEl, "sourceCode");
-  setElementText(contactAdminLinkEl, "contactAdmin");
-  micDeviceLabelEl.textContent = micDeviceLabel();
+  setElementText(reportBugLinkEl, "reportBug");
+  micDeviceLabelEl.textContent = micDeviceStartLabel();
+  updateMicDeviceDisplay();
+  updateActiveSourceLabels();
   customConnectBtn.textContent = tr("connect");
-  customBookmarkBtn.textContent = tr("bookmark");
   pasteHintEl.textContent = tr("pasteVideoHint");
   newLinkBtn.textContent = tr("generateNewLink");
   stopBtn.textContent = `⏹ ${tr("stopStreaming")}`;
@@ -342,10 +395,6 @@ function applyLanguage() {
   updateCustomOption();
   updateServerHint();
   renderAddSourceButtons();
-}
-
-function setStatus(text) {
-  statusEl.textContent = text;
 }
 
 function positionSideHint(anchorEl, hintEl) {
@@ -369,10 +418,6 @@ function positionSideHint(anchorEl, hintEl) {
   hintEl.style.top = `${Math.max(gap, top)}px`;
 }
 
-function setStreamInfo(text) {
-  streamInfoEl.textContent = text;
-}
-
 function setStreamInfoHint(text) {
   streamInfoHintEl.textContent = text;
   streamInfoHintEl.hidden = !text;
@@ -393,6 +438,25 @@ function showStreamInfoHint() {
 
 function hideStreamInfoHint() {
   streamInfoHintEl.classList.remove("is-visible");
+}
+
+function systemCaptureDisabled() {
+  return isFirefoxBased;
+}
+
+function showSystemSourceHint(kind) {
+  if (systemCaptureDisabled()) {
+    tabAudioHintEl.textContent = tr("chromiumRequired");
+  } else if (kind === "screen") {
+    tabAudioHintEl.textContent = tr("tabAudioHint");
+  } else {
+    return;
+  }
+  tabAudioHintEl.classList.add("is-visible");
+}
+
+function hideSystemSourceHint() {
+  tabAudioHintEl.classList.remove("is-visible");
 }
 
 function setRtspHint(text) {
@@ -421,8 +485,8 @@ function setStats(text) {
   statsEl.textContent = text;
 }
 
-function randomCode(length = 32) {
-  const bytes = new Uint8Array(length);
+function randomCode() {
+  const bytes = new Uint8Array(streamCodeLength);
   crypto.getRandomValues(bytes);
   let out = "";
   for (const byte of bytes) out += charset[byte % charset.length];
@@ -430,7 +494,7 @@ function randomCode(length = 32) {
 }
 
 function validStoredCode(code) {
-  return typeof code === "string" && code.length >= 8 && code.length <= 128 && /^[\x21-\x7e]+$/.test(code);
+  return typeof code === "string" && code.length === streamCodeLength && /^[\x21-\x7e]+$/.test(code);
 }
 
 function loadCode() {
@@ -463,12 +527,14 @@ function normalizeServerEntry(entry) {
   const apiBase = entry.apiBase || entry.api || entry.http || "";
   const rtspBase = entry.rtspBase || entry.rtsp || entry.media || "";
   if (typeof apiBase !== "string" || typeof rtspBase !== "string") return null;
-  if (!apiBase.trim() || !rtspBase.trim()) return null;
+  if (!apiBase.trim()) return null;
   return {
     name: String(entry.name || entry.label || "").trim(),
     description: String(entry.description || "").trim(),
     apiBase: apiBase.trim(),
-    rtspBase: rtspBase.trim()
+    rtspBase: rtspBase.trim(),
+    password: String(entry.password || "").trim(),
+    video: entry.video === true
   };
 }
 
@@ -481,13 +547,12 @@ function hostLabel(value) {
 }
 
 function sameServer(left, right) {
-  return normalizeBase(left.apiBase, "https://") === normalizeBase(right.apiBase, "https://")
-    && normalizeBase(left.rtspBase, "rtsp://") === normalizeBase(right.rtspBase, "rtsp://");
+  return normalizeBase(left.apiBase, "https://") === normalizeBase(right.apiBase, "https://");
 }
 
 function serverKey(server) {
   const apiDefault = location.protocol === "https:" ? "https://" : "http://";
-  return `${normalizeBase(server.apiBase, apiDefault)}|${normalizeBase(server.rtspBase, "rtsp://")}`;
+  return normalizeBase(server.apiBase, apiDefault);
 }
 
 function normalizeServerMeta(meta) {
@@ -495,6 +560,7 @@ function normalizeServerMeta(meta) {
   return {
     name: String(meta.name || "").trim(),
     description: String(meta.description || "").trim(),
+    rtspBase: String(meta.rtspBase || meta.rtsp_base || "").trim(),
     video: Boolean(meta.video)
   };
 }
@@ -505,7 +571,7 @@ function loadServerMetaCache() {
   if (!saved || typeof saved !== "object" || Array.isArray(saved)) return;
   for (const [key, value] of Object.entries(saved)) {
     const meta = normalizeServerMeta(value);
-    if (meta && (meta.name || meta.description)) serverMetaCache[key] = meta;
+    if (meta && (meta.name || meta.description || meta.rtspBase || meta.video)) serverMetaCache[key] = meta;
   }
 }
 
@@ -519,7 +585,11 @@ function savedServerMeta(server) {
 
 function serverDisplayName(server) {
   const meta = savedServerMeta(server);
-  return (meta && meta.name) || server.name || hostLabel(server.apiBase);
+  const video = meta ? meta.video : Boolean(server.video);
+  const name = ((meta && meta.name) || server.name || hostLabel(server.apiBase))
+    .replace(/^[🔊📺]\s*/u, "")
+    .replace(/\s*[🔊📺]\s*$/u, "");
+  return `${name} ${video ? "📺" : "🔊"}`;
 }
 
 function serverDescription(server) {
@@ -527,10 +597,13 @@ function serverDescription(server) {
   return (meta && meta.description) || server.description || "";
 }
 
+function serverRtspBase(server) {
+  const meta = savedServerMeta(server);
+  return (meta && meta.rtspBase) || server.rtspBase || "";
+}
+
 function customOptionText() {
-  const entry = customServerEntry();
-  const meta = entry && savedServerMeta(entry);
-  return meta && meta.name ? `${tr("customOption")}: ${meta.name}` : tr("customOption");
+  return tr("customOption");
 }
 
 function updateCustomOption() {
@@ -588,7 +661,6 @@ async function loadServers() {
 
 function renderServers() {
   customApiEl.value = readStorage(customApiStorageKey) || "http://127.0.0.1:8081";
-  customRtspEl.value = readStorage(customRtspStorageKey) || "rtsp://127.0.0.1";
   customPasswordEl.value = readStorage(customPasswordStorageKey);
 
   serverSelectEl.textContent = "";
@@ -653,11 +725,8 @@ async function nativeEncoderSupported() {
 }
 
 async function selectWasmWhenNativeUnsupported() {
-  if (encoderModeEl.value !== "native192") return;
-  const supported = await nativeEncoderSupported();
-  if (supported || encoderModeEl.value !== "native192") return;
-  encoderModeEl.value = "wasm192";
-  writeStorage(encoderModeStorageKey, encoderModeEl.value);
+  nativeAacAvailable = await nativeEncoderSupported();
+  updateNativeEncoderOption();
 }
 
 function selectedEncoderMode() {
@@ -669,10 +738,8 @@ function updateCustomVisibility() {
   const locked = Boolean(active);
   customServerEl.hidden = !custom || locked;
   customApiEl.disabled = locked || !custom;
-  customRtspEl.disabled = locked || !custom;
   customPasswordEl.disabled = locked || !custom;
   customConnectBtn.disabled = locked || !custom;
-  customBookmarkBtn.disabled = locked || !custom;
   updateCustomOption();
   updateServerHint();
 }
@@ -683,7 +750,6 @@ function selectedServer() {
       name: tr("customOption"),
       description: tr("customServerHint"),
       apiBase: customApiEl.value,
-      rtspBase: customRtspEl.value,
       password: customPasswordEl.value
     };
   }
@@ -693,7 +759,7 @@ function selectedServer() {
 function customServerEntry() {
   return normalizeServerEntry({
     apiBase: customApiEl.value,
-    rtspBase: customRtspEl.value
+    password: customPasswordEl.value
   });
 }
 
@@ -701,31 +767,33 @@ function saveSelectedServerValue() {
   writeStorage(serverStorageKey, serverSelectEl.value);
 }
 
-function connectSelectedServer() {
+async function connectSelectedServer() {
   saveSelectedServerValue();
   updateCustomVisibility();
   updateUrl();
-  refreshStats();
+  return await refreshStats();
 }
 
-function connectCustomServer() {
-  if (!customServerEntry()) {
-    setStatus("Custom server API and RTSP are required.");
+async function connectCustomServer() {
+  const entry = customServerEntry();
+  if (!entry) {
     return;
   }
   serverSelectEl.value = "custom";
-  connectSelectedServer();
+  const connected = await connectSelectedServer();
+  if (connected) saveCustomServer(entry);
 }
 
-function bookmarkCustomServer() {
-  const entry = customServerEntry();
-  if (!entry) {
-    setStatus("Custom server API and RTSP are required.");
-    return;
-  }
-
+function saveCustomServer(entry) {
+  entry.rtspBase = serverRtspBase(entry);
   const existing = servers.findIndex(server => sameServer(server, entry));
   if (existing >= 0) {
+    servers[existing].password = entry.password;
+    const bookmarked = bookmarkedServers.find(server => sameServer(server, entry));
+    if (bookmarked) {
+      bookmarked.password = entry.password;
+      saveBookmarkedServers();
+    }
     serverSelectEl.value = String(existing);
   } else {
     bookmarkedServers.push(entry);
@@ -746,20 +814,37 @@ function currentServerInfo() {
   return serverInfo && serverInfo.key === currentServerKey() ? serverInfo : null;
 }
 
+function serverVideoEnabled() {
+  const info = currentServerInfo();
+  if (info) return Boolean(info.video);
+  const meta = savedServerMeta(selectedServer());
+  return Boolean(meta && meta.video);
+}
+
+function updateStartTitle() {
+  startTitleEl.textContent = tr(serverVideoEnabled() ? "streamFrom" : "streamAudioFrom");
+}
+
 function applyServerInfo(info) {
   if (!info || typeof info !== "object") return;
 
   const name = typeof info.name === "string" ? info.name.trim() : "";
   const description = typeof info.description === "string" ? info.description.trim() : "";
+  const rtspBase = typeof info.rtsp_base === "string"
+    ? info.rtsp_base.trim()
+    : typeof info.rtspBase === "string"
+      ? info.rtspBase.trim()
+      : "";
   const key = currentServerKey();
   const previous = serverMetaCache[key] || {};
   const meta = {
     name: name || previous.name || "",
     description: description || previous.description || "",
+    rtspBase: rtspBase || previous.rtspBase || "",
     video: Boolean(info.video)
   };
   serverInfo = { key, ...meta };
-  if (meta.name || meta.description) {
+  if (meta.name || meta.description || meta.rtspBase || "video" in info) {
     serverMetaCache[key] = meta;
     saveServerMetaCache();
   }
@@ -770,6 +855,7 @@ function applyServerInfo(info) {
     if (server) {
       if (meta.name) server.name = meta.name;
       server.description = meta.description;
+      if (meta.rtspBase) server.rtspBase = meta.rtspBase;
       updateServerOption(index, server);
     }
   } else {
@@ -777,6 +863,8 @@ function applyServerInfo(info) {
   }
 
   updateCustomVisibility();
+  updateSourceControls();
+  updateUrl();
 }
 
 function normalizeBase(value, defaultProtocol) {
@@ -793,7 +881,7 @@ function apiUrl(path) {
 }
 
 function mediaUrl(hash) {
-  const base = normalizeBase(selectedServer().rtspBase, "rtsp://");
+  const base = normalizeBase(serverRtspBase(selectedServer()), "rtspt://");
   if (!base) return "";
   return `${base}/${hash}`;
 }
@@ -844,32 +932,18 @@ async function updateUrl() {
   setRtspUrl(mediaUrl(hash));
 }
 
-function hasSource(state, kind) {
-  return Boolean(state && state.sources && state.sources[kind]);
-}
-
-function sourceSummary(state = active) {
-  const names = [];
-  if (hasSource(state, "mic")) names.push(state.sources.mic.name);
-  if (hasSource(state, "screen")) names.push(state.sources.screen.name);
-  if (state && state.video) names.push("H.264 video");
-  return names.join(" + ") || "none";
-}
-
 function sourceSettings(source) {
   return {
     gain: sourceGain(source),
-    mute: Boolean(source.muteEl.checked),
-    forceMono: Boolean(source.monoEl.checked),
-    video: Boolean(source.videoEl && source.videoEl.checked)
+    mute: Boolean(source.muteEl && source.muteEl.checked),
+    forceMono: Boolean(source.monoEl && source.monoEl.checked)
   };
 }
 
 function defaultSourceSettings(kind) {
   return {
     gain: 1,
-    forceMono: kind === "mic",
-    video: false
+    forceMono: kind === "mic"
   };
 }
 
@@ -880,8 +954,7 @@ function normalizeRuntimeSourceSettings(kind, value) {
   return {
     gain,
     mute: Boolean(value && value.mute),
-    forceMono: typeof (value && value.forceMono) === "boolean" ? value.forceMono : defaults.forceMono,
-    video: kind === "screen" && typeof (value && value.video) === "boolean" ? value.video : defaults.video
+    forceMono: typeof (value && value.forceMono) === "boolean" ? value.forceMono : defaults.forceMono
   };
 }
 
@@ -889,8 +962,7 @@ function normalizeStoredSourceSettings(kind, value) {
   const settings = normalizeRuntimeSourceSettings(kind, value);
   return {
     gain: Math.min(1, settings.gain),
-    forceMono: settings.forceMono,
-    video: kind === "screen" ? settings.video : false
+    forceMono: settings.forceMono
   };
 }
 
@@ -904,11 +976,11 @@ function loadSourceSettings(kind) {
 }
 
 function saveSourceSettings(source) {
+  if (!source.gainEl) return;
   const stored = readStoredSourceSettings();
   stored[source.kind] = normalizeStoredSourceSettings(source.kind, {
     gain: sourceGain(source),
-    forceMono: Boolean(source.monoEl.checked),
-    video: Boolean(source.videoEl && source.videoEl.checked)
+    forceMono: Boolean(source.monoEl && source.monoEl.checked)
   });
   writeJsonStorage(sourceSettingsStorageKey, stored);
 }
@@ -916,29 +988,47 @@ function saveSourceSettings(source) {
 function activeSourceSpecs() {
   if (!active) return [];
   const specs = [];
-  for (const kind of ["mic", "screen"]) {
+  for (const kind of ["mic", "screen", "video"]) {
     const source = active.sources[kind];
     if (!source) continue;
     specs.push({
       kind,
       deviceId: source.deviceId || "",
       mediaStream: source.mediaStream,
-      settings: sourceSettings(source)
+      settings: source.gainEl ? sourceSettings(source) : null
     });
   }
   return specs;
 }
 
 function addSourceLabel(kind) {
-  return kind === "mic" ? tr("addMicInput") : tr("addTabSystem");
+  if (kind === "mic") return tr("addMicInput");
+  if (kind === "video") return tr("addVideoSource");
+  return tr("addTabSystem");
 }
 
-function createAddMicSourceSelect() {
+function addSourceIcon(kind) {
+  if (kind === "mic") return "🎙️";
+  if (kind === "video") return "📺";
+  return "🔊";
+}
+
+function addSourceButtonLabel(kind) {
+  return `＋ ${addSourceLabel(kind)} ${addSourceIcon(kind)}`;
+}
+
+function createAddMicSourceControl() {
+  const wrap = document.createElement("span");
+  const button = document.createElement("button");
   const select = document.createElement("select");
   const placeholder = document.createElement("option");
   placeholder.value = "__add_mic";
-  placeholder.textContent = addSourceLabel("mic");
-  select.className = "add-source-select";
+  placeholder.textContent = addSourceButtonLabel("mic");
+  wrap.className = "add-source-mic";
+  button.type = "button";
+  button.textContent = placeholder.textContent;
+  button.disabled = sourceRequestInFlight;
+  select.className = "add-source-hidden-select";
   select.disabled = sourceRequestInFlight;
   select.appendChild(placeholder);
 
@@ -951,10 +1041,20 @@ function createAddMicSourceSelect() {
   }
 
   select.value = placeholder.value;
-  select.onpointerdown = event => {
-    if (micDeviceSelectionReady || sourceRequestInFlight) return;
-    event.preventDefault();
-    addOrReplaceSource("mic");
+  button.onclick = () => {
+    if (sourceRequestInFlight) return;
+    if (!micDeviceSelectionReady) {
+      addOrReplaceSource("mic");
+      return;
+    }
+    if (typeof select.showPicker === "function") {
+      try {
+        select.showPicker();
+        return;
+      } catch (_) {}
+    }
+    select.focus();
+    select.click();
   };
   select.onchange = () => {
     const deviceId = select.value;
@@ -963,49 +1063,64 @@ function createAddMicSourceSelect() {
     saveMicDeviceSelection(deviceId);
     addOrReplaceSource("mic", deviceId);
   };
-  return select;
+  wrap.append(button, select);
+  return wrap;
 }
 
 function renderAddSourceButtons() {
   addSourcesEl.textContent = "";
-  if (!active) return;
+  if (!active) {
+    stopBtn.remove();
+    return;
+  }
 
   const missing = [];
-  if (!active.sources.screen) missing.push("screen");
+  const systemDisabled = systemCaptureDisabled();
+  if (!systemDisabled && (!active.sources.screen || active.sources.video)) missing.push("screen");
   if (!active.sources.mic) missing.push("mic");
+  if (!systemDisabled && serverVideoEnabled() && (!active.sources.video || active.sources.screen)) missing.push("video");
 
-  missing.forEach((kind, index) => {
-    if (index > 0) {
-      const separator = document.createElement("span");
-      separator.textContent = tr("or");
-      addSourcesEl.appendChild(separator);
-    }
+  missing.forEach(kind => {
     if (kind === "mic") {
-      addSourcesEl.appendChild(createAddMicSourceSelect());
-    } else {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.textContent = addSourceLabel(kind);
-      button.disabled = sourceRequestInFlight;
-      button.onclick = () => addOrReplaceSource(kind);
-      addSourcesEl.appendChild(button);
+      addSourcesEl.appendChild(createAddMicSourceControl());
+      return;
     }
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = addSourceButtonLabel(kind);
+    button.disabled = sourceRequestInFlight;
+    button.onclick = () => addOrReplaceSource(kind);
+    addSourcesEl.appendChild(button);
   });
+  addSourcesEl.appendChild(stopBtn);
 }
 
 function updateSourceControls() {
   const streaming = Boolean(active);
+  const videoEnabled = serverVideoEnabled();
+  const systemDisabled = systemCaptureDisabled();
   micBtn.disabled = sourceRequestInFlight;
   screenBtn.disabled = sourceRequestInFlight;
+  videoChoiceEl.hidden = !videoEnabled;
+  videoSourceBtn.disabled = sourceRequestInFlight || !videoEnabled;
+  screenBtn.classList.toggle("is-browser-disabled", systemDisabled);
+  videoSourceBtn.classList.toggle("is-browser-disabled", systemDisabled);
+  screenBtn.setAttribute("aria-disabled", String(systemDisabled));
+  videoSourceBtn.setAttribute("aria-disabled", String(systemDisabled));
   micDeviceEl.disabled = sourceRequestInFlight || !micDeviceSelectionReady;
+  encoderModeEl.disabled = false;
+  newLinkBtn.disabled = linkRestartInFlight;
   stopBtn.disabled = !streaming;
+  updateStartTitle();
+  if (active && !videoEnabled && active.sources.video) removeVideoSource(active.sources.video);
   renderAddSourceButtons();
 }
 
 function setMicDeviceSelectionReady(ready) {
   micDeviceSelectionReady = ready;
-  micDeviceEl.hidden = !ready;
+  micDeviceWrapEl.hidden = !ready;
   micDeviceLabelEl.hidden = ready;
+  updateMicDeviceDisplay();
 }
 
 function setSourceRequestBusy(busy) {
@@ -1051,6 +1166,16 @@ function savedMicDeviceId() {
 function saveMicDeviceSelection(value = micDeviceEl.value) {
   micDeviceEl.value = value || "";
   writeStorage(micDeviceStorageKey, micDeviceEl.value);
+  updateMicDeviceDisplay();
+}
+
+function selectedMicDeviceText() {
+  const option = micDeviceEl.selectedOptions && micDeviceEl.selectedOptions[0];
+  return (option && option.textContent.trim()) || micDeviceLabel();
+}
+
+function updateMicDeviceDisplay() {
+  micDeviceSelectedLabelEl.textContent = selectedMicDeviceText();
 }
 
 async function refreshMicDevices(preferredId = micDeviceEl.value || savedMicDeviceId()) {
@@ -1072,6 +1197,7 @@ async function refreshMicDevices(preferredId = micDeviceEl.value || savedMicDevi
 
   if (!micDeviceSelectionReady) {
     micDeviceEl.value = "";
+    updateMicDeviceDisplay();
     updateSourceControls();
     return;
   }
@@ -1093,6 +1219,7 @@ async function refreshMicDevices(preferredId = micDeviceEl.value || savedMicDevi
   if ([...micDeviceEl.options].some(option => option.value === preferredId)) {
     micDeviceEl.value = preferredId;
   }
+  updateMicDeviceDisplay();
   updateSourceControls();
 }
 
@@ -1113,8 +1240,10 @@ async function refreshStats() {
     const stats = await response.json();
     applyServerInfo(stats);
     setStats(`🟢 Online 📡${stats.active_streams} 👥${stats.active_listeners}`);
+    return true;
   } catch (_) {
     setStats("🔴 Offline 📡- 👥-");
+    return false;
   }
 }
 
@@ -1123,7 +1252,7 @@ function listenerCountFromMessage(message) {
   return Number.isInteger(value) && value >= 0 ? value : null;
 }
 
-function handlePublisherMessage(event, setStreamListeners) {
+function handleStreamerMessage(event, setStreamListeners) {
   if (typeof event.data !== "string") return;
 
   let message = null;
@@ -1169,6 +1298,41 @@ function withTimeout(promise, ms, message) {
   return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
 }
 
+function isDisplayMediaConstraintError(error) {
+  const name = error && error.name ? error.name : "";
+  const message = error && error.message ? error.message : String(error || "");
+  return name === "TypeError"
+    || name === "NotSupportedError"
+    || name === "OverconstrainedError"
+    || /not supported|constraint|parameter|operation/i.test(message);
+}
+
+async function getDisplayMediaCompat(primary, fallbacks = []) {
+  try {
+    return await navigator.mediaDevices.getDisplayMedia(primary);
+  } catch (error) {
+    if (!isDisplayMediaConstraintError(error)) throw error;
+    let lastError = error;
+    for (const constraints of fallbacks) {
+      try {
+        return await navigator.mediaDevices.getDisplayMedia(constraints);
+      } catch (fallbackError) {
+        if (!isDisplayMediaConstraintError(fallbackError)) throw fallbackError;
+        lastError = fallbackError;
+      }
+    }
+    throw lastError;
+  }
+}
+
+function isMissingAudioDeviceError(error) {
+  const name = error && error.name;
+  return name === "OverconstrainedError"
+    || name === "NotFoundError"
+    || name === "DevicesNotFoundError"
+    || name === "ConstraintNotSatisfiedError";
+}
+
 async function captureAudio(kind, deviceIdOverride = null) {
   const audio = {
     echoCancellation: false,
@@ -1178,18 +1342,62 @@ async function captureAudio(kind, deviceIdOverride = null) {
     sampleRate
   };
   if (kind === "screen") {
-    return await navigator.mediaDevices.getDisplayMedia({
-      video: {
-        width: { ideal: videoWidth },
-        height: { ideal: videoHeight },
-        frameRate: { ideal: videoCaptureFps, max: videoCaptureFps }
-      },
+    const video = {
+      width: { ideal: videoWidth },
+      height: { ideal: videoHeight },
+      frameRate: { ideal: videoCaptureFps, max: videoCaptureFps }
+    };
+    return await getDisplayMediaCompat({
+      video,
       audio
-    });
+    }, [
+      { video, audio: true },
+      { video: true, audio: true }
+    ]);
   }
   const deviceId = deviceIdOverride ?? micDeviceEl.value;
-  if (deviceId) audio.deviceId = { exact: deviceId };
-  return await navigator.mediaDevices.getUserMedia({ video: false, audio });
+  if (!deviceId) return await navigator.mediaDevices.getUserMedia({ video: false, audio });
+
+  try {
+    return await navigator.mediaDevices.getUserMedia({
+      video: false,
+      audio: { ...audio, deviceId: { exact: deviceId } }
+    });
+  } catch (error) {
+    if (!isMissingAudioDeviceError(error)) throw error;
+    saveMicDeviceSelection("");
+    return await navigator.mediaDevices.getUserMedia({ video: false, audio });
+  }
+}
+
+async function captureVideo() {
+  const audio = {
+    echoCancellation: false,
+    noiseSuppression: false,
+    autoGainControl: false,
+    channelCount: 2,
+    sampleRate
+  };
+  const video = {
+    width: { ideal: videoWidth },
+    height: { ideal: videoHeight },
+    frameRate: { ideal: videoCaptureFps, max: videoCaptureFps }
+  };
+  return await getDisplayMediaCompat({
+    video,
+    audio
+  }, [
+    { video, audio: true },
+    { video: true, audio: true },
+    { video: true, audio: false }
+  ]);
+}
+
+function removeVideoTracks(mediaStream) {
+  for (const track of mediaStream.getVideoTracks()) {
+    mediaStream.removeTrack(track);
+    track.stop();
+  }
 }
 
 function captureProcessorSource() {
@@ -1347,7 +1555,11 @@ function createAacEncoder(onPacket, onError) {
   let pcmBlocks = 0;
   let encodedFrames = 0;
   let encodedBytes = 0;
-  let firstPacketAt = 0;
+  let statsAt = performance.now();
+  let statsFrames = 0;
+  let statsBytes = 0;
+  let currentEncodedFps = 0;
+  let currentEncodedKbps = 0;
   let name = "Loading AAC";
   let detail = "";
   let fallbackReason = "";
@@ -1362,7 +1574,6 @@ function createAacEncoder(onPacket, onError) {
         readySettled = true;
         resolve({ name, detail, fallbackReason });
       } else if (message.type === "packet") {
-        if (firstPacketAt === 0) firstPacketAt = performance.now();
         encodedFrames++;
         encodedBytes += message.bytes;
         onPacket(message.packet);
@@ -1409,9 +1620,15 @@ function createAacEncoder(onPacket, onError) {
       return pcmBlocks - encodedFrames;
     },
     stats() {
-      const elapsed = firstPacketAt === 0
-        ? 0.001
-        : Math.max((performance.now() - firstPacketAt) / 1000, 0.001);
+      const now = performance.now();
+      const elapsed = Math.max((now - statsAt) / 1000, 0.001);
+      if (elapsed >= 0.25) {
+        currentEncodedFps = (encodedFrames - statsFrames) / elapsed;
+        currentEncodedKbps = ((encodedBytes - statsBytes) * 8 / 1000) / elapsed;
+        statsAt = now;
+        statsFrames = encodedFrames;
+        statsBytes = encodedBytes;
+      }
       return {
         name,
         detail,
@@ -1419,8 +1636,8 @@ function createAacEncoder(onPacket, onError) {
         pcmBlocks,
         encodedFrames,
         encodedBytes,
-        encodedFps: encodedFrames / elapsed,
-        encodedKbps: (encodedBytes * 8 / 1000) / elapsed,
+        encodedFps: currentEncodedFps,
+        encodedKbps: currentEncodedKbps,
         queue: pcmBlocks - encodedFrames
       };
     }
@@ -1449,6 +1666,9 @@ function createVideoWorker(ws, onError) {
         readySettled = true;
         reject(error);
       } else if (!closed) {
+        closed = true;
+        try { worker.postMessage({ type: "close" }); } catch (_) {}
+        worker.terminate();
         onError(error);
       }
     };
@@ -1459,7 +1679,10 @@ function createVideoWorker(ws, onError) {
         resolve();
       } else if (message.type === "packet") {
         if (closed || !active || active.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
-        if (ws.bufferedAmount > 4 * 1024 * 1024) return;
+        if (ws.bufferedAmount > maxVideoWsBufferedBytes) {
+          failReady(new Error("Network video queue is too slow; stopped video."));
+          return;
+        }
         ws.send(message.packet);
       } else if (message.type === "stats") {
         latestStats = message.stats || latestStats;
@@ -1485,6 +1708,7 @@ function createVideoWorker(ws, onError) {
         bitrate: videoBitrate,
         keyframeInterval: videoKeyframeInterval,
         framePeriodUs: videoFramePeriodUs,
+        placeholderUrl: new URL("static/live-placeholder.webp", location.href).href,
         ...message
       }, transfer);
     },
@@ -1503,13 +1727,22 @@ function createVideoWorker(ws, onError) {
         throw error;
       }
     },
+    setTrack(track) {
+      worker.postMessage({ type: "track", track }, [track]);
+    },
+    placeholder() {
+      worker.postMessage({ type: "placeholder" });
+    },
     close() {
       closed = true;
       try { worker.postMessage({ type: "close" }); } catch (_) {}
       worker.terminate();
     },
     stats() {
-      return latestStats;
+      return {
+        ...latestStats,
+        wsKBytes: ws.bufferedAmount / 1024
+      };
     }
   };
 }
@@ -1535,24 +1768,58 @@ function videoStats(worker, mode, track, captureFps = 0) {
 }
 
 async function createTrackVideoStreamer(source, ws, onError) {
-  const track = source.mediaStream.getVideoTracks()[0];
   const worker = createVideoWorker(ws, onError);
-  const workerTrack = track.clone();
+  let currentSource = source;
+  let api = null;
+  const clearStopTimer = () => {
+    if (!api) return;
+    clearTimeout(api.stopTimer);
+    api.stopTimer = 0;
+  };
+  const sourceTrack = nextSource => {
+    const track = nextSource && nextSource.mediaStream.getVideoTracks()[0];
+    if (!track) throw new Error("Selected source has no video track.");
+    return track;
+  };
+  api = {
+    source,
+    stopTimer: 0,
+    setSource(nextSource) {
+      clearStopTimer();
+      const nextWorkerTrack = sourceTrack(nextSource).clone();
+      worker.setTrack(nextWorkerTrack);
+      currentSource = nextSource;
+      api.source = nextSource;
+    },
+    placeholder() {
+      clearStopTimer();
+      worker.placeholder();
+      currentSource = null;
+      api.source = null;
+    },
+    close() {
+      clearStopTimer();
+      worker.close();
+    },
+    stats() {
+      const currentTrack = currentSource && currentSource.mediaStream.getVideoTracks()[0];
+      return videoStats(worker, "track", currentTrack);
+    }
+  };
+  let workerTrack = null;
   try {
-    worker.init({ track: workerTrack }, [workerTrack]);
+    if (source) {
+      workerTrack = sourceTrack(source).clone();
+      worker.init({ track: workerTrack }, [workerTrack]);
+      workerTrack = null;
+    } else {
+      worker.init({});
+    }
     await worker.ready;
-    return {
-      source,
-      close() {
-        worker.close();
-      },
-      stats() {
-        return videoStats(worker, "track", track);
-      }
-    };
+    return api;
   } catch (error) {
     worker.close();
-    try { workerTrack.stop(); } catch (_) {}
+    try { workerTrack && workerTrack.stop(); } catch (_) {}
     throw error;
   }
 }
@@ -1561,20 +1828,45 @@ async function createProcessorVideoStreamer(source, ws, onError) {
   if (!("MediaStreamTrackProcessor" in window)) {
     throw new Error("MediaStreamTrackProcessor is not available on main thread.");
   }
-  const track = source.mediaStream.getVideoTracks()[0];
-  const workerTrack = track.clone();
   const worker = createVideoWorker(ws, onError);
-  const processor = new MediaStreamTrackProcessor({ track: workerTrack });
-  const reader = processor.readable.getReader();
   let closed = false;
+  let currentSource = null;
+  let workerTrack = null;
+  let reader = null;
+  let readToken = 0;
+  let api = null;
   let captureFrames = 0;
   let captureFps = 0;
   let captureStatsAt = performance.now();
 
-  const readFrames = async () => {
+  const clearStopTimer = () => {
+    if (!api) return;
+    clearTimeout(api.stopTimer);
+    api.stopTimer = 0;
+  };
+
+  const closeReader = () => {
+    readToken++;
+    if (reader) {
+      try { reader.cancel(); } catch (_) {}
+      try { reader.releaseLock(); } catch (_) {}
+      reader = null;
+    }
+    if (workerTrack) {
+      try { workerTrack.stop(); } catch (_) {}
+      workerTrack = null;
+    }
+  };
+
+  const readFrames = async token => {
     try {
       while (!closed) {
+        if (token !== readToken) break;
         const { done, value } = await reader.read();
+        if (token !== readToken) {
+          if (value) value.close();
+          break;
+        }
         if (done || !value) break;
         captureFrames++;
         const now = performance.now();
@@ -1587,32 +1879,56 @@ async function createProcessorVideoStreamer(source, ws, onError) {
         worker.frame(value);
       }
     } catch (error) {
-      if (!closed) onError(error);
+      if (!closed && token === readToken) onError(error);
     }
+  };
+
+  const setSource = nextSource => {
+    const track = nextSource.mediaStream.getVideoTracks()[0];
+    if (!track) throw new Error("Selected source has no video track.");
+    clearStopTimer();
+    closeReader();
+    currentSource = nextSource;
+    worker.placeholder();
+    workerTrack = track.clone();
+    const processor = new MediaStreamTrackProcessor({ track: workerTrack });
+    reader = processor.readable.getReader();
+    readFrames(++readToken);
   };
 
   try {
     worker.init({});
     await worker.ready;
-    readFrames();
-    return {
+    setSource(source);
+    api = {
       source,
+      stopTimer: 0,
+      setSource(nextSource) {
+        setSource(nextSource);
+        api.source = nextSource;
+      },
+      placeholder() {
+        clearStopTimer();
+        closeReader();
+        currentSource = null;
+        api.source = null;
+        worker.placeholder();
+      },
       close() {
+        clearStopTimer();
         closed = true;
-        try { reader.cancel(); } catch (_) {}
-        try { reader.releaseLock(); } catch (_) {}
-        try { workerTrack.stop(); } catch (_) {}
+        closeReader();
         worker.close();
       },
       stats() {
-        return videoStats(worker, "processor", track, captureFps);
+        const currentTrack = currentSource && currentSource.mediaStream.getVideoTracks()[0];
+        return videoStats(worker, "processor", currentTrack, captureFps);
       }
     };
+    return api;
   } catch (error) {
     closed = true;
-    try { reader.cancel(); } catch (_) {}
-    try { reader.releaseLock(); } catch (_) {}
-    try { workerTrack.stop(); } catch (_) {}
+    closeReader();
     worker.close();
     throw error;
   }
@@ -1620,8 +1936,9 @@ async function createProcessorVideoStreamer(source, ws, onError) {
 
 async function createVideoStreamer(source, ws, onError) {
   if (!window.Worker) throw new Error("Video workers are not available.");
-  const track = source.mediaStream.getVideoTracks()[0];
-  if (!track) throw new Error("Selected source has no video track.");
+  if (!source || !source.mediaStream.getVideoTracks()[0]) {
+    throw new Error("Selected source has no video track.");
+  }
 
   try {
     return await createTrackVideoStreamer(source, ws, onError);
@@ -1645,7 +1962,7 @@ function setStreamingControls(streaming) {
   firstSourceSelectionEl.hidden = streaming;
   streamPanelEl.hidden = !streaming;
   if (!streaming) {
-    setStreamInfo("");
+    streamInfoEl.textContent = "";
     setStreamInfoHint("");
   } else {
     requestAnimationFrame(fitRtspUrlText);
@@ -1653,7 +1970,7 @@ function setStreamingControls(streaming) {
   stopBtn.disabled = !streaming;
   newLinkBtn.disabled = linkRestartInFlight;
   serverSelectEl.disabled = false;
-  encoderModeEl.disabled = streaming;
+  encoderModeEl.disabled = false;
   updateCustomVisibility();
   updateSourceControls();
 }
@@ -1672,62 +1989,36 @@ function videoStatusLines(video) {
     + `\nWorker input fps: ${videoFpsLabel(video.workerInputFps || video.sourceFps)}`
     + `\nVideo kbps: ${video.kbps.toFixed(0)}`
     + `\nVideo queue: ${video.queue}`
+    + `\nWebSocket queue: ${video.wsKBytes.toFixed(0)} KB`
     + `\nVideo dropped: ${video.dropped}`;
 }
 
-function streamStatusText(info) {
-  if (!active) return encoderStatusLine(info);
-
-  let text = `${encoderStatusLine(info)}${browserThrottleWarning()}\nListeners: ${active.streamListeners}\nSources: ${sourceSummary(active)}`;
-  if ("encodedFrames" in info) {
-    text += `\nEncoded AAC frames: ${info.encodedFrames}\nEncoded fps: ${info.encodedFps.toFixed(1)}/${expectedEncodedFpsLabel}\nAAC kbps: ${info.encodedKbps.toFixed(0)}\nEncoder queue: ${info.queue}`;
-  }
-  if (active.video) {
-    const video = active.video.stats();
-    text += `\n${videoStatusLines(video)}`;
-  }
-  return text;
-}
-
-function streamHintText(info) {
+function streamHintText(info, video = null) {
   if (!active) return encoderStatusLine(info);
 
   let text = `${encoderStatusLine(info)}${browserThrottleWarning()}`;
   if ("encodedFrames" in info) {
-    text += `\nEncoded AAC frames: ${info.encodedFrames}\nEncoder queue: ${info.queue}`;
+    text += `\nEncoded AAC frames: ${info.encodedFrames}\nEncoded fps: ${info.encodedFps.toFixed(1)}/${expectedEncodedFpsLabel}\nEncoder queue: ${info.queue}`;
   }
-  if (active.video) {
-    const video = active.video.stats();
-    text += `\n${videoStatusLines(video)}`;
-  }
+  if (video) text += `\n${videoStatusLines(video)}`;
   return text;
 }
 
-function encodedFpsClass(value) {
-  if (!Number.isFinite(value)) return "";
-  const shown = Number(value.toFixed(1));
-  if (shown < redEncodedFps) return "fps-bad";
-  return shown < Number(expectedEncodedFpsLabel) ? "fps-warn" : "";
-}
-
-function renderStreamInfo(kbps, fps, listeners) {
-  const fpsText = Number.isFinite(fps) ? fps.toFixed(1) : "-";
-  const fpsEl = document.createElement("span");
-  fpsEl.textContent = `${fpsText}/${expectedEncodedFpsLabel} fps`;
-  const className = encodedFpsClass(fps);
-  if (className) fpsEl.className = className;
-  streamInfoEl.replaceChildren(`👥${listeners} ${kbps} kbps `, fpsEl);
+function renderStreamInfo(kbps, listeners) {
+  streamInfoEl.textContent = `${kbps} kbps 👥${listeners}`;
 }
 
 function updateStreamStatus(info) {
   if (!active) return;
   const current = info || active.encoder.stats();
-  setStatus(streamStatusText(current));
-  const kbps = Number.isFinite(current.encodedKbps)
+  const audioKbps = Number.isFinite(current.encodedKbps)
     ? Math.round(current.encodedKbps)
     : Math.round(selectedEncoderMode().bitrate / 1000);
-  renderStreamInfo(kbps, current.encodedFps, active.streamListeners);
-  setStreamInfoHint(streamHintText(current));
+  const video = active.video ? active.video.stats() : null;
+  const videoKbps = video && Number.isFinite(video.kbps) ? Math.round(video.kbps) : 0;
+  const kbps = audioKbps + videoKbps;
+  renderStreamInfo(kbps, active.streamListeners);
+  setStreamInfoHint(streamHintText(current, video));
 }
 
 function stopMediaStream(mediaStream) {
@@ -1735,18 +2026,49 @@ function stopMediaStream(mediaStream) {
 }
 
 function fallbackSourceName(kind) {
-  return kind === "mic" ? tr("micInput") : tr("tabSystem");
+  if (kind === "mic") return tr("micInput");
+  if (kind === "video") return tr("tabVideoCard");
+  return tr("tabSystemCard");
 }
 
 function sourceDisplayName(kind, mediaStream) {
-  const label = mediaStream.getAudioTracks()[0]?.label?.trim() || "";
+  if (kind === "video") {
+    return mediaStream.getAudioTracks().length > 0 ? tr("tabVideoAudioCard") : tr("tabVideoCard");
+  }
+  if (kind === "screen") return tr("tabSystemCard");
+  const track = kind === "video" ? mediaStream.getVideoTracks()[0] : mediaStream.getAudioTracks()[0];
+  const label = track?.label?.trim() || "";
   return label
-    ? label.replace(/^(Mic\/Input Device|Tab\/System Audio|Tab\/System|Микрофон\/устройство ввода|Вкладка\/система|マイク\/入力デバイス|タブ\/システム)\s*:?\s*/i, "") || fallbackSourceName(kind)
+    ? label.replace(/^(Mic\/Input Device|Tab\/System Audio|Tab\/System|Video|Микрофон\/устройство ввода|Вкладка\/система|Видео|マイク\/入力デバイス|タブ\/システム|映像)\s*:?\s*/i, "") || fallbackSourceName(kind)
     : fallbackSourceName(kind);
 }
 
+function localizedSourceName(source) {
+  if (!source) return "";
+  if (source.kind === "screen") return tr("tabSystemCard");
+  if (source.kind === "video") return source.hasAudio ? tr("tabVideoAudioCard") : tr("tabVideoCard");
+  return source.name;
+}
+
+function updateSourceLabel(source) {
+  if (!source) return;
+  const name = localizedSourceName(source);
+  if (name && name !== source.name) {
+    source.name = name;
+    if (source.block) applySourceTheme(source.block, source);
+  }
+  if (source.controlEl && source.kind !== "mic") source.controlEl.textContent = `▾ ${source.name}`;
+}
+
+function updateActiveSourceLabels() {
+  if (!active) return;
+  updateSourceLabel(active.sources.screen);
+  updateSourceLabel(active.sources.video);
+  updateStreamStatus();
+}
+
 function sourceGain(source) {
-  const value = Number(source.gainEl.value);
+  const value = Number(source.gainEl && source.gainEl.value);
   if (!Number.isFinite(value)) return 1;
   return Math.min(1.5, Math.max(0, value));
 }
@@ -1767,18 +2089,40 @@ function updateSourceLevel(source, peak) {
 }
 
 function updateMuteState(source) {
-  if (source.block) source.block.classList.toggle("is-muted", Boolean(source.muteEl.checked));
+  const muted = Boolean(source.videoHidden) || Boolean(source.muteEl && source.muteEl.checked);
+  if (source.block) source.block.classList.toggle("is-muted", muted);
 }
 
 function applyAudioSourceSettings(source) {
-  updateGainValue(source);
   updateMuteState(source);
+  if (!source.processor || !source.muteEl) return;
+  updateGainValue(source);
   source.processor.port.postMessage({
     type: "settings",
     gain: sourceGain(source),
-    mute: source.muteEl.checked,
-    forceMono: source.monoEl.checked
+    mute: Boolean(source.videoHidden) || source.muteEl.checked,
+    forceMono: Boolean(source.monoEl && source.monoEl.checked)
   });
+}
+
+function setVideoSourceHidden(source, hidden) {
+  if (!source || source.kind !== "video") return;
+  source.videoHidden = Boolean(hidden);
+  if (source.muteEl) source.muteEl.checked = source.videoHidden;
+  applyAudioSourceSettings(source);
+  if (active && active.video && active.sources.video === source) {
+    if (source.videoHidden) {
+      active.video.placeholder();
+      active.video.source = source;
+    } else {
+      active.video.setSource(source);
+    }
+  }
+  updateStreamStatus();
+}
+
+function toggleVideoSourceHidden(source) {
+  setVideoSourceHidden(source, !source.videoHidden);
 }
 
 function sourceThemeHue(text) {
@@ -1803,7 +2147,7 @@ function applySourceTheme(block, source) {
 function updateSourceVideoPreview(source) {
   if (!source.previewEl) return;
   const track = source.mediaStream.getVideoTracks()[0];
-  const enabled = Boolean(source.videoEl && source.videoEl.checked && track);
+  const enabled = source.kind === "video" && Boolean(track);
   source.previewEl.hidden = !enabled;
   if (!enabled) {
     source.previewEl.pause();
@@ -1832,32 +2176,32 @@ function createMicSourceSelect(source) {
     select.appendChild(selectedOption);
   }
 
-  selectedOption.textContent = source.name;
+  selectedOption.textContent = `▾ ${source.name}`;
   select.value = source.deviceId || "";
   return select;
 }
 
 function createSourceBlock(source) {
+  const hasAudioControls = source.kind !== "video" || source.hasAudio;
+  const hasMonoControl = hasAudioControls && source.kind !== "video";
+  const hasPreview = source.kind === "video";
   const block = document.createElement("div");
   const iconWrap = document.createElement("button");
   const body = document.createElement("div");
   const head = document.createElement("div");
-  const settings = document.createElement("div");
+  const settings = hasAudioControls ? document.createElement("div") : null;
   const icon = document.createElement("span");
   const iconHint = document.createElement("span");
   const sourceControl = source.kind === "mic" ? createMicSourceSelect(source) : document.createElement("button");
-  const gainLabel = document.createElement("label");
-  const gainMeter = document.createElement("span");
-  const gain = document.createElement("input");
-  const gainValue = document.createElement("span");
-  const mute = document.createElement("input");
-  const monoLabel = document.createElement("label");
-  const monoText = document.createElement("span");
-  const mono = document.createElement("input");
-  const videoLabel = document.createElement("label");
-  const videoText = document.createElement("span");
-  const video = document.createElement("input");
-  const preview = document.createElement("video");
+  const gainLabel = hasAudioControls ? document.createElement("label") : null;
+  const gainMeter = hasAudioControls ? document.createElement("span") : null;
+  const gain = hasAudioControls ? document.createElement("input") : null;
+  const gainValue = hasAudioControls ? document.createElement("span") : null;
+  const mute = hasAudioControls ? document.createElement("input") : null;
+  const monoLabel = hasMonoControl ? document.createElement("label") : null;
+  const monoText = hasMonoControl ? document.createElement("span") : null;
+  const mono = hasMonoControl ? document.createElement("input") : null;
+  const preview = hasPreview ? document.createElement("video") : null;
   const remove = document.createElement("button");
 
   block.className = "source-card";
@@ -1865,80 +2209,87 @@ function createSourceBlock(source) {
   block.style.setProperty("--source-level", "0%");
   iconWrap.type = "button";
   iconWrap.className = "source-icon";
-  iconWrap.setAttribute("aria-label", "Toggle mute");
+  iconWrap.setAttribute("aria-label", source.kind === "video" ? tr("hideMuteVideo") : hasAudioControls ? "Toggle mute" : source.name);
   body.className = "source-body";
   head.className = "source-head";
-  settings.className = "source-settings";
+  if (settings) settings.className = "source-settings";
   icon.className = "source-icon-img";
   icon.setAttribute("aria-hidden", "true");
   iconHint.className = "source-icon-hint";
-  iconHint.dataset.i18n = "mute";
-  iconHint.textContent = tr("mute");
-  const iconMask = `url("${source.kind === "mic" ? "static/mic.webp" : "static/tab.webp"}") center / contain no-repeat`;
+  iconHint.dataset.i18n = source.kind === "video" ? "hideMuteVideo" : "mute";
+  iconHint.textContent = tr(iconHint.dataset.i18n);
+  const iconUrl = source.kind === "mic" ? "static/mic.webp" : source.kind === "video" ? "static/video.webp" : "static/audio.webp";
+  const iconMask = `url("${iconUrl}") center / contain no-repeat`;
   icon.style.setProperty("-webkit-mask", iconMask);
   icon.style.mask = iconMask;
-  gainLabel.className = "source-gain";
-  gainMeter.className = "source-gain-meter";
-  gainValue.className = "source-gain-value";
   sourceControl.className = "source-control";
 
   if (source.kind !== "mic") {
     sourceControl.type = "button";
-    sourceControl.textContent = source.name;
+    sourceControl.textContent = `▾ ${source.name}`;
   }
 
-  gain.type = "range";
-  gain.min = "0";
-  gain.max = "1.5";
-  gain.step = "0.01";
-  gain.value = "1";
-  gainMeter.append(gain);
-  gainLabel.append(gainMeter, gainValue);
-
-  mute.type = "checkbox";
-
-  mono.type = "checkbox";
-  mono.checked = source.kind === "mic";
-  monoText.dataset.i18n = "mono";
-  monoText.textContent = tr("mono");
-  monoLabel.className = "source-mono";
-  monoLabel.append(monoText, mono);
-
-  video.type = "checkbox";
-  videoText.dataset.i18n = "video";
-  videoText.textContent = tr("video");
-  videoLabel.className = "source-video";
-  videoLabel.append(videoText, video);
-  preview.className = "source-preview";
-  preview.hidden = true;
-  preview.muted = true;
-  preview.playsInline = true;
+  if (preview) {
+    preview.className = "source-preview";
+    preview.muted = true;
+    preview.playsInline = true;
+  }
 
   remove.type = "button";
   remove.className = "source-remove";
   remove.textContent = "×";
   remove.setAttribute("aria-label", "Delete source");
 
-  iconWrap.append(icon, iconHint);
+  iconWrap.append(icon);
+  iconWrap.append(iconHint);
   head.append(sourceControl, remove);
-  settings.append(gainLabel, monoLabel);
-  if (source.kind === "screen") settings.append(videoLabel);
-  body.append(head, settings);
-  if (source.kind === "screen") body.append(preview);
+  if (hasAudioControls) {
+    gainLabel.className = "source-gain";
+    gainMeter.className = "source-gain-meter";
+    gainValue.className = "source-gain-value";
+    gain.type = "range";
+    gain.min = "0";
+    gain.max = "1.5";
+    gain.step = "0.01";
+    gain.value = "1";
+    gainMeter.append(gain);
+    gainLabel.append(gainMeter, gainValue);
+
+    mute.type = "checkbox";
+    if (hasMonoControl) {
+      mono.type = "checkbox";
+      mono.checked = source.kind === "mic";
+      monoText.dataset.i18n = "mono";
+      monoText.textContent = tr("mono");
+      monoLabel.className = "source-mono";
+      monoLabel.append(monoText, mono);
+      settings.append(gainLabel, monoLabel);
+    } else {
+      settings.append(gainLabel);
+    }
+  }
+  body.append(head);
+  if (settings) body.append(settings);
+  if (preview) body.append(preview);
   block.append(iconWrap, body);
 
   source.block = block;
+  source.controlEl = sourceControl;
   source.deviceEl = source.kind === "mic" ? sourceControl : null;
   source.gainEl = gain;
   source.gainMeterEl = gainMeter;
   source.gainValueEl = gainValue;
   source.muteEl = mute;
   source.monoEl = mono;
-  source.videoEl = source.kind === "screen" ? video : null;
-  source.previewEl = source.kind === "screen" ? preview : null;
+  source.previewEl = preview;
   source.removeBtn = remove;
 
   iconWrap.onclick = () => {
+    if (source.kind === "video") {
+      toggleVideoSourceHidden(source);
+      return;
+    }
+    if (!hasAudioControls) return;
     source.muteEl.checked = !source.muteEl.checked;
     applyAudioSourceSettings(source);
     updateStreamStatus();
@@ -1950,76 +2301,93 @@ function createSourceBlock(source) {
       saveMicDeviceSelection(deviceId);
       addOrReplaceSource(source.kind, deviceId, sourceSettings(source));
     };
+  } else if (source.kind === "video") {
+    sourceControl.onclick = () => addOrReplaceSource("video", null, sourceSettings(source));
   } else {
     sourceControl.onclick = () => addOrReplaceSource(source.kind, null, sourceSettings(source));
   }
-  gain.addEventListener("input", () => {
-    applyAudioSourceSettings(source);
-    updateStreamStatus();
-  });
-  gain.addEventListener("change", () => {
-    saveSourceSettings(source);
-  });
-  mute.addEventListener("change", () => {
-    applyAudioSourceSettings(source);
-    updateStreamStatus();
-  });
-  mono.addEventListener("change", () => {
-    applyAudioSourceSettings(source);
-    saveSourceSettings(source);
-    updateStreamStatus();
-  });
-  video.addEventListener("change", () => {
-    saveSourceSettings(source);
-    updateSourceVideoPreview(source);
-    syncVideoSource().catch(error => {
-      video.checked = false;
-      updateSourceVideoPreview(source);
-      saveSourceSettings(source);
-      setStatus(error.message || String(error));
+  if (hasAudioControls) {
+    gain.addEventListener("input", () => {
+      applyAudioSourceSettings(source);
+      updateStreamStatus();
     });
-  });
-  remove.onclick = () => removeAudioSource(source.kind, source);
+    gain.addEventListener("change", () => {
+      saveSourceSettings(source);
+    });
+    mute.addEventListener("change", () => {
+      applyAudioSourceSettings(source);
+      updateStreamStatus();
+    });
+    if (hasMonoControl) {
+      mono.addEventListener("change", () => {
+        applyAudioSourceSettings(source);
+        saveSourceSettings(source);
+        updateStreamStatus();
+      });
+    }
+  }
+  remove.onclick = () => {
+    if (source.kind === "video") removeVideoSource(source);
+    else removeAudioSource(source.kind, source);
+  };
 
   return block;
 }
 
-function stopActiveVideo() {
-  if (!active || !active.video) return;
-  active.video.close();
-  active.video = null;
+function sendStreamerCommand(command) {
+  if (!active || active.ws.readyState !== WebSocket.OPEN) return;
+  try { active.ws.send(command); } catch (_) {}
 }
 
-async function syncVideoSource() {
-  if (!active) return;
-  const source = active.sources.screen;
-  const wantsVideo = Boolean(source && source.videoEl && source.videoEl.checked);
-  if (!wantsVideo) {
+function stopActiveVideo(source = null) {
+  if (!active || !active.video) return;
+  if (source && active.video.source !== source) return;
+  clearTimeout(active.video.stopTimer);
+  active.video.close();
+  active.video = null;
+  sendStreamerCommand("video_stop");
+}
+
+function showActiveVideoPlaceholder(source = null) {
+  if (!active || !active.video) return;
+  if (source && active.video.source !== source) return;
+  const video = active.video;
+  clearTimeout(video.stopTimer);
+  video.placeholder();
+  video.stopTimer = setTimeout(() => {
+    if (!active || active.video !== video || active.sources.video) return;
     stopActiveVideo();
-    if (source) updateSourceVideoPreview(source);
-    return;
+    updateStreamStatus();
+  }, videoPlaceholderHoldMs);
+}
+
+function disposeVideoSource(source, stopStream = true, holdVideo = true) {
+  if (!source) return;
+  if (active && active.video && active.video.source === source) {
+    if (holdVideo) showActiveVideoPlaceholder(source);
+    else stopActiveVideo(source);
   }
-  if (active.video && active.video.source === source) return;
-  stopActiveVideo();
-  active.video = await createVideoStreamer(source, active.ws, error => {
-    if (active) {
-      stopActiveVideo();
-      if (source.videoEl) source.videoEl.checked = false;
-      updateSourceVideoPreview(source);
-      saveSourceSettings(source);
-      setStatus(error.message || String(error));
-    }
-  });
+  try { source.node && source.node.disconnect(); } catch (_) {}
+  try { source.processor && source.processor.disconnect(); } catch (_) {}
+  try { source.processor && source.processor.port.close(); } catch (_) {}
+  if (source.previewEl) {
+    source.previewEl.pause();
+    source.previewEl.srcObject = null;
+  }
+  if (source.block) source.block.remove();
+  if (stopStream) stopMediaStream(source.mediaStream);
+}
+
+function removeVideoSource(source) {
+  if (!active || active.sources.video !== source) return;
+  active.sources.video = null;
+  disposeVideoSource(source);
+  updateSourceControls();
   updateStreamStatus();
 }
 
 function disposeAudioSource(source, stopStream = true) {
   if (!source) return;
-  if (active && active.video && active.video.source === source) stopActiveVideo();
-  if (source.previewEl) {
-    source.previewEl.pause();
-    source.previewEl.srcObject = null;
-  }
   try { source.node.disconnect(); } catch (_) {}
   try { source.processor.disconnect(); } catch (_) {}
   try { source.processor.port.close(); } catch (_) {}
@@ -2040,6 +2408,8 @@ function installAudioSource(kind, mediaStream, deviceId = kind === "mic" ? micDe
     stopMediaStream(mediaStream);
     return;
   }
+  const replacedVideo = kind === "screen" ? active.sources.video : null;
+  if (replacedVideo) active.sources.video = null;
 
   const node = active.audioContext.createMediaStreamSource(mediaStream);
   const processor = new AudioWorkletNode(active.audioContext, "source-processor", {
@@ -2066,8 +2436,6 @@ function installAudioSource(kind, mediaStream, deviceId = kind === "mic" ? micDe
   next.gainEl.value = String(initialSettings.gain);
   next.muteEl.checked = Boolean(initialSettings.mute);
   next.monoEl.checked = Boolean(initialSettings.forceMono);
-  if (next.videoEl) next.videoEl.checked = Boolean(initialSettings.video);
-  updateSourceVideoPreview(next);
   applyAudioSourceSettings(next);
   saveSourceSettings(next);
 
@@ -2078,18 +2446,13 @@ function installAudioSource(kind, mediaStream, deviceId = kind === "mic" ? micDe
   processor.connect(active.mixer);
   if (previous && previous.block && previous.block.parentNode) {
     previous.block.replaceWith(next.block);
+  } else if (replacedVideo && replacedVideo.block && replacedVideo.block.parentNode) {
+    replacedVideo.block.replaceWith(next.block);
   } else {
     sourcesEl.appendChild(next.block);
   }
   if (previous) disposeAudioSource(previous);
-  if (next.kind === "screen") {
-    syncVideoSource().catch(error => {
-      if (next.videoEl) next.videoEl.checked = false;
-      updateSourceVideoPreview(next);
-      saveSourceSettings(next);
-      setStatus(error.message || String(error));
-    });
-  }
+  if (replacedVideo) disposeVideoSource(replacedVideo);
 
   mediaStream.getAudioTracks().forEach(track => {
     track.addEventListener("ended", () => removeAudioSource(kind, next), { once: true });
@@ -2100,14 +2463,12 @@ function installAudioSource(kind, mediaStream, deviceId = kind === "mic" ? micDe
 }
 
 async function requestAudioSource(kind, deviceId = null) {
-  setStatus(kind === "screen"
-    ? "Choose a screen/tab and enable audio sharing in the browser prompt..."
-    : "Allow microphone access in the browser prompt...");
   const mediaStream = await withTimeout(
     captureAudio(kind, deviceId),
     45000,
     "Timed out waiting for browser audio permission/selection."
   );
+  if (kind === "screen") removeVideoTracks(mediaStream);
   if (mediaStream.getAudioTracks().length === 0) {
     stopMediaStream(mediaStream);
     throw new Error("No audio track selected");
@@ -2118,22 +2479,136 @@ async function requestAudioSource(kind, deviceId = null) {
   return mediaStream;
 }
 
+async function requestVideoSource() {
+  if (!serverVideoEnabled()) throw new Error("Video is disabled on this server.");
+  const mediaStream = await withTimeout(
+    captureVideo(),
+    45000,
+    "Timed out waiting for browser video selection."
+  );
+  if (mediaStream.getVideoTracks().length === 0) {
+    stopMediaStream(mediaStream);
+    throw new Error("No video track selected");
+  }
+  return mediaStream;
+}
+
+async function installVideoSource(mediaStream, settings = null) {
+  if (!active) {
+    stopMediaStream(mediaStream);
+    return;
+  }
+  if (!serverVideoEnabled()) {
+    stopMediaStream(mediaStream);
+    throw new Error("Video is disabled on this server.");
+  }
+  const hasAudio = mediaStream.getAudioTracks().length > 0;
+
+  const next = {
+    kind: "video",
+    name: sourceDisplayName("video", mediaStream),
+    mediaStream,
+    hasAudio,
+    videoHidden: false,
+    node: null,
+    processor: null
+  };
+  if (hasAudio) {
+    next.node = active.audioContext.createMediaStreamSource(mediaStream);
+    next.processor = new AudioWorkletNode(active.audioContext, "source-processor", {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [2]
+    });
+  }
+  createSourceBlock(next);
+  if (hasAudio) {
+    next.processor.port.onmessage = event => {
+      const message = event.data;
+      if (message && message.type === "level") updateSourceLevel(next, message.peak);
+    };
+    const initialSettings = settings
+      ? normalizeRuntimeSourceSettings("video", settings)
+      : normalizeRuntimeSourceSettings("video", loadSourceSettings("video"));
+    next.gainEl.value = String(initialSettings.gain);
+    next.muteEl.checked = Boolean(initialSettings.mute);
+  }
+  updateSourceVideoPreview(next);
+  applyAudioSourceSettings(next);
+  saveSourceSettings(next);
+
+  const replacedScreen = active.sources.screen;
+  if (replacedScreen) active.sources.screen = null;
+  const previous = active.sources.video;
+  active.sources.video = next;
+  if (hasAudio) {
+    next.node.connect(next.processor);
+    next.processor.connect(active.mixer);
+  }
+  if (previous && previous.block && previous.block.parentNode) {
+    previous.block.replaceWith(next.block);
+  } else if (replacedScreen && replacedScreen.block && replacedScreen.block.parentNode) {
+    replacedScreen.block.replaceWith(next.block);
+  } else {
+    sourcesEl.appendChild(next.block);
+  }
+  let videoStartSent = false;
+  try {
+    if (active.video) {
+      active.video.setSource(next);
+    } else {
+      sendStreamerCommand("video_start");
+      videoStartSent = true;
+      active.video = await createVideoStreamer(next, active.ws, error => {
+        if (!active) return;
+        removeVideoSource(next);
+      });
+    }
+  } catch (error) {
+    if (videoStartSent) sendStreamerCommand("video_stop");
+    if (active && active.sources.video === next) active.sources.video = null;
+    disposeVideoSource(next, true, false);
+    throw error;
+  }
+
+  if (previous) disposeVideoSource(previous, true, false);
+  if (replacedScreen) disposeAudioSource(replacedScreen);
+
+  mediaStream.getTracks().forEach(track => {
+    track.addEventListener("ended", () => removeVideoSource(next), { once: true });
+  });
+
+  updateSourceControls();
+  updateStreamStatus();
+}
+
 async function addOrReplaceSource(kind, deviceId = null, settings = null, mediaStreamOverride = null) {
   if (!active || sourceRequestInFlight) return;
+  if ((kind === "screen" || kind === "video") && systemCaptureDisabled()) {
+    showSystemSourceHint(kind);
+    return;
+  }
 
   let mediaStream = mediaStreamOverride;
   setSourceRequestBusy(true);
   try {
-    if (!mediaStream) mediaStream = await requestAudioSource(kind, deviceId);
+    if (!mediaStream) {
+      mediaStream = kind === "video"
+        ? await requestVideoSource()
+        : await requestAudioSource(kind, deviceId);
+    }
     if (!active) {
       stopMediaStream(mediaStream);
       return;
     }
-    installAudioSource(kind, mediaStream, deviceId ?? undefined, settings);
+    if (kind === "video") {
+      await installVideoSource(mediaStream, settings);
+    } else {
+      installAudioSource(kind, mediaStream, deviceId ?? undefined, settings);
+    }
     mediaStream = null;
     updateStreamStatus();
-  } catch (error) {
-    setStatus(error.message || String(error));
+  } catch {
   } finally {
     stopMediaStream(mediaStream);
     setSourceRequestBusy(false);
@@ -2141,6 +2616,10 @@ async function addOrReplaceSource(kind, deviceId = null, settings = null, mediaS
 }
 
 async function start(kind, deviceId = null, settings = null, mediaStreamOverride = null) {
+  if ((kind === "screen" || kind === "video") && systemCaptureDisabled()) {
+    showSystemSourceHint(kind);
+    return;
+  }
   if (active) {
     await addOrReplaceSource(kind, deviceId, settings, mediaStreamOverride);
     return;
@@ -2148,8 +2627,7 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
   if (sourceRequestInFlight) return;
 
   const code = streamCode;
-  if (code.length < 8) {
-    setStatus("Stream code is not ready.");
+  if (code.length !== streamCodeLength) {
     return;
   }
 
@@ -2160,20 +2638,23 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
   let pendingStreamListeners = 0;
   setSourceRequestBusy(true);
   try {
-    if (!mediaStream) mediaStream = await requestAudioSource(kind, deviceId);
+    if (!mediaStream) {
+      mediaStream = kind === "video"
+        ? await requestVideoSource()
+        : await requestAudioSource(kind, deviceId);
+    }
 
-    setStatus("Preparing browser AAC encoder...");
     encoder = createAacEncoder(
       packet => {
         if (!active || active.encoder !== encoder || ws.readyState !== WebSocket.OPEN) return;
-        if (ws.bufferedAmount > 256 * 1024) {
-          failActive("Network queue is too slow; stopped.");
+        if (ws.bufferedAmount > maxAudioWsBufferedBytes) {
+          failActive();
           return;
         }
         ws.send(packet);
       },
-      error => {
-        if (active && active.encoder === encoder) failActive(error.message || String(error));
+      () => {
+        if (active && active.encoder === encoder) failActive();
       }
     );
     let encoderReadyError = null;
@@ -2184,10 +2665,9 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
     const encoderInfo = await encoderReady;
     if (encoderReadyError) throw encoderReadyError;
 
-    setStatus("Connecting to relay server...");
     ws = new WebSocket(wsUrlForCode(code));
     ws.binaryType = "arraybuffer";
-    ws.onmessage = event => handlePublisherMessage(event, listeners => {
+    ws.onmessage = event => handleStreamerMessage(event, listeners => {
       pendingStreamListeners = listeners;
       if (active && active.ws === ws) {
         active.streamListeners = listeners;
@@ -2205,7 +2685,7 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
     const captureNode = await createCaptureNode(audioContext, buffer => {
       if (!active || active.encoder !== encoder) return;
       if (encoder.lagFrames() > 128) {
-        failActive("AAC encoder queue is too slow; stopped.");
+        failActive();
         return;
       }
       encoder.encode(buffer);
@@ -2228,12 +2708,16 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
       captureNode,
       monitor,
       wakeLock,
-      statusTimer: null,
-      sources: { mic: null, screen: null },
+      statsTimer: null,
+      sources: { mic: null, screen: null, video: null },
       streamListeners: pendingStreamListeners
     };
 
-    installAudioSource(kind, mediaStream, deviceId ?? undefined, settings);
+    if (kind === "video") {
+      await installVideoSource(mediaStream, settings);
+    } else {
+      installAudioSource(kind, mediaStream, deviceId ?? undefined, settings);
+    }
     mediaStream = null;
     mixer.connect(captureNode);
     captureNode.connect(monitor);
@@ -2245,40 +2729,40 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
     ws.onclose = () => {
       if (active && active.ws === ws) {
         cleanup();
-        setStatus("Stopped.");
       }
     };
     ws.onerror = () => {
-      if (active && active.ws === ws) failActive("WebSocket error.");
+      if (active && active.ws === ws) failActive();
     };
 
     updateStreamStatus(encoderInfo);
-    active.statusTimer = setInterval(() => {
+    active.statsTimer = setInterval(() => {
       if (!active || active.ws !== ws) return;
       updateStreamStatus(encoder.stats());
     }, 1000);
-  } catch (error) {
+  } catch {
     if (encoder) encoder.close();
-    if (ws && ws.readyState === WebSocket.OPEN) ws.close(1011, "start failed");
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try { ws.close(3000, "start failed"); } catch (_) {
+        try { ws.close(); } catch (_) {}
+      }
+    }
     if (audioContext) {
       try { audioContext.close(); } catch (_) {}
     }
     stopMediaStream(mediaStream);
     cleanup();
-    setStatus(error.message || String(error));
   } finally {
     setSourceRequestBusy(false);
   }
 }
 
-function failActive(message) {
+function failActive() {
   cleanup();
-  setStatus(message);
 }
 
 function stop() {
   cleanup();
-  setStatus("Stopped.");
 }
 
 function forceResync() {
@@ -2293,22 +2777,23 @@ function cleanup({ stopStreams = true, updateControls = true } = {}) {
   if (updateControls) setStreamingControls(false);
   if (!current) return;
 
-  if (current.statusTimer) clearInterval(current.statusTimer);
+  if (current.statsTimer) clearInterval(current.statsTimer);
   try { current.captureNode.disconnect(); } catch (_) {}
   try { current.mixer.disconnect(); } catch (_) {}
   try { current.monitor.disconnect(); } catch (_) {}
   disposeAudioSource(current.sources.mic, stopStreams);
   disposeAudioSource(current.sources.screen, stopStreams);
-  if (current.video) current.video.close();
-  current.encoder.close();
+  disposeVideoSource(current.sources.video, stopStreams);
+  try { current.video && current.video.close(); } catch (_) {}
+  try { current.encoder.close(); } catch (_) {}
   if (current.wakeLock) {
     try { current.wakeLock.release(); } catch (_) {}
   }
   setMediaSessionPlaying(false);
   if (current.ws.readyState === WebSocket.OPEN || current.ws.readyState === WebSocket.CONNECTING) {
-    current.ws.close(1000, "stop");
+    try { current.ws.close(1000, "stop"); } catch (_) {}
   }
-  current.audioContext.close();
+  try { current.audioContext.close(); } catch (_) {}
 }
 
 async function copyUrl() {
@@ -2333,29 +2818,33 @@ async function copyUrl() {
 
 async function newLink() {
   if (sourceRequestInFlight || linkRestartInFlight) return;
-  const sources = activeSourceSpecs();
   linkRestartInFlight = true;
   newLinkBtn.disabled = true;
 
   try {
     rotateCode();
     await updateUrl();
-    if (!active || sources.length === 0) return;
-
-    cleanup({ stopStreams: false, updateControls: false });
-    const first = sources[0];
-    await start(first.kind, first.deviceId, first.settings, first.mediaStream);
-    if (!active) {
-      for (let i = 1; i < sources.length; i++) stopMediaStream(sources[i].mediaStream);
-      return;
-    }
-    for (let i = 1; i < sources.length && active; i++) {
-      const source = sources[i];
-      await addOrReplaceSource(source.kind, source.deviceId, source.settings, source.mediaStream);
-    }
+    await restartActiveWithCurrentSources();
   } finally {
     linkRestartInFlight = false;
     newLinkBtn.disabled = false;
+  }
+}
+
+async function restartActiveWithCurrentSources() {
+  const sources = activeSourceSpecs();
+  if (!active || sources.length === 0) return;
+
+  cleanup({ stopStreams: false, updateControls: false });
+  const first = sources[0];
+  await start(first.kind, first.deviceId, first.settings, first.mediaStream);
+  if (!active) {
+    for (let i = 1; i < sources.length; i++) stopMediaStream(sources[i].mediaStream);
+    return;
+  }
+  for (let i = 1; i < sources.length && active; i++) {
+    const source = sources[i];
+    await addOrReplaceSource(source.kind, source.deviceId, source.settings, source.mediaStream);
   }
 }
 
@@ -2367,6 +2856,15 @@ rtspUrlEl.addEventListener("focusout", hideRtspHint);
 newLinkBtn.onclick = newLink;
 micBtn.onclick = () => start("mic");
 screenBtn.onclick = () => start("screen");
+screenBtn.addEventListener("mouseenter", () => showSystemSourceHint("screen"));
+screenBtn.addEventListener("mouseleave", hideSystemSourceHint);
+screenBtn.addEventListener("focusin", () => showSystemSourceHint("screen"));
+screenBtn.addEventListener("focusout", hideSystemSourceHint);
+videoSourceBtn.onclick = () => start("video");
+videoSourceBtn.addEventListener("mouseenter", () => showSystemSourceHint("video"));
+videoSourceBtn.addEventListener("mouseleave", hideSystemSourceHint);
+videoSourceBtn.addEventListener("focusin", () => showSystemSourceHint("video"));
+videoSourceBtn.addEventListener("focusout", hideSystemSourceHint);
 stopBtn.onclick = stop;
 window.force_resync = forceResync;
 streamInfoWrapEl.addEventListener("mouseenter", showStreamInfoHint);
@@ -2388,17 +2886,20 @@ serverSelectEl.onchange = () => {
   connectSelectedServer();
 };
 customConnectBtn.onclick = connectCustomServer;
-customBookmarkBtn.onclick = bookmarkCustomServer;
 encoderModeEl.onchange = () => {
   writeStorage(encoderModeStorageKey, encoderModeEl.value);
+  if (active && !sourceRequestInFlight && !linkRestartInFlight) {
+    linkRestartInFlight = true;
+    updateSourceControls();
+    restartActiveWithCurrentSources()
+      .finally(() => {
+        linkRestartInFlight = false;
+        updateSourceControls();
+      });
+  }
 };
 customApiEl.addEventListener("input", () => {
   writeStorage(customApiStorageKey, customApiEl.value);
-  updateCustomOption();
-  updateServerHint();
-});
-customRtspEl.addEventListener("input", () => {
-  writeStorage(customRtspStorageKey, customRtspEl.value);
   updateCustomOption();
   updateServerHint();
 });
@@ -2444,4 +2945,4 @@ async function init() {
   setInterval(refreshStats, statsRefreshMs);
 }
 
-init().catch(error => setStatus(error.message || String(error)));
+init();

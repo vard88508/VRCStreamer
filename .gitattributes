@@ -1,2 +1,18 @@
-client/vendor/mediabunny-aac.js -text
+* text=auto
+
+.gitattributes text eol=lf
+*.example text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.lock text eol=lf
+*.md text eol=lf
+*.rs text eol=lf
 *.sh text eol=lf
+*.toml text eol=lf
+
+*.h264 binary
+*.webp binary
+
+client/vendor/mediabunny-aac.js -text
