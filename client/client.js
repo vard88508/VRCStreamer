@@ -546,6 +546,30 @@ function hostLabel(value) {
   }
 }
 
+function hostName(value, defaultProtocol) {
+  try {
+    return new URL(normalizeBase(value, defaultProtocol)).hostname.toLowerCase();
+  } catch (_) {
+    return "";
+  }
+}
+
+function isLoopbackHost(host) {
+  return host === "localhost" || host === "::1" || host.startsWith("127.");
+}
+
+function isLoopbackBase(value, defaultProtocol) {
+  return isLoopbackHost(hostName(value, defaultProtocol));
+}
+
+function safeRtspBaseForServer(server, value) {
+  const base = normalizeBase(value, "rtspt://");
+  if (!base) return "";
+  return !isLoopbackBase(server.apiBase, "https://") && isLoopbackBase(base, "rtspt://")
+    ? ""
+    : base;
+}
+
 function sameServer(left, right) {
   return normalizeBase(left.apiBase, "https://") === normalizeBase(right.apiBase, "https://");
 }
@@ -599,7 +623,7 @@ function serverDescription(server) {
 
 function serverRtspBase(server) {
   const meta = savedServerMeta(server);
-  return (meta && meta.rtspBase) || server.rtspBase || "";
+  return safeRtspBaseForServer(server, (meta && meta.rtspBase) || server.rtspBase || "");
 }
 
 function customOptionText() {
@@ -825,8 +849,9 @@ function updateStartTitle() {
   startTitleEl.textContent = tr(serverVideoEnabled() ? "streamFrom" : "streamAudioFrom");
 }
 
-function applyServerInfo(info) {
+function applyServerInfo(info, targetKey = currentServerKey()) {
   if (!info || typeof info !== "object") return;
+  if (targetKey !== currentServerKey()) return;
 
   const name = typeof info.name === "string" ? info.name.trim() : "";
   const description = typeof info.description === "string" ? info.description.trim() : "";
@@ -835,17 +860,19 @@ function applyServerInfo(info) {
     : typeof info.rtspBase === "string"
       ? info.rtspBase.trim()
       : "";
-  const key = currentServerKey();
-  const previous = serverMetaCache[key] || {};
+  const previous = serverMetaCache[targetKey] || {};
+  const selected = selectedServer();
+  const currentRtspBase = safeRtspBaseForServer(selected, rtspBase);
+  const previousRtspBase = safeRtspBaseForServer(selected, previous.rtspBase || "");
   const meta = {
     name: name || previous.name || "",
     description: description || previous.description || "",
-    rtspBase: rtspBase || previous.rtspBase || "",
+    rtspBase: currentRtspBase || previousRtspBase || "",
     video: Boolean(info.video)
   };
-  serverInfo = { key, ...meta };
+  serverInfo = { key: targetKey, ...meta };
   if (meta.name || meta.description || meta.rtspBase || "video" in info) {
-    serverMetaCache[key] = meta;
+    serverMetaCache[targetKey] = meta;
     saveServerMetaCache();
   }
 
@@ -874,8 +901,8 @@ function normalizeBase(value, defaultProtocol) {
   return text.replace(/\/+$/, "");
 }
 
-function apiUrl(path) {
-  const base = normalizeBase(selectedServer().apiBase, location.protocol === "https:" ? "https://" : "http://");
+function apiUrlFor(server, path) {
+  const base = normalizeBase(server.apiBase, location.protocol === "https:" ? "https://" : "http://");
   if (!base) throw new Error("API server is not configured.");
   return new URL(String(path).replace(/^\/+/, ""), base + "/");
 }
@@ -1223,9 +1250,9 @@ async function refreshMicDevices(preferredId = micDeviceEl.value || savedMicDevi
   updateSourceControls();
 }
 
-function wsUrlForCode(code) {
-  const url = apiUrl(`ingest?code=${encodeURIComponent(code)}`);
-  const password = selectedServer().password || "";
+function wsUrlForCode(code, server = selectedServer()) {
+  const url = apiUrlFor(server, `ingest?code=${encodeURIComponent(code)}`);
+  const password = server.password || "";
   if (password) url.searchParams.set("password", password);
   if (url.protocol === "https:") url.protocol = "wss:";
   else if (url.protocol === "http:") url.protocol = "ws:";
@@ -1234,14 +1261,18 @@ function wsUrlForCode(code) {
 }
 
 async function refreshStats() {
+  const server = selectedServer();
+  const key = serverKey(server);
   try {
-    const response = await fetch(apiUrl("stats"), { cache: "no-store" });
+    const response = await fetch(apiUrlFor(server, "stats"), { cache: "no-store" });
     if (!response.ok) throw new Error(`stats ${response.status}`);
     const stats = await response.json();
-    applyServerInfo(stats);
+    if (key !== currentServerKey()) return false;
+    applyServerInfo(stats, key);
     setStats(`🟢 Online 📡${stats.active_streams} 👥${stats.active_listeners}`);
     return true;
   } catch (_) {
+    if (key !== currentServerKey()) return false;
     setStats("🔴 Offline 📡- 👥-");
     return false;
   }
@@ -1252,7 +1283,7 @@ function listenerCountFromMessage(message) {
   return Number.isInteger(value) && value >= 0 ? value : null;
 }
 
-function handleStreamerMessage(event, setStreamListeners) {
+function handleStreamerMessage(event, key, setStreamListeners) {
   if (typeof event.data !== "string") return;
 
   let message = null;
@@ -1263,7 +1294,7 @@ function handleStreamerMessage(event, setStreamListeners) {
   }
 
   if (message.type === "hello") {
-    applyServerInfo(message);
+    applyServerInfo(message, key);
     const listeners = listenerCountFromMessage(message);
     if (listeners !== null) setStreamListeners(listeners);
   } else if (message.type === "listeners") {
@@ -2665,9 +2696,11 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
     const encoderInfo = await encoderReady;
     if (encoderReadyError) throw encoderReadyError;
 
-    ws = new WebSocket(wsUrlForCode(code));
+    const server = selectedServer();
+    const serverInfoKey = serverKey(server);
+    ws = new WebSocket(wsUrlForCode(code, server));
     ws.binaryType = "arraybuffer";
-    ws.onmessage = event => handleStreamerMessage(event, listeners => {
+    ws.onmessage = event => handleStreamerMessage(event, serverInfoKey, listeners => {
       pendingStreamListeners = listeners;
       if (active && active.ws === ws) {
         active.streamListeners = listeners;
