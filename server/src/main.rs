@@ -426,7 +426,7 @@ async fn stats(
 
     let active_streams = {
         let channels = state.channels.lock().await;
-        channels.len()
+        count_active_streams(&channels)
     };
     let active_streamers = state.active_streamers.load(Ordering::Acquire);
     let active_listeners = state.active_listeners.load(Ordering::Acquire);
@@ -2380,7 +2380,14 @@ fn active_streams(state: &AppState) -> Option<usize> {
         .channels
         .try_lock()
         .ok()
-        .map(|channels| channels.len())
+        .map(|channels| count_active_streams(&channels))
+}
+
+fn count_active_streams(channels: &HashMap<String, Arc<Channel>>) -> usize {
+    channels
+        .values()
+        .filter(|channel| channel.streamer.load(Ordering::Acquire))
+        .count()
 }
 
 fn validate_code(code: &str) -> Result<(), &'static str> {
@@ -2937,6 +2944,21 @@ mod tests {
 
         assert!(connection_limit_allows(&state, 1, 1));
         assert!(!connection_limit_allows(&state, 1, 2));
+    }
+
+    #[test]
+    fn active_stream_count_ignores_offline_listener_channels() {
+        let mut channels = HashMap::new();
+        let offline = Arc::new(Channel::new(8));
+        offline.listeners.store(1, Ordering::Release);
+        channels.insert("offline".to_owned(), offline);
+
+        let live = Arc::new(Channel::new(8));
+        live.streamer.store(true, Ordering::Release);
+        live.listeners.store(1, Ordering::Release);
+        channels.insert("live".to_owned(), live);
+
+        assert_eq!(count_active_streams(&channels), 1);
     }
 
     #[test]
