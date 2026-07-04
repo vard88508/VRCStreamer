@@ -3,6 +3,7 @@ const mainEl = document.querySelector("main");
 const serverSelectEl = $("serverSelect");
 const serverHintEl = $("serverHint");
 const messageBoxEl = $("messageBox");
+const patronsEl = $("patrons");
 const customServerEl = $("customServer");
 const customApiEl = $("customApi");
 const customPasswordEl = $("customPassword");
@@ -76,6 +77,12 @@ const videoPlaceholderHoldMs = 15000;
 const maxAudioWsBufferedBytes = 256 * 1024;
 const maxVideoWsBufferedBytes = 1024 * 1024;
 const isFirefoxBased = /\b(Firefox|FxiOS|Waterfox|LibreWolf|Iceweasel)\b/i.test(navigator.userAgent);
+const patronTiers = [
+  { key: "Tier4", className: "tier4" },
+  { key: "Tier3", className: "tier3" },
+  { key: "Tier2", className: "tier2" },
+  { key: "Tier1", className: "tier1" }
+];
 const fallbackServers = [
   {
     name: "Local 554",
@@ -104,7 +111,9 @@ let sourceRequestInFlight = false;
 let linkRestartInFlight = false;
 let rtspHintResetTimer = 0;
 let messagePayload = null;
+let patronTiersPayload = [];
 let nativeAacAvailable = true;
+let serverStatus = { state: "loading", streams: 0, listeners: 0 };
 
 const encoderModes = {
   native192: {
@@ -144,7 +153,11 @@ const translations = {
     password: "Password (optional)",
     pasteVideoHint: "Paste this link into video player",
     sourceCode: "Source Code",
-    reportBug: "Report bug",
+    reportBug: "Report a bug",
+    statusLoading: "Loading",
+    statusOffline: "Offline",
+    statusOnline: "Online",
+    thankYou: "Thank you for your support",
     stopStreaming: "Stop Streaming",
     startTip: "Tip: You can mute browser tabs by right-clicking them, so you do not get annoyed by echo while streaming into VRChat.",
     streamAudioFrom: "Stream Audio From",
@@ -180,6 +193,10 @@ const translations = {
     pasteVideoHint: "このリンクをビデオプレイヤーに貼り付け",
     sourceCode: "ソースコード",
     reportBug: "バグを報告",
+    statusLoading: "読み込み中",
+    statusOffline: "オフライン",
+    statusOnline: "オンライン",
+    thankYou: "ご支援ありがとうございます",
     stopStreaming: "配信を停止",
     startTip: "ヒント: ブラウザのタブは右クリックでミュートできます。VRChat に配信中の音の二重再生を防げます。",
     streamAudioFrom: "音声の配信元",
@@ -215,6 +232,10 @@ const translations = {
     pasteVideoHint: "Вставь эту ссылку в видеоплеер",
     sourceCode: "Исходный код",
     reportBug: "Зарепортить баг",
+    statusLoading: "Загрузка",
+    statusOffline: "Не в сети",
+    statusOnline: "В сети",
+    thankYou: "Спасибо за поддержку",
     stopStreaming: "Остановить стрим",
     startTip: "Совет: Ты можешь выключить звук из вкладки, нажав по ней правой кнопкой мыши. Так у тебя не будет двоиться звук при стриме в VRChat.",
     streamAudioFrom: "Транслировать звук из",
@@ -369,6 +390,69 @@ async function refreshMessage() {
   renderMessage();
 }
 
+function tierPayloadValue(payload, key) {
+  return payload[key] || payload[key.toLowerCase()] || payload[key.toUpperCase()];
+}
+
+function patronName(value) {
+  if (typeof value === "string") return value.trim();
+  if (value && typeof value === "object" && typeof value.name === "string") return value.name.trim();
+  return "";
+}
+
+function normalizePatronTiers(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return [];
+  return patronTiers
+    .map(tier => {
+      const value = tierPayloadValue(payload, tier.key);
+      return {
+        ...tier,
+        names: Array.isArray(value) ? value.map(patronName).filter(Boolean) : []
+      };
+    })
+    .filter(tier => tier.names.length > 0);
+}
+
+function renderPatrons(tiers) {
+  patronTiersPayload = Array.isArray(tiers) ? tiers : [];
+  patronsEl.textContent = "";
+  const hasPatrons = patronTiersPayload.some(tier => tier.names.length > 0);
+  patronsEl.hidden = !hasPatrons;
+  if (!hasPatrons) return;
+
+  const header = document.createElement("div");
+  header.className = "patrons-header";
+  const title = document.createElement("span");
+  title.textContent = tr("thankYou");
+  const heart = document.createElement("span");
+  heart.className = "patrons-heart";
+  heart.textContent = "♥";
+  header.append(title, " ", heart);
+  patronsEl.appendChild(header);
+
+  patronTiersPayload.forEach(tier => {
+    const row = document.createElement("div");
+    row.className = `patron-tier patron-${tier.className}`;
+    tier.names.forEach(name => {
+      const item = document.createElement("span");
+      item.className = "patron-name";
+      item.textContent = name;
+      row.appendChild(item);
+    });
+    patronsEl.appendChild(row);
+  });
+}
+
+async function refreshPatrons() {
+  try {
+    const response = await fetch(new URL("patrons.json", location.href), { cache: "no-store" });
+    if (!response.ok) throw new Error(`patrons.json ${response.status}`);
+    renderPatrons(normalizePatronTiers(await response.json()));
+  } catch (_) {
+    renderPatrons([]);
+  }
+}
+
 function applyLanguage() {
   document.documentElement.lang = currentLanguage === "ja" ? "ja" : currentLanguage === "ru" ? "ru" : "en";
   updateStartTitle();
@@ -392,6 +476,8 @@ function applyLanguage() {
   if (rtspHintEl.textContent && rtspHintEl.textContent !== tr("copied")) setRtspHint(tr("clickToCopy"));
   for (const el of document.querySelectorAll("[data-i18n]")) el.textContent = tr(el.dataset.i18n);
   renderMessage();
+  renderServerStatus();
+  renderPatrons(patronTiersPayload);
   updateCustomOption();
   updateServerHint();
   renderAddSourceButtons();
@@ -483,6 +569,21 @@ function hideRtspHint() {
 
 function setStats(text) {
   statsEl.textContent = text;
+}
+
+function renderServerStatus() {
+  if (serverStatus.state === "online") {
+    setStats(`🟢 ${tr("statusOnline")} 📡${serverStatus.streams} 👥${serverStatus.listeners}`);
+  } else if (serverStatus.state === "offline") {
+    setStats(`🔴 ${tr("statusOffline")}`);
+  } else {
+    setStats(`🟡 ${tr("statusLoading")}`);
+  }
+}
+
+function setServerStatus(state, streams = 0, listeners = 0) {
+  serverStatus = { state, streams, listeners };
+  renderServerStatus();
 }
 
 function randomCode() {
@@ -684,7 +785,7 @@ async function loadServers() {
 }
 
 function renderServers() {
-  customApiEl.value = readStorage(customApiStorageKey) || "http://127.0.0.1:8081";
+  customApiEl.value = readStorage(customApiStorageKey);
   customPasswordEl.value = readStorage(customPasswordStorageKey);
 
   serverSelectEl.textContent = "";
@@ -793,6 +894,7 @@ function saveSelectedServerValue() {
 
 async function connectSelectedServer() {
   saveSelectedServerValue();
+  setServerStatus("loading");
   updateCustomVisibility();
   updateUrl();
   return await refreshStats();
@@ -1269,11 +1371,11 @@ async function refreshStats() {
     const stats = await response.json();
     if (key !== currentServerKey()) return false;
     applyServerInfo(stats, key);
-    setStats(`🟢 Online 📡${stats.active_streams} 👥${stats.active_listeners}`);
+    setServerStatus("online", stats.active_streams, stats.active_listeners);
     return true;
   } catch (_) {
     if (key !== currentServerKey()) return false;
-    setStats("🔴 Offline 📡- 👥-");
+    setServerStatus("offline");
     return false;
   }
 }
@@ -2912,6 +3014,7 @@ serverSelectEl.onchange = () => {
   if (active) stop();
   if (serverSelectEl.value === "custom") {
     saveSelectedServerValue();
+    setServerStatus("loading");
     updateCustomVisibility();
     updateUrl();
     return;
@@ -2973,6 +3076,7 @@ async function init() {
   setStreamingControls(false);
   updateUrl();
   refreshMessage();
+  refreshPatrons();
   refreshStats();
   setInterval(refreshMessage, messageRefreshMs);
   setInterval(refreshStats, statsRefreshMs);

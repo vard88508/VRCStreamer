@@ -761,6 +761,9 @@ header{
   color:#3ba85e;
   text-decoration:none
 }
+.main-footer>.patreon-link{
+  color:#f28c28
+}
 .footer-spacer{
   margin-left:auto
 }
@@ -772,6 +775,49 @@ header{
   padding:0;
   text-align:right;
   text-align-last:right
+}
+.patrons{
+  font-size:.68rem;
+  line-height:1.35;
+  margin:1rem auto 0;
+  text-align:center;
+  width:100%
+}
+.patrons-header{
+  align-items:center;
+  color:#fff;
+  display:flex;
+  font-weight:700;
+  gap:.35rem;
+  justify-content:center;
+  margin-bottom:.3rem
+}
+.patrons-heart{
+  color:#ff3333;
+  font-size:1.64rem;
+  line-height:1
+}
+.patron-tier{
+  display:flex;
+  flex-wrap:wrap;
+  gap:.2rem .55rem;
+  justify-content:center;
+  margin-top:.08rem
+}
+.patron-name{
+  white-space:nowrap
+}
+.patron-tier4{
+  color:#b56cff
+}
+.patron-tier3{
+  color:#f28c28
+}
+.patron-tier2{
+  color:#3ba85e
+}
+.patron-tier1{
+  color:#8c968f
 }
 @media (max-width:540px){
   .custom-server{
