@@ -486,6 +486,13 @@ async fn ingest_ws(
         return text_response(StatusCode::BAD_REQUEST, reason);
     }
 
+    let ip_guard = match try_acquire_streamer_ip(&state, addr.ip()) {
+        Ok(guard) => guard,
+        Err(reason) => {
+            return text_response(StatusCode::TOO_MANY_REQUESTS, reason);
+        }
+    };
+
     let key = hash_code(&query.code);
     let channel = get_or_create_channel(&state, &key).await;
     if channel
@@ -498,15 +505,6 @@ async fn ingest_ws(
             "stream already has an active streamer\n",
         );
     }
-
-    let ip_guard = match try_acquire_streamer_ip(&state, addr.ip()) {
-        Ok(guard) => guard,
-        Err(reason) => {
-            channel.streamer.store(false, Ordering::Release);
-            cleanup_channel(&state, &key, &channel).await;
-            return text_response(StatusCode::TOO_MANY_REQUESTS, reason);
-        }
-    };
 
     if state
         .active_streamers
@@ -789,17 +787,24 @@ async fn handle_rtsp_client(
     let (read_half, write_half) = stream.into_split();
     let writer = Arc::new(Mutex::new(write_half));
     let mut reader = BufReader::new(read_half);
-    let mut session = RtspSession::default();
+    let listener_ip_guard = match try_acquire_listener_ip(&state, ip) {
+        Ok(guard) => guard,
+        Err(error) => return Err(error.into()),
+    };
+    let mut session = RtspSession {
+        _listener_ip_guard: listener_ip_guard,
+        ..RtspSession::default()
+    };
+    let handshake_deadline = TokioInstant::now() + state.config.rtsp_handshake_timeout;
     let mut requests = 0usize;
 
     loop {
         let request = if session.guard.is_none() {
-            match timeout(
-                state.config.rtsp_handshake_timeout,
-                read_rtsp_request(&mut reader),
-            )
-            .await
-            {
+            let now = TokioInstant::now();
+            if now >= handshake_deadline {
+                return Err("rtsp handshake timeout".into());
+            }
+            match timeout(handshake_deadline - now, read_rtsp_request(&mut reader)).await {
                 Ok(result) => result?,
                 Err(_) => return Err("rtsp handshake timeout".into()),
             }
@@ -815,7 +820,7 @@ async fn handle_rtsp_client(
         {
             return Err("too many rtsp requests on one connection".into());
         }
-        if handle_rtsp_request(&request, &writer, &state, &mut session, &peer, ip).await? {
+        if handle_rtsp_request(&request, &writer, &state, &mut session, &peer).await? {
             break;
         }
     }
@@ -831,7 +836,6 @@ async fn handle_rtsp_request(
     state: &Arc<AppState>,
     session: &mut RtspSession,
     peer: &str,
-    ip: IpAddr,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let cseq = request.header("cseq").unwrap_or("0");
     info!(%peer, method = %request.method, uri = %request.uri, "rtsp request");
@@ -895,7 +899,7 @@ async fn handle_rtsp_request(
             }
 
             if session.guard.is_none() {
-                match subscribe_listener(state, &key, ip).await {
+                match subscribe_listener(state, &key).await {
                     Ok(subscription) => {
                         session.audio_rx = Some(subscription.audio_rx);
                         session.video_rx = Some(subscription.video_rx);
@@ -1075,9 +1079,7 @@ async fn handle_rtsp_request(
 async fn subscribe_listener(
     state: &Arc<AppState>,
     key: &str,
-    ip: IpAddr,
 ) -> Result<ListenerSubscription, &'static str> {
-    let ip_guard = try_acquire_listener_ip(state, ip)?;
     let channel = {
         let mut channels = state.channels.lock().await;
         channels
@@ -1118,7 +1120,6 @@ async fn subscribe_listener(
         state: state.clone(),
         key: key.to_owned(),
         channel,
-        _ip_guard: ip_guard,
     };
     Ok(ListenerSubscription {
         audio_rx,
@@ -1342,10 +1343,7 @@ where
         }
 
         let mut first_line = vec![first];
-        reader.read_until(b'\n', &mut first_line).await?;
-        if first_line.len() > RTSP_MAX_LINE_BYTES {
-            return Err("rtsp request line too long".into());
-        }
+        read_until_limited(reader, b'\n', &mut first_line, RTSP_MAX_LINE_BYTES).await?;
         let first_line = String::from_utf8(first_line)?;
         let mut parts = first_line.split_whitespace();
         let Some(method) = parts.next() else {
@@ -1360,12 +1358,9 @@ where
 
         loop {
             let mut line = Vec::new();
-            let bytes = reader.read_until(b'\n', &mut line).await?;
+            let bytes = read_until_limited(reader, b'\n', &mut line, RTSP_MAX_LINE_BYTES).await?;
             if bytes == 0 || line == b"\r\n" || line == b"\n" {
                 break;
-            }
-            if line.len() > RTSP_MAX_LINE_BYTES {
-                return Err("rtsp header line too long".into());
             }
             if headers.len() >= RTSP_MAX_HEADERS {
                 return Err("too many rtsp headers".into());
@@ -1395,6 +1390,45 @@ where
             _version: version,
             headers,
         }));
+    }
+}
+
+async fn read_until_limited<R>(
+    reader: &mut R,
+    delimiter: u8,
+    buffer: &mut Vec<u8>,
+    limit: usize,
+) -> Result<usize, std::io::Error>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let started = buffer.len();
+
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(buffer.len().saturating_sub(started));
+        }
+
+        let take = available
+            .iter()
+            .position(|byte| *byte == delimiter)
+            .map_or(available.len(), |index| index + 1);
+        let found = available[..take].contains(&delimiter);
+
+        if buffer.len().saturating_add(take) > limit {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "rtsp line too long",
+            ));
+        }
+
+        buffer.extend_from_slice(&available[..take]);
+        reader.consume(take);
+
+        if found {
+            return Ok(buffer.len().saturating_sub(started));
+        }
     }
 }
 
@@ -1833,6 +1867,7 @@ struct RtspSession {
     key: Option<String>,
     audio_rx: Option<broadcast::Receiver<Bytes>>,
     video_rx: Option<broadcast::Receiver<Bytes>>,
+    _listener_ip_guard: Option<ListenerIpGuard>,
     guard: Option<ListenerGuard>,
     audio_rtp_task: Option<JoinHandle<()>>,
     video_rtp_task: Option<JoinHandle<()>>,
@@ -1934,7 +1969,6 @@ struct ListenerGuard {
     state: Arc<AppState>,
     key: String,
     channel: Arc<Channel>,
-    _ip_guard: Option<ListenerIpGuard>,
 }
 
 impl Drop for ListenerGuard {
@@ -2827,6 +2861,41 @@ mod tests {
         assert!(!is_websocket_disconnect_noise(
             &"WebSocket protocol error: invalid frame opcode"
         ));
+    }
+
+    fn run_async_test<F: std::future::Future<Output = ()>>(future: F) {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future);
+    }
+
+    #[test]
+    fn rtsp_parser_accepts_bounded_request_line() {
+        run_async_test(async {
+            let input = b"OPTIONS rtspt://127.0.0.1/abc RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+            let mut reader = BufReader::new(&input[..]);
+            let request = read_rtsp_request(&mut reader).await.unwrap().unwrap();
+
+            assert_eq!(request.method, "OPTIONS");
+            assert_eq!(request.uri, "rtspt://127.0.0.1/abc");
+            assert_eq!(request.header("cseq"), Some("1"));
+        });
+    }
+
+    #[test]
+    fn rtsp_parser_rejects_unbounded_request_line() {
+        run_async_test(async {
+            let input = vec![b'A'; RTSP_MAX_LINE_BYTES + 1];
+            let mut reader = BufReader::new(input.as_slice());
+            let error = match read_rtsp_request(&mut reader).await {
+                Ok(_) => panic!("oversized request line was accepted"),
+                Err(error) => error,
+            };
+
+            assert!(error.to_string().contains("rtsp line too long"));
+        });
     }
 
     #[test]
