@@ -241,7 +241,7 @@ impl Config {
         let rtsp_bind_addr: SocketAddr = env::var("RTSP_BIND_ADDR")
             .unwrap_or_else(|_| "0.0.0.0:554".to_owned())
             .parse()?;
-        let rtsp_public_base = env_public_base("RTSP_PUBLIC_BASE", "rtspt://");
+        let rtsp_public_base = env_public_base("RTSP_PUBLIC_BASE", "rtsp://");
         let tls_cert_path = env_nonempty_or_default(
             "TLS_CERT_PATH",
             "/etc/letsencrypt/live/example.com/fullchain.pem",
@@ -779,9 +779,9 @@ fn public_rtsp_base(config: &Config, headers: &HeaderMap) -> String {
         .unwrap_or_else(|| default_rtsp_host(config.rtsp_bind_addr));
     let port = config.rtsp_bind_addr.port();
     if port == 554 {
-        format!("rtspt://{host}")
+        format!("rtsp://{host}")
     } else {
-        format!("rtspt://{host}:{port}")
+        format!("rtsp://{host}:{port}")
     }
 }
 

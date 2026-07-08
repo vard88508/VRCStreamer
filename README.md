@@ -86,7 +86,7 @@ cd server
 | `TLS_CERT_PATH` | `/etc/letsencrypt/live/example.com/fullchain.pem` | PEM certificate path |
 | `TLS_KEY_PATH` | `/etc/letsencrypt/live/example.com/privkey.pem` | PEM private key path |
 | `RTSP_BIND_ADDR` | `0.0.0.0:554` | RTSP listen address |
-| `RTSP_PUBLIC_BASE` | `none` | Public RTSPT URL sent by `/stats` and streamer hello; `none` derives from API Host header and `RTSP_BIND_ADDR` |
+| `RTSP_PUBLIC_BASE` | `none` | Public RTSP URL sent by `/stats` and streamer hello; `none` derives from API Host header and `RTSP_BIND_ADDR` |
 | `ALLOWED_ORIGINS` | `https://vard.cc` | Comma-separated browser origins allowed to stream |
 | `ALLOW_ANY_ORIGIN` | `false` | Disable Origin protection when `true` |
 | `VIDEO` | `false` | Allow browser streamers to send H.264 video; `false` makes clients audio-only while RTSP still keeps one-shot placeholders |
