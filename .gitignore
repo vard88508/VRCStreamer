@@ -10,7 +10,6 @@
 certs/
 *.key
 *.pem
-client/patrons.json
 
 # Logs and runtime output
 *.log

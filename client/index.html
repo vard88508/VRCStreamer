@@ -7,7 +7,7 @@
   <meta name="description" content="Stream audio/video into VRChat directly from your browser. Low latency, no setup, and no extra software required.">
   <link rel="icon" href="static/logo.webp" type="image/webp">
   <link rel="stylesheet" href="style.css">
-  <script src="client.js" defer></script>
+  <script type="module" src="scripts/client.js"></script>
 </head>
 <body>
   <main>
@@ -15,7 +15,7 @@
       <a class="logo" href="">
         <img src="static/logo.webp" alt="">
         <p>VRCStreamer</p>
-        <p class="version">2.0</p>
+        <p class="version">2.1</p>
       </a>
 
       <div class="server-selection">
@@ -109,9 +109,7 @@
       <a id="reportBugLink" href="https://github.com/vard88508/VRCStreamer/issues" target="_blank" rel="noopener noreferrer">Report a bug</a>
       <span class="footer-spacer"></span>
       <select id="languageSelect" aria-label="Language">
-        <option value="en">English</option>
-        <option value="ja">日本語</option>
-        <option value="ru">Русский</option>
+        <option value="">Loading...</option>
       </select>
     </footer>
 

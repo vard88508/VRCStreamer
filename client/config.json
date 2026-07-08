@@ -1,0 +1,11 @@
+{
+  "langs": {
+    "en": "English",
+    "ja": "日本語",
+    "ru": "Русский"
+  },
+  "servers": [
+    "https://eu.stream.vard.cc"
+  ],
+  "remoteData": "https://gist.githubusercontent.com/vard88508/a4dc6a35e14a0cab912c5276000d29e0/raw/VRCStreamerRemoteData.json"
+}

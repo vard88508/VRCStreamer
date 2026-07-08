@@ -297,8 +297,9 @@ async function init(message) {
     width,
     height,
     bitrate,
+    bitrateMode: "constant",
     framerate: fps,
-    latencyMode: "realtime",
+    latencyMode: "quality",
     avc: { format: "annexb" }
   };
   if (VideoEncoder.isConfigSupported) {
