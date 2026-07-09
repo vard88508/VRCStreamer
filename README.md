@@ -58,7 +58,7 @@ journalctl -u VRCStreamer -f
 Open:
 
 ```text
-https://vard.cc/VRCStreamer
+https://stream.vard.cc
 ```
 
 Choose `Custom Server` and enter your API server address:
