@@ -99,12 +99,12 @@ fn run_async_test<F: std::future::Future<Output = ()>>(future: F) {
 #[test]
 fn rtsp_parser_accepts_bounded_request_line() {
     run_async_test(async {
-        let input = b"OPTIONS rtsp://127.0.0.1/abc RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+        let input = b"OPTIONS rtspt://127.0.0.1/abc RTSP/1.0\r\nCSeq: 1\r\n\r\n";
         let mut reader = BufReader::new(&input[..]);
         let request = read_rtsp_request(&mut reader).await.unwrap().unwrap();
 
         assert_eq!(request.method, "OPTIONS");
-        assert_eq!(request.uri, "rtsp://127.0.0.1/abc");
+        assert_eq!(request.uri, "rtspt://127.0.0.1/abc");
         assert_eq!(request.header("cseq"), Some("1"));
     });
 }
@@ -171,8 +171,8 @@ fn streamer_hello_message_escapes_json_strings() {
     config.server_description = "Line\nTwo".to_owned();
 
     assert_eq!(
-        streamer_hello_message(&config, 7, "rtsp://example.com"),
-        "{\"type\":\"hello\",\"name\":\"Name \\\"A\\\"\",\"description\":\"Line\\nTwo\",\"rtsp_base\":\"rtsp://example.com\",\"video\":true,\"listeners\":7}"
+        streamer_hello_message(&config, 7, "rtspt://example.com"),
+        "{\"type\":\"hello\",\"name\":\"Name \\\"A\\\"\",\"description\":\"Line\\nTwo\",\"rtsp_base\":\"rtspt://example.com\",\"video\":true,\"listeners\":7}"
     );
 }
 
@@ -363,7 +363,7 @@ fn rtsp_uri_parser_extracts_hash() {
     let key = "a85c0211c512828c4c52dc5716a79e3a";
 
     assert_eq!(
-        key_from_rtsp_uri("rtsp://example.com/a85c0211c512828c4c52dc5716a79e3a"),
+        key_from_rtsp_uri("rtspt://example.com/a85c0211c512828c4c52dc5716a79e3a"),
         Some(key)
     );
     assert_eq!(
@@ -371,7 +371,7 @@ fn rtsp_uri_parser_extracts_hash() {
         Some(key)
     );
     assert_eq!(
-        key_from_rtsp_uri("rtsp://example.com:8554/a85c0211c512828c4c52dc5716a79e3a?x=1"),
+        key_from_rtsp_uri("rtspt://example.com:8554/a85c0211c512828c4c52dc5716a79e3a?x=1"),
         Some(key)
     );
     assert!(valid_hash(key));
@@ -435,6 +435,6 @@ fn streamer_video_flag_is_independent_from_rtsp_placeholder_track() {
     let mut config = test_config();
     config.video_enabled = false;
 
-    assert!(streamer_hello_message(&config, 0, "rtsp://example.com").contains("\"video\":false"));
+    assert!(streamer_hello_message(&config, 0, "rtspt://example.com").contains("\"video\":false"));
     assert!(rtsp_sdp().contains("m=video 0 RTP/AVP 97\r\n"));
 }

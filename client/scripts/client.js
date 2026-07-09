@@ -76,13 +76,13 @@ const fallbackServers = [
     name: "Local 554",
     description: "Local test server on default RTSP port 554.",
     apiBase: "http://127.0.0.1:8081",
-    rtspBase: "rtsp://127.0.0.1"
+    rtspBase: "rtspt://127.0.0.1"
   },
   {
     name: "Local 8554",
     description: "Local test server on RTSP port 8554.",
     apiBase: "http://127.0.0.1:8081",
-    rtspBase: "rtsp://127.0.0.1:8554"
+    rtspBase: "rtspt://127.0.0.1:8554"
   }
 ];
 
@@ -264,9 +264,9 @@ function isLoopbackBase(value, defaultProtocol) {
 }
 
 function safeRtspBaseForServer(server, value) {
-  const base = normalizeBase(value, "rtsp://").replace(/^rtspt:\/\//i, "rtsp://");
+  const base = normalizeBase(value, "rtspt://").replace(/^rtsp:\/\//i, "rtspt://");
   if (!base) return "";
-  return !isLoopbackBase(server.apiBase, "https://") && isLoopbackBase(base, "rtsp://") ? "" : base;
+  return !isLoopbackBase(server.apiBase, "https://") && isLoopbackBase(base, "rtspt://") ? "" : base;
 }
 
 function sameServer(left, right) {
@@ -587,7 +587,7 @@ function wsUrlForCode(code, server = selectedServer()) {
 }
 
 function mediaUrl(hash) {
-  const base = normalizeBase(serverRtspBase(selectedServer()), "rtsp://");
+  const base = normalizeBase(serverRtspBase(selectedServer()), "rtspt://");
   return base ? `${base}/${hash}` : "";
 }
 
