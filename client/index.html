@@ -4,68 +4,67 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>VRCStreamer - Easy low-latency streaming into VRChat</title>
-  <meta name="description" content="Stream audio/video into VRChat directly from your browser. Low latency, no setup, and no extra software required.">
+  <meta name="description" content="Stream audio and video into VRChat directly from your browser. Low latency, no setup, and no extra software required.">
   <link rel="icon" href="static/logo.webp" type="image/webp">
-  <link rel="stylesheet" href="style.css">
-  <script type="module" src="scripts/client.js"></script>
+  <link rel="stylesheet" href="style.css?v=2r45">
+  <link rel="modulepreload" href="scripts/ui.js?v=2r47">
+  <link rel="modulepreload" href="scripts/streamer.js?v=2r36">
+  <script type="module" src="scripts/client.js?v=2r48"></script>
 </head>
 <body>
   <main>
     <header>
       <a class="logo" href="">
-        <img src="static/logo.webp" alt="">
+        <img src="static/logo.webp" width="256" height="256" alt="">
         <p>VRCStreamer</p>
-        <p class="version">2.1</p>
+        <p class="version">2.2</p>
       </a>
 
       <div class="server-selection">
-        <div class="server-select-row">
-          <select id="serverSelect">
+        <div class="text-select server-select-row">
+          <span id="serverSelectDisplay" class="text-select-display server-select-display" aria-hidden="true">Loading...</span>
+          <select id="serverSelect" aria-label="Server">
             <option value="">Loading...</option>
           </select>
           <span id="serverHint" class="server-hint" hidden></span>
         </div>
-        <section class="server-stats">
-          <p id="stats" class="srv-stats">🟡 Loading</p>
-        </section>
+        <p id="serverStats" class="server-stats">🟡 Loading</p>
       </div>
     </header>
 
-    <section id="messageBox" class="message-box" hidden></section>
+    <section id="motd" class="motd" hidden></section>
 
-    <section id="customServer" class="custom-server" hidden>
+    <form id="customServerForm" class="custom-server" hidden>
       <input id="customApi" autocomplete="off" spellcheck="false" placeholder="HTTP API Address">
       <input id="customPassword" type="password" autocomplete="off" spellcheck="false" placeholder="Password (optional)">
-      <div>
-        <button id="customConnect" type="button">Connect</button>
-      </div>
-    </section>
+      <button id="customConnect" type="submit">Connect</button>
+    </form>
 
     <section id="firstSourceSelection" class="first-source-selection">
       <h2 id="startTitle">Stream Audio From</h2>
       <div>
         <div class="source-choice">
-          <button id="mic" type="button">
-            <img src="static/mic.webp" alt="Mic">
-            <span id="micDeviceLabel">▾ Mic/Input Device</span>
+          <button id="mic" type="button" disabled>
+            <img src="static/mic.webp" width="256" height="256" alt="">
+            <span id="micDeviceLabel">▾ Mic / Input Device</span>
           </button>
-          <div id="micDeviceWrap" class="source-label-select-wrap" hidden>
-            <span id="micDeviceSelectedLabel" class="source-label-select-display">Mic/Input Device</span>
-            <select id="micDevice" class="source-label-select">
-              <option value="">Mic/Input Device</option>
+          <div id="micDeviceWrap" class="text-select source-label-select-wrap" hidden>
+            <span id="micDeviceSelectedLabel" class="text-select-display source-label-select-display">Mic / Input Device</span>
+            <select id="micDevice" class="source-label-select" disabled>
+              <option value="">Mic / Input Device</option>
             </select>
           </div>
         </div>
         <div class="source-choice">
-          <button id="screen" type="button">
-            <img src="static/audio.webp" alt="Tab/System Audio">
-            <span id="screenLabel">Tab/System Audio</span>
+          <button id="displayAudio" type="button" disabled>
+            <img src="static/audio.webp" width="256" height="256" alt="">
+            <span id="displayAudioLabel">Tab / Window / System Audio</span>
           </button>
         </div>
         <div id="videoChoice" class="source-choice" hidden>
-          <button id="videoSource" type="button">
-            <img src="static/video.webp" alt="Tab/System Video">
-            <span id="videoSourceLabel">Tab/System Video</span>
+          <button id="displayVideo" type="button" disabled>
+            <img src="static/video.webp" width="256" height="256" alt="">
+            <span id="displayVideoLabel">Tab / Window / Display Video</span>
           </button>
         </div>
       </div>
@@ -78,7 +77,7 @@
     <section id="streamPanel" class="stream-panel" hidden>
       <h2 id="streamToTitle">Streaming To</h2>
       <div class="url-wrap">
-        <input id="rtspUrl" readonly aria-label="Stream URL">
+        <input id="rtspUrl" readonly spellcheck="false" aria-label="Stream URL">
         <span id="rtspHint" class="stream-hint" hidden>Click to Copy</span>
       </div>
       <div class="link-actions">
@@ -89,11 +88,22 @@
       <div id="sources"></div>
       <div id="addSources" class="add-sources"></div>
       <div class="stream-bottom">
-        <select id="encoderMode">
-          <option value="native192">🔊 Native AAC 192 kbps</option>
-          <option value="wasm192">🔊 WASM AAC 192 kbps</option>
-          <option value="wasm320">🔊 WASM AAC 320 kbps</option>
-        </select>
+        <div class="stream-selects">
+          <span id="encoderModeWrap" class="text-select stream-select">
+            <img class="stream-select-icon" src="static/audio.webp" width="256" height="256" alt="">
+            <span id="encoderModeDisplay" class="text-select-display" aria-hidden="true">Native 192 kbps</span>
+            <select id="encoderMode" aria-label="Audio encoder">
+              <option value="native192">Native 192 kbps</option>
+              <option value="wasm192">WASM 192 kbps</option>
+              <option value="wasm320">WASM 320 kbps</option>
+            </select>
+          </span>
+          <span id="videoQualityWrap" class="text-select stream-select video-quality-select" hidden>
+            <img class="stream-select-icon" src="static/video.webp" width="256" height="256" alt="">
+            <span id="videoQualityDisplay" class="text-select-display" aria-hidden="true"></span>
+            <select id="videoQuality" aria-label="Video quality"></select>
+          </span>
+        </div>
         <div id="streamInfoWrap" class="stream-info-wrap" tabindex="0">
           <div id="streamInfo" class="stream-info"></div>
           <span id="streamInfoHint" class="stream-hint" hidden></span>
@@ -102,15 +112,15 @@
     </section>
 
     <footer class="main-footer">
-      <a id="patreonLink" class="patreon-link" href="https://patreon.com/vard" target="_blank" rel="noopener noreferrer">Patreon</a>
-      <span>•</span>
       <a id="sourceCodeLink" href="https://github.com/vard88508/VRCStreamer" target="_blank" rel="noopener noreferrer">Source Code</a>
       <span>•</span>
       <a id="reportBugLink" href="https://github.com/vard88508/VRCStreamer/issues" target="_blank" rel="noopener noreferrer">Report a bug</a>
-      <span class="footer-spacer"></span>
-      <select id="languageSelect" aria-label="Language">
-        <option value="">Loading...</option>
-      </select>
+      <span class="text-select language-select">
+        <span id="languageSelectDisplay" class="text-select-display" data-prefix="🌐 " aria-hidden="true">🌐 Loading...</span>
+        <select id="languageSelect" aria-label="Language">
+          <option value="">Loading...</option>
+        </select>
+      </span>
     </footer>
 
     <section id="patrons" class="patrons" hidden></section>

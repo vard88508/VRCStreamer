@@ -1,6 +1,11 @@
 export function createStreamer(app) {
   const config = app.config;
   const ui = app.ui;
+  const assetVersion = new URL(import.meta.url).search;
+  const audioWorkletUrl = new URL(`audio-worklet.js${assetVersion}`, import.meta.url);
+  const aacWorkerUrl = new URL(`aac-worker.js${assetVersion}`, import.meta.url);
+  const videoWorkerUrl = new URL(`video-worker.js${assetVersion}`, import.meta.url);
+  const videoPlaceholderUrl = new URL(`static/live-placeholder-1080.webp${assetVersion}`, location.href).href;
 
 async function requestScreenWakeLock() {
   if (!("wakeLock" in navigator)) return null;
@@ -72,6 +77,17 @@ function isMissingAudioDeviceError(error) {
     || name === "ConstraintNotSatisfiedError";
 }
 
+function displayMediaOptions(video, audio) {
+  return {
+    video,
+    audio,
+    systemAudio: "include",
+    windowAudio: "window",
+    surfaceSwitching: "include",
+    selfBrowserSurface: "exclude"
+  };
+}
+
 async function captureAudio(kind, deviceIdOverride = null) {
   const audio = {
     echoCancellation: false,
@@ -86,10 +102,7 @@ async function captureAudio(kind, deviceIdOverride = null) {
       height: { ideal: config.videoHeight },
       frameRate: { ideal: config.videoCaptureFps, max: config.videoCaptureFps }
     };
-    return await getDisplayMediaCompat({
-      video,
-      audio
-    }, [
+    return await getDisplayMediaCompat(displayMediaOptions(video, audio), [
       { video, audio: true },
       { video: true, audio: true }
     ]);
@@ -122,10 +135,7 @@ async function captureVideo() {
     height: { ideal: config.videoHeight },
     frameRate: { ideal: config.videoCaptureFps, max: config.videoCaptureFps }
   };
-  return await getDisplayMediaCompat({
-    video,
-    audio
-  }, [
+  return await getDisplayMediaCompat(displayMediaOptions(video, audio), [
     { video, audio: true },
     { video: true, audio: true },
     { video: true, audio: false }
@@ -143,156 +153,24 @@ function stopMediaStream(mediaStream) {
   if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
 }
 
-function captureProcessorSource() {
-  return `
-class SourceProcessor extends AudioWorkletProcessor {
-  constructor() {
-    super();
-    this.gain = 1;
-    this.mute = false;
-    this.forceMono = false;
-    this.levelPeak = 0;
-    this.levelFrames = 0;
-    this.levelInterval = ${Math.round(config.sampleRate / 15)};
-    this.port.onmessage = event => {
-      if (event.data && event.data.type === "settings") {
-        const gain = Number(event.data.gain);
-        this.gain = Number.isFinite(gain) ? Math.min(4, Math.max(0, gain)) : 1;
-        this.mute = Boolean(event.data.mute);
-        this.forceMono = Boolean(event.data.forceMono);
-      }
-    };
-  }
-
-  process(inputs, outputs) {
-    const input = inputs[0];
-    const output = outputs[0];
-    const leftOut = output && output[0] ? output[0] : null;
-    const rightOut = output && output[1] ? output[1] : leftOut;
-    if (!leftOut) return true;
-
-    const leftIn = input && input[0] ? input[0] : null;
-    if (!leftIn || this.mute) {
-      leftOut.fill(0);
-      if (rightOut !== leftOut) rightOut.fill(0);
-      this.levelFrames += leftOut.length;
-      if (this.levelFrames >= this.levelInterval) {
-        this.port.postMessage({ type: "level", peak: 0 });
-        this.levelFrames = 0;
-        this.levelPeak = 0;
-      }
-      return true;
-    }
-    const rightIn = input[1] || leftIn;
-    const gain = this.gain;
-    let blockPeak = 0;
-
-    for (let i = 0; i < leftOut.length; i++) {
-      let left;
-      let right;
-      if (this.forceMono) {
-        const mono = (leftIn[i] + rightIn[i]) * 0.5 * gain;
-        left = mono;
-        right = mono;
-      } else {
-        left = leftIn[i] * gain;
-        right = rightIn[i] * gain;
-      }
-      if (left > 1) left = 1;
-      else if (left < -1) left = -1;
-      if (right > 1) right = 1;
-      else if (right < -1) right = -1;
-      leftOut[i] = left;
-      if (rightOut !== leftOut) rightOut[i] = right;
-      const absLeft = left < 0 ? -left : left;
-      const absRight = right < 0 ? -right : right;
-      const peak = absLeft > absRight ? absLeft : absRight;
-      if (peak > blockPeak) blockPeak = peak;
-    }
-    if (blockPeak > this.levelPeak) this.levelPeak = blockPeak;
-    this.levelFrames += leftOut.length;
-    if (this.levelFrames >= this.levelInterval) {
-      this.port.postMessage({ type: "level", peak: this.levelPeak });
-      this.levelFrames = 0;
-      this.levelPeak = 0;
-    }
-    return true;
-  }
-}
-
-class CaptureProcessor extends AudioWorkletProcessor {
-  constructor() {
-    super();
-    this.frames = ${config.framesPerChunk};
-    this.channels = ${config.channels};
-    this.pcm = new Float32Array(this.frames * this.channels);
-    this.offset = 0;
-  }
-
-  process(inputs, outputs) {
-    const output = outputs[0];
-    const monitorOut = output && output[0] ? output[0] : null;
-
-    const input = inputs[0];
-    const leftIn = input && input[0] ? input[0] : null;
-    const rightIn = input && input[1] ? input[1] : leftIn;
-    const frameCount = leftIn ? leftIn.length : (monitorOut ? monitorOut.length : 128);
-
-    let sourceOffset = 0;
-    while (sourceOffset < frameCount) {
-      const take = Math.min(this.frames - this.offset, frameCount - sourceOffset);
-      for (let i = 0; i < take; i++) {
-        const dst = (this.offset + i) * this.channels;
-        const src = sourceOffset + i;
-        let left = leftIn ? leftIn[src] : 0;
-        let right = rightIn ? rightIn[src] : left;
-        if (left > 1) left = 1;
-        else if (left < -1) left = -1;
-        if (right > 1) right = 1;
-        else if (right < -1) right = -1;
-        this.pcm[dst] = left;
-        this.pcm[dst + 1] = right;
-        if (monitorOut) monitorOut[src] = (left + right) * 0.5;
-      }
-      this.offset += take;
-      sourceOffset += take;
-
-      if (this.offset === this.frames) {
-        const pcm = this.pcm;
-        this.port.postMessage(pcm.buffer, [pcm.buffer]);
-        this.pcm = new Float32Array(this.frames * this.channels);
-        this.offset = 0;
-      }
-    }
-
-    return true;
-  }
-}
-registerProcessor("source-processor", SourceProcessor);
-registerProcessor("capture-processor", CaptureProcessor);
-`;
-}
-
 async function createCaptureNode(audioContext, onBlock) {
-  const blob = new Blob([captureProcessorSource()], { type: "text/javascript" });
-  const url = URL.createObjectURL(blob);
-  try {
-    await audioContext.audioWorklet.addModule(url);
-  } finally {
-    URL.revokeObjectURL(url);
-  }
+  await audioContext.audioWorklet.addModule(audioWorkletUrl);
 
   const node = new AudioWorkletNode(audioContext, "capture-processor", {
     numberOfInputs: 1,
     numberOfOutputs: 1,
-    outputChannelCount: [1]
+    outputChannelCount: [1],
+    processorOptions: {
+      frames: config.framesPerChunk,
+      channels: config.channels
+    }
   });
   node.port.onmessage = event => onBlock(event.data);
   return node;
 }
 
 function createAacEncoder(onPacket, onError) {
-  const worker = new Worker(new URL("aac-worker.js", import.meta.url), { type: "module" });
+  const worker = new Worker(aacWorkerUrl, { type: "module" });
   const encoderMode = app.selectedEncoderMode();
   let readySettled = false;
   let pcmBlocks = 0;
@@ -388,10 +266,11 @@ function createAacEncoder(onPacket, onError) {
 }
 
 function createVideoWorker(ws, onError) {
-  const worker = new Worker(new URL("video-worker.js", import.meta.url));
+  const worker = new Worker(videoWorkerUrl);
   let closed = false;
   let framePending = false;
   let readySettled = false;
+  let pendingReconfigure = null;
   let latestStats = {
     submitted: 0,
     encoded: 0,
@@ -405,6 +284,10 @@ function createVideoWorker(ws, onError) {
 
   const ready = new Promise((resolve, reject) => {
     const failReady = error => {
+      if (pendingReconfigure) {
+        pendingReconfigure.reject(error);
+        pendingReconfigure = null;
+      }
       if (!readySettled) {
         readySettled = true;
         reject(error);
@@ -429,6 +312,21 @@ function createVideoWorker(ws, onError) {
         ws.send(message.packet);
       } else if (message.type === "stats") {
         latestStats = message.stats || latestStats;
+      } else if (message.type === "reconfigured" && pendingReconfigure) {
+        const pending = pendingReconfigure;
+        pendingReconfigure = null;
+        try {
+          if (ws.readyState !== WebSocket.OPEN) throw new Error("Streamer WebSocket is closed.");
+          ws.send(`video_quality:${pending.qualityIndex}`);
+          ws.send("video_reset");
+          worker.postMessage({ type: "resume" });
+          pending.resolve();
+        } catch (error) {
+          pending.reject(error);
+        }
+      } else if (message.type === "reconfigure-error" && pendingReconfigure) {
+        pendingReconfigure.reject(new Error(message.message || "Video reconfigure failed."));
+        pendingReconfigure = null;
       } else if (message.type === "frame") {
         framePending = false;
       } else if (message.type === "error") {
@@ -442,7 +340,7 @@ function createVideoWorker(ws, onError) {
 
   return {
     ready,
-    init(message, transfer = []) {
+    init() {
       worker.postMessage({
         type: "init",
         width: config.videoWidth,
@@ -451,9 +349,8 @@ function createVideoWorker(ws, onError) {
         bitrate: config.videoBitrate,
         keyframeInterval: config.videoKeyframeInterval,
         framePeriodUs: config.videoFramePeriodUs,
-        placeholderUrl: new URL("static/live-placeholder-1080.webp", location.href).href,
-        ...message
-      }, transfer);
+        placeholderUrl: videoPlaceholderUrl
+      });
     },
     frame(frame) {
       if (framePending) {
@@ -470,22 +367,31 @@ function createVideoWorker(ws, onError) {
         throw error;
       }
     },
-    setTrack(track) {
-      worker.postMessage({ type: "track", track }, [track]);
-    },
     placeholder() {
       worker.postMessage({ type: "placeholder" });
     },
+    forceKeyframe() {
+      if (!closed) worker.postMessage({ type: "keyframe" });
+    },
+    reconfigure(options) {
+      if (closed) return Promise.reject(new Error("Video worker is closed."));
+      if (pendingReconfigure) return Promise.reject(new Error("Video reconfigure is already running."));
+      return new Promise((resolve, reject) => {
+        pendingReconfigure = { resolve, reject, qualityIndex: options.qualityIndex };
+        worker.postMessage({ type: "reconfigure", ...options });
+      });
+    },
     close() {
       closed = true;
+      if (pendingReconfigure) {
+        pendingReconfigure.reject(new Error("Video worker is closed."));
+        pendingReconfigure = null;
+      }
       try { worker.postMessage({ type: "close" }); } catch (_) {}
       worker.terminate();
     },
     stats() {
-      return {
-        ...latestStats,
-        wsKBytes: ws.bufferedAmount / 1024
-      };
+      return latestStats;
     }
   };
 }
@@ -510,66 +416,21 @@ function videoStats(worker, mode, track, captureFps = 0) {
   };
 }
 
-async function createTrackVideoStreamer(source, ws, onError) {
-  const worker = createVideoWorker(ws, onError);
-  let currentSource = source;
-  let api = null;
-  const clearStopTimer = () => {
-    if (!api) return;
-    clearTimeout(api.stopTimer);
-    api.stopTimer = 0;
+function videoConstraints(width, height, fps) {
+  return {
+    width: { ideal: width },
+    height: { ideal: height },
+    frameRate: { ideal: fps, max: fps }
   };
-  const sourceTrack = nextSource => {
-    const track = nextSource && nextSource.mediaStream.getVideoTracks()[0];
-    if (!track) throw new Error("Selected source has no video track.");
-    return track;
-  };
-  api = {
-    source,
-    stopTimer: 0,
-    setSource(nextSource) {
-      clearStopTimer();
-      const nextWorkerTrack = sourceTrack(nextSource).clone();
-      worker.setTrack(nextWorkerTrack);
-      currentSource = nextSource;
-      api.source = nextSource;
-    },
-    placeholder() {
-      clearStopTimer();
-      worker.placeholder();
-      currentSource = null;
-      api.source = null;
-    },
-    close() {
-      clearStopTimer();
-      worker.close();
-    },
-    stats() {
-      const currentTrack = currentSource && currentSource.mediaStream.getVideoTracks()[0];
-      return videoStats(worker, "track", currentTrack);
-    }
-  };
-  let workerTrack = null;
-  try {
-    if (source) {
-      workerTrack = sourceTrack(source).clone();
-      worker.init({ track: workerTrack }, [workerTrack]);
-      workerTrack = null;
-    } else {
-      worker.init({});
-    }
-    await worker.ready;
-    return api;
-  } catch (error) {
-    worker.close();
-    try { workerTrack && workerTrack.stop(); } catch (_) {}
-    throw error;
-  }
 }
 
-async function createProcessorVideoStreamer(source, ws, onError) {
+async function createVideoStreamer(source, ws, onError) {
+  if (!window.Worker) throw new Error("Video workers are not available.");
   if (!("MediaStreamTrackProcessor" in window)) {
     throw new Error("MediaStreamTrackProcessor is not available on main thread.");
+  }
+  if (!source || !source.mediaStream.getVideoTracks()[0]) {
+    throw new Error("Selected source has no video track.");
   }
   const worker = createVideoWorker(ws, onError);
   let closed = false;
@@ -629,18 +490,25 @@ async function createProcessorVideoStreamer(source, ws, onError) {
   const setSource = nextSource => {
     const track = nextSource.mediaStream.getVideoTracks()[0];
     if (!track) throw new Error("Selected source has no video track.");
+    const replacingSource = currentSource !== null;
     clearStopTimer();
     closeReader();
     currentSource = nextSource;
-    worker.placeholder();
+    if (replacingSource) worker.placeholder();
     workerTrack = track.clone();
+    try { workerTrack.contentHint = "motion"; } catch (_) {}
     const processor = new MediaStreamTrackProcessor({ track: workerTrack });
     reader = processor.readable.getReader();
     readFrames(++readToken);
   };
 
   try {
-    worker.init({});
+    try {
+      await source.mediaStream.getVideoTracks()[0].applyConstraints(
+        videoConstraints(config.videoWidth, config.videoHeight, config.videoFps)
+      );
+    } catch (_) {}
+    worker.init();
     await worker.ready;
     setSource(source);
     api = {
@@ -656,6 +524,16 @@ async function createProcessorVideoStreamer(source, ws, onError) {
         currentSource = null;
         api.source = null;
         worker.placeholder();
+      },
+      forceKeyframe() {
+        worker.forceKeyframe();
+      },
+      async reconfigure(options) {
+        const constraints = videoConstraints(options.width, options.height, options.fps);
+        const sourceTrack = currentSource && currentSource.mediaStream.getVideoTracks()[0];
+        const tracks = [sourceTrack, workerTrack].filter(Boolean);
+        await Promise.allSettled(tracks.map(track => track.applyConstraints(constraints)));
+        await worker.reconfigure(options);
       },
       close() {
         clearStopTimer();
@@ -674,23 +552,6 @@ async function createProcessorVideoStreamer(source, ws, onError) {
     closeReader();
     worker.close();
     throw error;
-  }
-}
-
-async function createVideoStreamer(source, ws, onError) {
-  if (!window.Worker) throw new Error("Video workers are not available.");
-  if (!source || !source.mediaStream.getVideoTracks()[0]) {
-    throw new Error("Selected source has no video track.");
-  }
-
-  try {
-    return await createTrackVideoStreamer(source, ws, onError);
-  } catch (trackError) {
-    try {
-      return await createProcessorVideoStreamer(source, ws, onError);
-    } catch (processorError) {
-      throw new Error(`Video worker failed: ${processorError.message || processorError}. Track path: ${trackError.message || trackError}`);
-    }
   }
 }
 
@@ -850,6 +711,7 @@ async function requestVideoSource() {
     stopMediaStream(mediaStream);
     throw new Error("No video track selected");
   }
+  try { mediaStream.getVideoTracks()[0].contentHint = "motion"; } catch (_) {}
   return mediaStream;
 }
 
@@ -996,6 +858,10 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
   let ws = null;
   let encoder = null;
   let pendingStreamListeners = 0;
+  let pendingVideoKeyframe = false;
+  let resolveHello = null;
+  let helloReceived = false;
+  const helloReady = new Promise(resolve => { resolveHello = resolve; });
   ui.setSourceRequestBusy(true);
   try {
     if (!mediaStream) {
@@ -1029,14 +895,32 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
     const serverInfoKey = app.serverKey(server);
     ws = new WebSocket(app.wsUrlForCode(code, server));
     ws.binaryType = "arraybuffer";
-    ws.onmessage = event => app.handleStreamerMessage(event, serverInfoKey, listeners => {
-      pendingStreamListeners = listeners;
-      if (app.active && app.active.ws === ws) {
-        app.active.streamListeners = listeners;
-        ui.updateStreamStatus();
+    ws.onmessage = event => app.handleStreamerMessage(
+      event,
+      serverInfoKey,
+      listeners => {
+        pendingStreamListeners = listeners;
+        if (app.active && app.active.ws === ws) {
+          app.active.streamListeners = listeners;
+          ui.updateStreamStatus();
+        }
+      },
+      () => {
+        const video = app.active && app.active.ws === ws ? app.active.video : null;
+        if (video) video.forceKeyframe();
+        else pendingVideoKeyframe = true;
+      },
+      (message, quality) => {
+        if (helloReceived) return;
+        helloReceived = true;
+        resolveHello({ message, quality });
       }
-    });
+    );
     await app.waitForOpen(ws);
+    const hello = await withTimeout(helloReady, 10000, "Streamer hello timeout");
+    if (hello.message.video && hello.quality && Array.isArray(hello.message.video_qualities)) {
+      ws.send(`video_quality:${hello.quality.index}`);
+    }
 
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     audioContext = new AudioContextClass({ latencyHint: "interactive", sampleRate: config.sampleRate });
@@ -1077,6 +961,10 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
 
     if (kind === "video") {
       await installVideoSource(mediaStream, settings);
+      if (pendingVideoKeyframe && app.active.video) {
+        app.active.video.forceKeyframe();
+        pendingVideoKeyframe = false;
+      }
     } else {
       installAudioSource(kind, mediaStream, deviceId ?? undefined, settings);
     }
@@ -1151,6 +1039,29 @@ function forceResync() {
   return true;
 }
 
+async function setVideoQuality(quality) {
+  if (!quality || !Number.isInteger(quality.index)) {
+    throw new Error("Invalid video quality preset.");
+  }
+  const keyframeInterval = quality.fps * 2;
+  const framePeriodUs = Math.round(1000000 / quality.fps);
+  if (app.active && app.active.video) {
+    await app.active.video.reconfigure({
+      width: quality.width,
+      height: quality.height,
+      fps: quality.fps,
+      bitrate: quality.bitrate,
+      keyframeInterval,
+      framePeriodUs,
+      qualityIndex: quality.index
+    });
+  } else if (app.active) {
+    sendStreamerCommand(`video_quality:${quality.index}`);
+  }
+  app.applyVideoQuality(quality);
+  ui.updateStreamStatus();
+}
+
 function cleanup({ stopStreams = true, updateControls = true } = {}) {
   const current = app.active;
   app.active = null;
@@ -1209,23 +1120,16 @@ function cleanup({ stopStreams = true, updateControls = true } = {}) {
   }
 
   return {
-    get active() { return app.active; },
     start,
     stop,
-    cleanup,
-    failActive,
     forceResync,
+    setVideoQuality,
     refreshScreenWakeLock,
     addOrReplaceSource,
     removeAudioSource,
     removeVideoSource,
-    disposeAudioSource,
-    disposeVideoSource,
-    stopMediaStream,
     applyAudioSourceSettings,
     toggleVideoSourceHidden,
-    setVideoSourceHidden,
-    restartActiveWithCurrentSources,
-    activeSourceSpecs: ui.activeSourceSpecs
+    restartActiveWithCurrentSources
   };
 }

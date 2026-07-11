@@ -1,16 +1,22 @@
 const $ = id => document.getElementById(id);
 const mainEl = document.querySelector("main");
 const serverSelectEl = $("serverSelect");
+const serverSelectDisplayEl = $("serverSelectDisplay");
 const serverHintEl = $("serverHint");
-const motdBoxEl = $("messageBox");
+const motdEl = $("motd");
 const patronsEl = $("patrons");
-const customServerEl = $("customServer");
+const customServerFormEl = $("customServerForm");
 const customApiEl = $("customApi");
 const customPasswordEl = $("customPassword");
 const customConnectBtn = $("customConnect");
 const rtspUrlEl = $("rtspUrl");
 const rtspHintEl = $("rtspHint");
 const encoderModeEl = $("encoderMode");
+const encoderModeWrapEl = $("encoderModeWrap");
+const encoderModeDisplayEl = $("encoderModeDisplay");
+const videoQualityEl = $("videoQuality");
+const videoQualityWrapEl = $("videoQualityWrap");
+const videoQualityDisplayEl = $("videoQualityDisplay");
 const micDeviceEl = $("micDevice");
 const micDeviceWrapEl = $("micDeviceWrap");
 const micDeviceSelectedLabelEl = $("micDeviceSelectedLabel");
@@ -20,25 +26,26 @@ const addSourcesEl = $("addSources");
 const firstSourceSelectionEl = $("firstSourceSelection");
 const startTitleEl = $("startTitle");
 const startTipEl = $("startTip");
-const screenLabelEl = $("screenLabel");
+const displayAudioLabelEl = $("displayAudioLabel");
 const tabAudioHintEl = $("tabAudioHint");
 const videoChoiceEl = $("videoChoice");
-const videoSourceBtn = $("videoSource");
-const videoSourceLabelEl = $("videoSourceLabel");
+const displayVideoBtn = $("displayVideo");
+const displayVideoLabelEl = $("displayVideoLabel");
 const streamPanelEl = $("streamPanel");
 const streamToTitleEl = $("streamToTitle");
 const streamInfoWrapEl = $("streamInfoWrap");
 const streamInfoEl = $("streamInfo");
 const streamInfoHintEl = $("streamInfoHint");
-const statsEl = $("stats");
+const serverStatsEl = $("serverStats");
 const pasteHintEl = $("pasteHint");
 const newLinkBtn = $("newLink");
 const micBtn = $("mic");
-const screenBtn = $("screen");
+const displayAudioBtn = $("displayAudio");
 const stopBtn = $("stop");
 const sourceCodeLinkEl = $("sourceCodeLink");
 const reportBugLinkEl = $("reportBugLink");
 const languageSelectEl = $("languageSelect");
+const languageSelectDisplayEl = $("languageSelectDisplay");
 
 let currentLanguage = "en";
 let languageOptions = { en: "English" };
@@ -52,6 +59,25 @@ let rtspHintResetTimer = 0;
 let micDeviceSelectionReady = false;
 
 export function createUi(app) {
+  const selectDisplays = new Map([
+    [serverSelectEl, serverSelectDisplayEl],
+    [encoderModeEl, encoderModeDisplayEl],
+    [videoQualityEl, videoQualityDisplayEl],
+    [micDeviceEl, micDeviceSelectedLabelEl],
+    [languageSelectEl, languageSelectDisplayEl]
+  ]);
+
+  function updateSelectDisplay(select, display = selectDisplays.get(select)) {
+    if (!display) return;
+    const option = select.selectedOptions[0];
+    const text = option ? option.textContent.trim() : "";
+    display.textContent = text ? `${display.dataset.prefix || ""}${text}` : "";
+  }
+
+  for (const select of selectDisplays.keys()) {
+    select.addEventListener("change", () => updateSelectDisplay(select));
+  }
+
   function languageCodes() {
     return Object.keys(languageOptions);
   }
@@ -76,14 +102,16 @@ export function createUi(app) {
   }
 
   function renderLanguageOptions() {
-    languageSelectEl.textContent = "";
+    const fragment = document.createDocumentFragment();
     for (const [code, label] of Object.entries(languageOptions)) {
       const option = document.createElement("option");
       option.value = code;
       option.textContent = label;
-      languageSelectEl.appendChild(option);
+      fragment.appendChild(option);
     }
+    languageSelectEl.replaceChildren(fragment);
     languageSelectEl.value = currentLanguage;
+    updateSelectDisplay(languageSelectEl);
   }
 
   function setAvailableLanguages(langs) {
@@ -150,16 +178,32 @@ async function loadLanguage() {
   await loadTranslations(currentLanguage);
   renderLanguageOptions();
   languageSelectEl.value = currentLanguage;
+  updateSelectDisplay(languageSelectEl);
 }
 
 function updateEncoderLabels() {
   const nativeOption = encoderModeEl.querySelector('option[value="native192"]');
   const wasm192Option = encoderModeEl.querySelector('option[value="wasm192"]');
   const wasmOption = encoderModeEl.querySelector('option[value="wasm320"]');
-  if (nativeOption) nativeOption.textContent = "🔊 Native AAC 192 kbps";
-  if (wasm192Option) wasm192Option.textContent = "🔊 WASM AAC 192 kbps";
-  if (wasmOption) wasmOption.textContent = "🔊 WASM AAC 320 kbps";
+  if (nativeOption) nativeOption.textContent = "Native 192 kbps";
+  if (wasm192Option) wasm192Option.textContent = "WASM 192 kbps";
+  if (wasmOption) wasmOption.textContent = "WASM 320 kbps";
   updateNativeEncoderOption();
+  updateSelectDisplay(encoderModeEl);
+}
+
+function setVideoQualities(qualities, selectedId) {
+  const fragment = document.createDocumentFragment();
+  for (const quality of qualities) {
+    const option = document.createElement("option");
+    option.value = quality.id;
+    option.textContent = `${quality.width}×${quality.height} · ${quality.fps} FPS · ${quality.bitrateKbps} kbps`;
+    fragment.appendChild(option);
+  }
+  videoQualityEl.replaceChildren(fragment);
+  if (selectedId) videoQualityEl.value = selectedId;
+  updateSelectDisplay(videoQualityEl);
+  updateSourceControls();
 }
 
 function updateNativeEncoderOption() {
@@ -169,6 +213,7 @@ function updateNativeEncoderOption() {
     encoderModeEl.value = "wasm192";
     app.writeStorage(app.storageKeys.encoderMode, encoderModeEl.value);
   }
+  updateSelectDisplay(encoderModeEl);
 }
 
 function updateStartTitle() {
@@ -203,8 +248,8 @@ function localizedMotdText(motd) {
 
 function renderMotd() {
   const text = localizedMotdText(motdPayload);
-  motdBoxEl.textContent = text;
-  motdBoxEl.hidden = !text;
+  motdEl.textContent = text;
+  motdEl.hidden = !text;
 }
 
 function setMotdPayload(payload) {
@@ -241,34 +286,36 @@ function normalizePatronTiers(payload) {
 
 function renderPatrons(tiers) {
   patronTiersPayload = Array.isArray(tiers) ? tiers : [];
-  patronsEl.textContent = "";
   const hasPatrons = patronTiersPayload.some(tier => tier.names.length > 0);
   patronsEl.hidden = !hasPatrons;
-  if (!hasPatrons) return;
+  if (!hasPatrons) {
+    patronsEl.replaceChildren();
+    return;
+  }
 
   const header = document.createElement("div");
   header.className = "patrons-header";
-  const title = document.createElement("span");
-  title.textContent = tr("patronsThankYouTitle");
-  const heart = document.createElement("span");
-  heart.className = "patrons-heart";
-  heart.textContent = "♥";
-  header.append(title, " ", heart);
+  header.textContent = `${tr("patronsThankYouTitle")} <3`;
+  const list = document.createElement("div");
+  list.className = "patrons-list";
   const fragment = document.createDocumentFragment();
-  fragment.appendChild(header);
 
   patronTiersPayload.forEach(tier => {
-    const row = document.createElement("div");
-    row.className = `patron-tier patron-${tier.className}`;
     tier.names.forEach(name => {
       const item = document.createElement("span");
-      item.className = "patron-name";
+      item.className = `patron-name patron-${tier.className}`;
       item.textContent = name;
-      row.appendChild(item);
+      list.appendChild(item);
     });
-    fragment.appendChild(row);
   });
-  patronsEl.appendChild(fragment);
+  const link = document.createElement("a");
+  link.className = "patrons-link";
+  link.href = "https://patreon.com/vard";
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  link.textContent = "patreon.com/vard";
+  fragment.append(header, list, link);
+  patronsEl.replaceChildren(fragment);
 }
 
 function setPatronsPayload(payload) {
@@ -283,9 +330,9 @@ function applyLanguage() {
   document.documentElement.lang = currentLanguage === "ja" ? "ja" : currentLanguage === "ru" ? "ru" : "en";
   updateStartTitle();
   setElementText(startTipEl, "firstSourceTip");
-  setElementText(screenLabelEl, "firstSourceTabSystemAudio");
+  setElementText(displayAudioLabelEl, "firstSourceTabWindowSystemAudio");
   tabAudioHintEl.textContent = tr("firstSourceTabAudioHint");
-  setElementText(videoSourceLabelEl, "firstSourceTabSystemVideo");
+  setElementText(displayVideoLabelEl, "firstSourceTabWindowDisplayVideo");
   setElementText(streamToTitleEl, "streamDestinationTitle");
   customApiEl.placeholder = tr("customServerApiPlaceholder");
   customPasswordEl.placeholder = tr("customServerPasswordPlaceholder");
@@ -341,6 +388,11 @@ function positionStreamInfoHint() {
   positionSideHint(streamInfoWrapEl, streamInfoHintEl);
 }
 
+function positionHints() {
+  positionRtspHint();
+  positionStreamInfoHint();
+}
+
 function showStreamInfoHint() {
   if (streamInfoHintEl.hidden || !streamInfoHintEl.textContent) return;
   streamInfoHintEl.classList.add("is-visible");
@@ -354,10 +406,6 @@ function hideStreamInfoHint() {
 
 function systemCaptureDisabled() {
   return app.config.isFirefoxBased;
-}
-
-function browserThrottleWarning() {
-  return document.hidden ? "\nBrowser tab is hidden/minimized; Chrome may throttle realtime encoding." : "";
 }
 
 function showSystemSourceHint(kind) {
@@ -397,17 +445,17 @@ function hideRtspHint() {
   rtspHintEl.classList.remove("is-visible");
 }
 
-function setStats(text) {
-  statsEl.textContent = text;
+function setServerStatsText(text) {
+  serverStatsEl.textContent = text;
 }
 
 function renderServerStatus() {
   if (serverStatus.state === "online") {
-    setStats(`🟢 ${tr("serverStatusOnline")} 📡${serverStatus.streams} 👥${serverStatus.listeners}`);
+    setServerStatsText(`🟢 ${tr("serverStatusOnline")} 📡${serverStatus.streams} 👥${serverStatus.listeners}`);
   } else if (serverStatus.state === "offline") {
-    setStats(`🔴 ${tr("serverStatusOffline")}`);
+    setServerStatsText(`🔴 ${tr("serverStatusOffline")}`);
   } else {
-    setStats(`🟡 ${tr("serverStatusLoading")}`);
+    setServerStatsText(`🟡 ${tr("serverStatusLoading")}`);
   }
 }
 
@@ -416,10 +464,15 @@ function setServerStatus(state, streams = 0, listeners = 0) {
   renderServerStatus();
 }
 
+function updateServerDisplay() {
+  updateSelectDisplay(serverSelectEl);
+}
+
 function updateCustomOption() {
   for (const option of serverSelectEl.options) {
     if (option.value === "custom") option.textContent = tr("serverSelectCustomOption");
   }
+  updateServerDisplay();
 }
 
 function updateServerHint() {
@@ -432,13 +485,15 @@ function updateServerHint() {
 
 function updateServerOption(index, server) {
   const option = serverSelectEl.options[index];
-  if (option) option.textContent = app.serverDisplayName(server);
+  if (!option) return;
+  option.textContent = app.serverDisplayName(server);
+  if (option.selected) updateServerDisplay();
 }
 
 function updateCustomVisibility() {
   const custom = serverSelectEl.value === "custom";
   const locked = Boolean(app.active);
-  customServerEl.hidden = !custom || locked;
+  customServerFormEl.hidden = !custom || locked;
   customApiEl.disabled = locked || !custom;
   customPasswordEl.disabled = locked || !custom;
   customConnectBtn.disabled = locked || !custom;
@@ -551,18 +606,24 @@ function activeSourceSpecs() {
 
 function addSourceLabel(kind) {
   if (kind === "mic") return tr("addSourceMicInputAudio");
-  if (kind === "video") return tr("addSourceTabSystemVideo");
-  return tr("addSourceTabSystemAudio");
+  if (kind === "video") return tr("addSourceTabWindowDisplayVideo");
+  return tr("addSourceTabWindowSystemAudio");
 }
 
-function addSourceIcon(kind) {
-  if (kind === "mic") return "🎙️";
-  if (kind === "video") return "📺";
-  return "🔊";
+function sourceIconUrl(kind) {
+  if (kind === "mic") return "static/mic.webp";
+  if (kind === "video") return "static/video.webp";
+  return "static/audio.webp";
 }
 
-function addSourceButtonLabel(kind) {
-  return `＋ ${addSourceLabel(kind)} ${addSourceIcon(kind)}`;
+function setupAddSourceButton(button, kind) {
+  const icon = document.createElement("img");
+  const label = document.createElement("span");
+  button.className = "add-source-button";
+  icon.src = sourceIconUrl(kind);
+  icon.alt = "";
+  label.textContent = addSourceLabel(kind);
+  button.append("＋", icon, label);
 }
 
 function createAddMicSourceControl() {
@@ -571,10 +632,10 @@ function createAddMicSourceControl() {
   const select = document.createElement("select");
   const placeholder = document.createElement("option");
   placeholder.value = "__add_mic";
-  placeholder.textContent = addSourceButtonLabel("mic");
+  placeholder.textContent = addSourceLabel("mic");
   wrap.className = "add-source-mic";
   button.type = "button";
-  button.textContent = placeholder.textContent;
+  setupAddSourceButton(button, "mic");
   button.disabled = app.sourceRequestInFlight;
   select.className = "add-source-hidden-select";
   select.disabled = app.sourceRequestInFlight;
@@ -635,7 +696,7 @@ function renderAddSourceButtons() {
     }
     const button = document.createElement("button");
     button.type = "button";
-    button.textContent = addSourceButtonLabel(kind);
+    setupAddSourceButton(button, kind);
     button.disabled = app.sourceRequestInFlight;
     button.onclick = () => app.streamer.addOrReplaceSource(kind);
     addSourcesEl.appendChild(button);
@@ -646,21 +707,27 @@ function renderAddSourceButtons() {
 function updateSourceControls() {
   const streaming = Boolean(app.active);
   const videoEnabled = app.serverVideoEnabled();
+  const serverReady = app.serverConnectionReady();
   const systemDisabled = systemCaptureDisabled();
-  micBtn.disabled = app.sourceRequestInFlight;
-  screenBtn.disabled = app.sourceRequestInFlight;
+  const sources = app.active && app.active.sources;
+  const hasAudioSource = Boolean(sources && (sources.mic || sources.screen || sources.video?.hasAudio));
+  micBtn.disabled = app.sourceRequestInFlight || !serverReady;
+  displayAudioBtn.disabled = app.sourceRequestInFlight || !serverReady;
   videoChoiceEl.hidden = !videoEnabled;
-  videoSourceBtn.disabled = app.sourceRequestInFlight || !videoEnabled;
-  screenBtn.classList.toggle("is-browser-disabled", systemDisabled);
-  videoSourceBtn.classList.toggle("is-browser-disabled", systemDisabled);
-  screenBtn.setAttribute("aria-disabled", String(systemDisabled));
-  videoSourceBtn.setAttribute("aria-disabled", String(systemDisabled));
-  micDeviceEl.disabled = app.sourceRequestInFlight || !micDeviceSelectionReady;
-  encoderModeEl.disabled = false;
+  displayVideoBtn.disabled = app.sourceRequestInFlight || !videoEnabled || !serverReady;
+  displayAudioBtn.classList.toggle("is-browser-disabled", systemDisabled);
+  displayVideoBtn.classList.toggle("is-browser-disabled", systemDisabled);
+  displayAudioBtn.setAttribute("aria-disabled", String(systemDisabled));
+  displayVideoBtn.setAttribute("aria-disabled", String(systemDisabled));
+  micDeviceEl.disabled = app.sourceRequestInFlight || !micDeviceSelectionReady || !serverReady;
+  encoderModeWrapEl.hidden = !streaming || !hasAudioSource;
+  videoQualityWrapEl.hidden = !streaming
+    || !videoEnabled
+    || !app.active.sources.video
+    || videoQualityEl.options.length === 0;
   newLinkBtn.disabled = app.linkRestartInFlight;
   stopBtn.disabled = !streaming;
   updateStartTitle();
-  if (app.active && !videoEnabled && app.active.sources.video) app.streamer.removeVideoSource(app.active.sources.video);
   renderAddSourceButtons();
 }
 
@@ -686,13 +753,9 @@ function saveMicDeviceSelection(value = micDeviceEl.value) {
   updateMicDeviceDisplay();
 }
 
-function selectedMicDeviceText() {
-  const option = micDeviceEl.selectedOptions && micDeviceEl.selectedOptions[0];
-  return (option && option.textContent.trim()) || micDeviceLabel();
-}
-
 function updateMicDeviceDisplay() {
-  micDeviceSelectedLabelEl.textContent = selectedMicDeviceText();
+  updateSelectDisplay(micDeviceEl);
+  if (!micDeviceSelectedLabelEl.textContent) micDeviceSelectedLabelEl.textContent = micDeviceLabel();
 }
 
 async function refreshMicDevices(preferredId = micDeviceEl.value || savedMicDeviceId()) {
@@ -741,13 +804,6 @@ async function refreshMicDevices(preferredId = micDeviceEl.value || savedMicDevi
   updateSourceControls();
 }
 
-function encoderStatusLine(info) {
-  let line = `Encoder: ${info.name}`;
-  if (info.detail) line += ` (${info.detail})`;
-  if (info.fallbackReason) line += `\nNative AAC fallback: ${info.fallbackReason}`;
-  return line;
-}
-
 function setStreamingControls(streaming) {
   firstSourceSelectionEl.hidden = streaming;
   streamPanelEl.hidden = !streaming;
@@ -760,7 +816,6 @@ function setStreamingControls(streaming) {
   stopBtn.disabled = !streaming;
   newLinkBtn.disabled = app.linkRestartInFlight;
   serverSelectEl.disabled = false;
-  encoderModeEl.disabled = false;
   updateCustomVisibility();
   updateSourceControls();
 }
@@ -769,29 +824,53 @@ function videoFpsLabel(value) {
   return Number.isFinite(value) && value > 0 ? value.toFixed(1) : "-";
 }
 
-function videoStatusLines(video) {
-  return `Video: H.264 ${app.config.videoWidth}x${app.config.videoHeight}@${app.config.videoFps}`
-    + `\nVideo mode: ${video.mode || "worker"}`
-    + `\nVideo fps: ${videoFpsLabel(video.fps)}`
-    + `\nCapture target fps: ${app.config.videoCaptureFps}`
-    + `\nBrowser capture fps: ${videoFpsLabel(video.captureFps)}`
-    + `\nTrack setting fps: ${videoFpsLabel(video.trackFps)}`
-    + `\nWorker input fps: ${videoFpsLabel(video.workerInputFps || video.sourceFps)}`
-    + `\nVideo kbps: ${video.kbps.toFixed(0)}`
-    + `\nVideo queue: ${video.queue}`
-    + `\nWebSocket queue: ${video.wsKBytes.toFixed(0)} KB`
-    + `\nVideo dropped: ${video.dropped}`;
+function statsSection(title, lines) {
+  return `[${title}]\n${lines.join("\n")}`;
+}
+
+function audioStatsSection(info) {
+  const lines = [`Encoder: ${info.name}`];
+  if (info.detail) lines.push(`Configuration: ${info.detail}`);
+  if (Number.isFinite(info.encodedKbps)) {
+    lines.push(`Bitrate: ${info.encodedKbps.toFixed(0)} kbps`);
+  }
+  if ("encodedFrames" in info) {
+    lines.push(
+      `Frame rate: ${info.encodedFps.toFixed(1)} / ${app.config.expectedEncodedFpsLabel} FPS`,
+      `Encoder queue: ${info.queue} frames`,
+      `Encoded frames: ${info.encodedFrames}`
+    );
+  }
+  if (info.fallbackReason) lines.push(`Native fallback: ${info.fallbackReason}`);
+  return statsSection("AUDIO", lines);
+}
+
+function videoStatsSection(video) {
+  const pipeline = video.mode === "processor" ? "MediaStreamTrackProcessor" : video.mode || "Worker";
+  return statsSection("VIDEO", [
+    "Codec: H.264",
+    `Output: ${app.config.videoWidth}×${app.config.videoHeight} @ ${app.config.videoFps} FPS`,
+    `Capture pipeline: ${pipeline}`,
+    `Bitrate: ${video.kbps.toFixed(0)} kbps`,
+    `Frame rate: ${videoFpsLabel(video.fps)} / ${app.config.videoFps.toFixed(1)} FPS`,
+    `Captured frame rate: ${videoFpsLabel(video.captureFps)} FPS`,
+    `Track-reported frame rate: ${videoFpsLabel(video.trackFps)} FPS`,
+    `Encoder queue: ${video.queue} frames`,
+    `Dropped frames: ${video.dropped}`
+  ]);
 }
 
 function streamHintText(info, video = null) {
-  if (!app.active) return encoderStatusLine(info);
-
-  let text = `${encoderStatusLine(info)}${browserThrottleWarning()}`;
-  if ("encodedFrames" in info) {
-    text += `\nEncoded AAC frames: ${info.encodedFrames}\nEncoded fps: ${info.encodedFps.toFixed(1)}/${app.config.expectedEncodedFpsLabel}\nEncoder queue: ${info.queue}`;
-  }
-  if (video) text += `\n${videoStatusLines(video)}`;
-  return text;
+  const browserState = document.hidden
+    ? "Hidden/minimized; encoding may be throttled"
+    : "Visible";
+  const general = statsSection("GENERAL", [
+    `Browser tab: ${browserState}`,
+    `WebSocket queue: ${(app.active.ws.bufferedAmount / 1024).toFixed(0)} KB`
+  ]);
+  const sections = [general, audioStatsSection(info)];
+  if (video) sections.push(videoStatsSection(video));
+  return sections.join("\n\n");
 }
 
 function renderStreamInfo(kbps, listeners) {
@@ -813,26 +892,32 @@ function updateStreamStatus(info) {
 
 function fallbackSourceName(kind) {
   if (kind === "mic") return tr("sourceMicInputDevice");
-  if (kind === "video") return tr("sourceCardTabSystemVideoTitle");
-  return tr("sourceCardTabSystemAudioTitle");
+  if (kind === "video") return tr("sourceCardTabWindowDisplayVideoTitle");
+  return tr("sourceCardTabWindowSystemAudioTitle");
 }
 
 function sourceDisplayName(kind, mediaStream) {
   if (kind === "video") {
-    return mediaStream.getAudioTracks().length > 0 ? tr("sourceCardTabSystemVideoAudioTitle") : tr("sourceCardTabSystemVideoTitle");
+    return mediaStream.getAudioTracks().length > 0
+      ? tr("sourceCardTabWindowDisplayVideoAudioTitle")
+      : tr("sourceCardTabWindowDisplayVideoTitle");
   }
-  if (kind === "screen") return tr("sourceCardTabSystemAudioTitle");
-  const track = kind === "video" ? mediaStream.getVideoTracks()[0] : mediaStream.getAudioTracks()[0];
+  if (kind === "screen") return tr("sourceCardTabWindowSystemAudioTitle");
+  const track = mediaStream.getAudioTracks()[0];
   const label = track?.label?.trim() || "";
   return label
-    ? label.replace(/^(Mic\/Input Device|Tab\/System Audio|Tab\/System|Video|Микрофон\/устройство ввода|Вкладка\/система|Видео|マイク\/入力デバイス|タブ\/システム|映像)\s*:?\s*/i, "") || fallbackSourceName(kind)
+    ? label.replace(/^Mic\s*\/\s*Input Device\s*:?\s*/i, "") || fallbackSourceName(kind)
     : fallbackSourceName(kind);
 }
 
 function localizedSourceName(source) {
   if (!source) return "";
-  if (source.kind === "screen") return tr("sourceCardTabSystemAudioTitle");
-  if (source.kind === "video") return source.hasAudio ? tr("sourceCardTabSystemVideoAudioTitle") : tr("sourceCardTabSystemVideoTitle");
+  if (source.kind === "screen") return tr("sourceCardTabWindowSystemAudioTitle");
+  if (source.kind === "video") {
+    return source.hasAudio
+      ? tr("sourceCardTabWindowDisplayVideoAudioTitle")
+      : tr("sourceCardTabWindowDisplayVideoTitle");
+  }
   return source.name;
 }
 
@@ -841,7 +926,6 @@ function updateSourceLabel(source) {
   const name = localizedSourceName(source);
   if (name && name !== source.name) {
     source.name = name;
-    if (source.block) applySourceTheme(source.block, source);
   }
   if (source.controlEl && source.kind !== "mic") source.controlEl.textContent = `▾ ${source.name}`;
 }
@@ -879,25 +963,6 @@ function updateMuteState(source) {
   if (source.block) source.block.classList.toggle("is-muted", muted);
 }
 
-function sourceThemeHue(text) {
-  let hash = 2166136261;
-  for (let i = 0; i < text.length; i++) {
-    hash ^= text.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-  return Math.abs(hash) % 360;
-}
-
-function applySourceTheme(block, source) {
-  const hue = sourceThemeHue(`${source.kind}:${source.name}`);
-  block.style.setProperty("--source-bg-a", `hsl(${hue} 28% 12%)`);
-  block.style.setProperty("--source-bg-b", `hsl(${(hue + 42) % 360} 24% 9%)`);
-  block.style.setProperty("--source-icon-bg", `hsl(${hue} 24% 14%)`);
-  block.style.setProperty("--source-fg", `hsl(${hue} 58% 72%)`);
-  block.style.setProperty("--source-soft", `hsl(${hue} 34% 48%)`);
-  block.style.setProperty("--source-accent", `hsl(${hue} 62% 60%)`);
-}
-
 function updateSourceVideoPreview(source) {
   if (!source.previewEl) return;
   const track = source.mediaStream.getVideoTracks()[0];
@@ -915,6 +980,8 @@ function updateSourceVideoPreview(source) {
 }
 
 function createMicSourceSelect(source) {
+  const wrap = document.createElement("span");
+  const display = document.createElement("span");
   const select = document.createElement("select");
   let selectedOption = null;
 
@@ -930,9 +997,14 @@ function createMicSourceSelect(source) {
     select.appendChild(selectedOption);
   }
 
-  selectedOption.textContent = `▾ ${source.name}`;
+  selectedOption.textContent = source.name;
   select.value = source.deviceId || "";
-  return select;
+  wrap.className = "text-select source-control";
+  display.className = "text-select-display";
+  display.textContent = source.name;
+  display.setAttribute("aria-hidden", "true");
+  wrap.append(display, select);
+  return { wrap, display, select };
 }
 
 function createSourceBlock(source) {
@@ -946,7 +1018,9 @@ function createSourceBlock(source) {
   const settings = hasAudioControls ? document.createElement("div") : null;
   const icon = document.createElement("span");
   const iconHint = document.createElement("span");
-  const sourceControl = source.kind === "mic" ? createMicSourceSelect(source) : document.createElement("button");
+  const micControl = source.kind === "mic" ? createMicSourceSelect(source) : null;
+  const sourceControl = micControl ? micControl.select : document.createElement("button");
+  const sourceControlHost = micControl ? micControl.wrap : sourceControl;
   const gainLabel = hasAudioControls ? document.createElement("label") : null;
   const gainMeter = hasAudioControls ? document.createElement("span") : null;
   const gain = hasAudioControls ? document.createElement("input") : null;
@@ -959,7 +1033,7 @@ function createSourceBlock(source) {
   const remove = document.createElement("button");
 
   block.className = "source-card";
-  applySourceTheme(block, source);
+  block.dataset.sourceKind = source.kind;
   block.style.setProperty("--source-level", "0%");
   iconWrap.type = "button";
   iconWrap.className = "source-icon";
@@ -972,11 +1046,10 @@ function createSourceBlock(source) {
   iconHint.className = "source-icon-hint";
   iconHint.dataset.i18n = source.kind === "video" ? "sourceVideoHideMuteHint" : "sourceMuteHint";
   iconHint.textContent = tr(iconHint.dataset.i18n);
-  const iconUrl = source.kind === "mic" ? "static/mic.webp" : source.kind === "video" ? "static/video.webp" : "static/audio.webp";
-  const iconMask = `url("${iconUrl}") center / contain no-repeat`;
+  const iconMask = `url("${sourceIconUrl(source.kind)}") center / contain no-repeat`;
   icon.style.setProperty("-webkit-mask", iconMask);
   icon.style.mask = iconMask;
-  sourceControl.className = "source-control";
+  if (!micControl) sourceControl.className = "source-control";
 
   if (source.kind !== "mic") {
     sourceControl.type = "button";
@@ -996,7 +1069,7 @@ function createSourceBlock(source) {
 
   iconWrap.append(icon);
   iconWrap.append(iconHint);
-  head.append(sourceControl, remove);
+  head.append(sourceControlHost, remove);
   if (hasAudioControls) {
     gainLabel.className = "source-gain";
     gainMeter.className = "source-gain-meter";
@@ -1029,6 +1102,7 @@ function createSourceBlock(source) {
 
   source.block = block;
   source.controlEl = sourceControl;
+  source.controlDisplayEl = micControl ? micControl.display : null;
   source.deviceEl = source.kind === "mic" ? sourceControl : null;
   source.gainEl = gain;
   source.gainMeterEl = gainMeter;
@@ -1051,6 +1125,7 @@ function createSourceBlock(source) {
 
   if (source.kind === "mic") {
     sourceControl.onchange = () => {
+      updateSelectDisplay(sourceControl, source.controlDisplayEl);
       const deviceId = source.deviceEl.value;
       saveMicDeviceSelection(deviceId);
       app.streamer.addOrReplaceSource(source.kind, deviceId, sourceSettings(source));
@@ -1100,14 +1175,9 @@ function createSourceBlock(source) {
 
   const api = {
     els: {
-      mainEl, serverSelectEl, serverHintEl, messageBoxEl: motdBoxEl, patronsEl, customServerEl,
-      customApiEl, customPasswordEl, customConnectBtn, rtspUrlEl, rtspHintEl,
-      encoderModeEl, micDeviceEl, micDeviceWrapEl, micDeviceSelectedLabelEl,
-      micDeviceLabelEl, sourcesEl, addSourcesEl, firstSourceSelectionEl, startTitleEl,
-      startTipEl, screenLabelEl, tabAudioHintEl, videoChoiceEl, videoSourceBtn,
-      videoSourceLabelEl, streamPanelEl, streamToTitleEl, streamInfoWrapEl,
-      streamInfoEl, streamInfoHintEl, statsEl, pasteHintEl, newLinkBtn, micBtn,
-      screenBtn, stopBtn, sourceCodeLinkEl, reportBugLinkEl, languageSelectEl
+      serverSelectEl, customServerFormEl, customApiEl, customPasswordEl, rtspUrlEl,
+      encoderModeEl, videoQualityEl, micDeviceEl, sourcesEl, streamInfoWrapEl,
+      newLinkBtn, micBtn, displayAudioBtn, displayVideoBtn, stopBtn, languageSelectEl
     },
     tr,
     setAvailableLanguages,
@@ -1117,14 +1187,15 @@ function createSourceBlock(source) {
     setLanguage(language) {
       currentLanguage = isSupportedLanguage(language) ? language : fallbackLanguage();
       languageSelectEl.value = currentLanguage;
+      updateSelectDisplay(languageSelectEl);
       app.writeStorage(app.storageKeys.language, currentLanguage);
     },
     loadTranslations,
     setNativeAacAvailable,
+    setVideoQualities,
     setMotdPayload,
     setPatronsPayload,
-    positionRtspHint,
-    positionStreamInfoHint,
+    positionHints,
     showRtspHint,
     hideRtspHint,
     showStreamInfoHint,
@@ -1147,7 +1218,7 @@ function createSourceBlock(source) {
     systemCaptureDisabled,
     savedMicDeviceId,
     saveMicDeviceSelection,
-    updateMicDeviceDisplay,
+    updateSelectDisplay,
     normalizeRuntimeSourceSettings,
     loadSourceSettings,
     saveSourceSettings,
@@ -1158,12 +1229,8 @@ function createSourceBlock(source) {
     createSourceBlock,
     updateSourceVideoPreview,
     sourceDisplayName,
-    localizedSourceName,
-    updateActiveSourceLabels,
     activeSourceSpecs,
-    renderAddSourceButtons,
     updateStreamStatus
   };
-  app.ui = api;
   return api;
 }

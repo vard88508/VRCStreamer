@@ -82,6 +82,7 @@ cd server
 | --- | ---: | --- |
 | `SERVER_NAME` | `Self-Hosted Instance` | Public server name sent to clients |
 | `SERVER_DESCRIPTION` | empty | Public server description sent to clients |
+| `REDIRECT_URL` | `https://stream.vard.cc` | Absolute HTTP/HTTPS URL returned by `GET /` as a temporary `302 Found` redirect |
 | `BIND_ADDR` | `0.0.0.0:443` | HTTP/HTTPS API and WebSocket ingest listen address |
 | `TLS_CERT_PATH` | `/etc/letsencrypt/live/example.com/fullchain.pem` | PEM certificate path |
 | `TLS_KEY_PATH` | `/etc/letsencrypt/live/example.com/privkey.pem` | PEM private key path |
@@ -90,6 +91,7 @@ cd server
 | `ALLOWED_ORIGINS` | `https://vard.cc` | Comma-separated browser origins allowed to stream |
 | `ALLOW_ANY_ORIGIN` | `false` | Disable Origin protection when `true` |
 | `VIDEO` | `false` | Allow browser streamers to send H.264 video; `false` makes clients audio-only while RTSP still keeps one-shot placeholders |
+| `AVALIABLE_VIDEO_QUALITY` | `1280x720*30/2000,1280x720*60/4000,1920x1080*30/3000,1920x1080*60/6000` | Comma-separated video presets in `widthxheight*fps/bitrate-kbps` format; the selected bitrate is the sustained H.264 ingest limit |
 | `MAX_CONNECTIONS` | `320` | Max simultaneously active streamers + RTSP listeners; `0` disables this limit |
 | `MAX_STREAMERS` | `0` | Max simultaneously active streamers; `0` disables this limit |
 | `MAX_STREAMERS_PER_IP` | `3` | Max simultaneous streamers from one IP; `0` disables this limit |
@@ -103,10 +105,9 @@ cd server
 | `HTTP_RATE_LIMIT_WINDOW_SECS` | `60` | HTTP request rate-limit window |
 | `MAX_TRACKED_IPS` | `8192` | Max IP entries kept by the in-memory limiter; `0` disables the cap |
 | `MAX_AAC_FRAME_BYTES` | `4096` | Max size of one raw AAC access unit from a streamer WebSocket frame |
-| `MAX_INGEST_BYTES_PER_SEC` | `98304` | Max average incoming AAC bytes/sec per streamer |
+| `MAX_INGEST_BYTES_PER_SEC` | `49152` | Sustained AAC ingest bytes/sec per streamer; allows up to about 393 kbps including the media header |
 | `MAX_H264_FRAME_BYTES` | `524288` | Max size of one Annex-B H.264 access unit from a streamer WebSocket frame |
-| `MAX_VIDEO_INGEST_BYTES_PER_SEC` | `1048576` | Max average incoming H.264 bytes/sec per streamer |
-| `CHANNEL_BUFFER` | `128` | Per-stream frame queue for RTSP listeners; higher tolerates more listener jitter but uses more memory per active stream |
+| `CHANNEL_BUFFER` | `32` | Per-stream frame queue for RTSP listeners; higher tolerates more listener jitter but uses more memory per active stream |
 | `STREAMER_IDLE_TIMEOUT_SECS` | `120` | Disconnect a streamer if no WebSocket messages arrive for this many seconds |
 | `PASSWORD` | empty | Optional comma-separated passwords; empty disables password auth |
 | `RUST_LOG` | `warn` | Server log level |

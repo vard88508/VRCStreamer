@@ -1,18 +1,40 @@
-use std::{
-    collections::HashMap,
-    net::IpAddr,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Instant};
 
 use super::{AppState, Config};
 
-pub(crate) struct IpLimitEntry {
+struct IpLimitEntry {
     window_started: Instant,
     request_count: usize,
     streamers: usize,
     listeners: usize,
     last_seen: Instant,
+}
+
+pub(crate) struct IpLimitTable {
+    entries: HashMap<IpAddr, IpLimitEntry>,
+    last_pruned: Instant,
+}
+
+impl IpLimitTable {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            last_pruned: Instant::now(),
+        }
+    }
+
+    fn prune_if_due(&mut self, now: Instant, config: &Config) {
+        if now.duration_since(self.last_pruned) < config.http_rate_limit_window {
+            return;
+        }
+        self.last_pruned = now;
+        let idle_timeout = config.http_rate_limit_window.saturating_mul(2);
+        self.entries.retain(|_, entry| {
+            entry.streamers != 0
+                || entry.listeners != 0
+                || now.duration_since(entry.last_seen) < idle_timeout
+        });
+    }
 }
 
 impl IpLimitEntry {
@@ -27,29 +49,43 @@ impl IpLimitEntry {
     }
 }
 
-pub(crate) struct RateWindow {
-    started: Instant,
-    bytes: usize,
-    window: Duration,
+pub(crate) struct TokenBucket {
+    available: f64,
+    updated_at: Instant,
+    initialized: bool,
 }
 
-impl RateWindow {
-    pub(crate) fn new(window: Duration) -> Self {
+impl TokenBucket {
+    pub(crate) fn new() -> Self {
         Self {
-            started: Instant::now(),
-            bytes: 0,
-            window,
+            available: 0.0,
+            updated_at: Instant::now(),
+            initialized: false,
         }
     }
 
-    pub(crate) fn allow(&mut self, len: usize, bytes_per_sec: usize) -> bool {
-        if self.started.elapsed() >= self.window {
-            self.started = Instant::now();
-            self.bytes = 0;
+    pub(crate) fn allow(&mut self, units: usize, units_per_second: usize) -> bool {
+        if units_per_second == 0 {
+            return false;
         }
 
-        self.bytes = self.bytes.saturating_add(len);
-        self.bytes <= bytes_per_sec.saturating_mul(self.window.as_secs() as usize)
+        let now = Instant::now();
+        let capacity = units_per_second.saturating_mul(2) as f64;
+        if self.initialized {
+            self.available = (self.available
+                + now.duration_since(self.updated_at).as_secs_f64() * units_per_second as f64)
+                .min(capacity);
+        } else {
+            self.available = capacity;
+            self.initialized = true;
+        }
+        self.updated_at = now;
+
+        if units as f64 > self.available {
+            return false;
+        }
+        self.available -= units as f64;
+        true
     }
 }
 
@@ -59,11 +95,12 @@ pub(crate) fn allow_http_request(state: &Arc<AppState>, ip: IpAddr) -> bool {
     }
 
     let now = Instant::now();
-    let mut limits = state
+    let mut table = state
         .ip_limits
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    prune_ip_limits(&mut limits, now, &state.config);
+    table.prune_if_due(now, &state.config);
+    let limits = &mut table.entries;
 
     if !limits.contains_key(&ip)
         && state.config.max_tracked_ips != 0
@@ -96,11 +133,12 @@ pub(crate) fn try_acquire_streamer_ip(
     }
 
     let now = Instant::now();
-    let mut limits = state
+    let mut table = state
         .ip_limits
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    prune_ip_limits(&mut limits, now, &state.config);
+    table.prune_if_due(now, &state.config);
+    let limits = &mut table.entries;
 
     if !limits.contains_key(&ip)
         && state.config.max_tracked_ips != 0
@@ -131,11 +169,12 @@ pub(crate) fn try_acquire_listener_ip(
     }
 
     let now = Instant::now();
-    let mut limits = state
+    let mut table = state
         .ip_limits
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    prune_ip_limits(&mut limits, now, &state.config);
+    table.prune_if_due(now, &state.config);
+    let limits = &mut table.entries;
 
     if !limits.contains_key(&ip)
         && state.config.max_tracked_ips != 0
@@ -157,15 +196,6 @@ pub(crate) fn try_acquire_listener_ip(
     }))
 }
 
-fn prune_ip_limits(limits: &mut HashMap<IpAddr, IpLimitEntry>, now: Instant, config: &Config) {
-    let idle_timeout = config.http_rate_limit_window.saturating_mul(2);
-    limits.retain(|_, entry| {
-        entry.streamers != 0
-            || entry.listeners != 0
-            || now.duration_since(entry.last_seen) < idle_timeout
-    });
-}
-
 pub(crate) struct StreamerIpGuard {
     state: Arc<AppState>,
     ip: IpAddr,
@@ -173,12 +203,12 @@ pub(crate) struct StreamerIpGuard {
 
 impl Drop for StreamerIpGuard {
     fn drop(&mut self) {
-        let mut limits = self
+        let mut table = self
             .state
             .ip_limits
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(entry) = limits.get_mut(&self.ip) {
+        if let Some(entry) = table.entries.get_mut(&self.ip) {
             entry.streamers = entry.streamers.saturating_sub(1);
             entry.last_seen = Instant::now();
         }
@@ -192,12 +222,12 @@ pub(crate) struct ListenerIpGuard {
 
 impl Drop for ListenerIpGuard {
     fn drop(&mut self) {
-        let mut limits = self
+        let mut table = self
             .state
             .ip_limits
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(entry) = limits.get_mut(&self.ip) {
+        if let Some(entry) = table.entries.get_mut(&self.ip) {
             entry.listeners = entry.listeners.saturating_sub(1);
             entry.last_seen = Instant::now();
         }

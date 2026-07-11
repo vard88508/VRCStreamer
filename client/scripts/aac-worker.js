@@ -1,3 +1,5 @@
+const MEDIA_FRAME_HEADER_BYTES = 5;
+
 let mode = "";
 let sampleRate = 48000;
 let channels = 2;
@@ -6,7 +8,7 @@ let expectedAacConfigHex = "1190";
 let nativeAacBitrates = [320000, 256000, 192000, 160000, 128000, 96000];
 
 let nativeEncoder = null;
-let nativeNextTimestampUs = 0;
+let nativeNextSample = 0;
 let nativeS16Scratch = null;
 
 let modulePromise = null;
@@ -91,9 +93,21 @@ function copyEncodedChunk(chunk) {
   return packet;
 }
 
-function validatePacket(packet, configHex) {
-  if (!packet || packet.byteLength < 4) throw new Error("Native AAC encoder produced no packet.");
-  if (packet[0] === 0xff && (packet[1] & 0xf6) === 0xf0) {
+function createMediaPacket(size, rtpTimestamp) {
+  const packet = new Uint8Array(size + MEDIA_FRAME_HEADER_BYTES);
+  packet[0] = 0x00;
+  packet[1] = rtpTimestamp >>> 24;
+  packet[2] = rtpTimestamp >>> 16;
+  packet[3] = rtpTimestamp >>> 8;
+  packet[4] = rtpTimestamp;
+  return packet;
+}
+
+function validatePacket(packet, configHex, offset = 0) {
+  if (!packet || packet.byteLength - offset < 4) {
+    throw new Error("Native AAC encoder produced no packet.");
+  }
+  if (packet[offset] === 0xff && (packet[offset + 1] & 0xf6) === 0xf0) {
     throw new Error("Native AAC encoder produced ADTS instead of raw AAC access units.");
   }
   if (configHex && !configHex.startsWith(expectedAacConfigHex)) {
@@ -192,16 +206,18 @@ async function initNative() {
       const description = metadata && metadata.decoderConfig && metadata.decoderConfig.description;
       if (description) configHex = bytesToHex(new Uint8Array(description));
 
-      const packet = copyEncodedChunk(chunk);
+      const rtpTimestamp = Math.round(chunk.timestamp * sampleRate / 1000000) >>> 0;
+      const packet = createMediaPacket(chunk.byteLength, rtpTimestamp);
+      chunk.copyTo(packet.subarray(MEDIA_FRAME_HEADER_BYTES));
       try {
-        validatePacket(packet, configHex);
+        validatePacket(packet, configHex, MEDIA_FRAME_HEADER_BYTES);
       } catch (error) {
         self.postMessage({ type: "error", message: errorText(error) });
         return;
       }
 
       self.postMessage(
-        { type: "packet", packet: packet.buffer, bytes: packet.byteLength },
+        { type: "packet", packet: packet.buffer, bytes: chunk.byteLength },
         [packet.buffer]
       );
     },
@@ -213,7 +229,7 @@ async function initNative() {
   encoder.configure(config);
   mode = "native";
   nativeEncoder = encoder;
-  nativeNextTimestampUs = 0;
+  nativeNextSample = 0;
   self.postMessage({
     type: "ready",
     name: "Native WebCodecs AAC",
@@ -230,10 +246,10 @@ function encodeNative(pcm) {
     sampleRate,
     numberOfFrames: frameCount,
     numberOfChannels: channels,
-    timestamp: nativeNextTimestampUs,
+    timestamp: Math.round(nativeNextSample * 1000000 / sampleRate),
     data: float32ToS16View(pcm)
   });
-  nativeNextTimestampUs += Math.round(frameCount * 1000000 / sampleRate);
+  nativeNextSample += frameCount;
   nativeEncoder.encode(audioData);
   audioData.close();
 }
@@ -243,7 +259,7 @@ function closeNative() {
   try { nativeEncoder.close(); } catch (_) {}
   nativeEncoder = null;
   nativeS16Scratch = null;
-  nativeNextTimestampUs = 0;
+  nativeNextSample = 0;
 }
 
 async function ensureModule() {
@@ -270,9 +286,10 @@ function drainWasmPackets() {
     const pts = Number(getEncodedPtsFn(ctx));
     if (pts < 0) continue;
 
-    const packet = module.HEAPU8.slice(ptr, ptr + size);
+    const packet = createMediaPacket(size, pts >>> 0);
+    packet.set(module.HEAPU8.subarray(ptr, ptr + size), MEDIA_FRAME_HEADER_BYTES);
     self.postMessage(
-      { type: "packet", packet: packet.buffer, bytes: packet.byteLength },
+      { type: "packet", packet: packet.buffer, bytes: size },
       [packet.buffer]
     );
   }

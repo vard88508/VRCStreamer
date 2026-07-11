@@ -1,16 +1,39 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 
-use super::{AAC_MAX_ACCESS_UNIT_BYTES, Config, H264_MAX_NAL_UNITS};
+use super::{AAC_MAX_ACCESS_UNIT_BYTES, Config, H264_MAX_NAL_UNITS, MEDIA_FRAME_HEADER_BYTES};
+
+const H264_MAX_PARAMETER_SET_BYTES: usize = 1024;
 
 pub(crate) enum StreamerMediaFrame {
-    Audio(Bytes),
-    Video { access_unit: Bytes, keyframe: bool },
+    Audio {
+        access_unit: Bytes,
+        rtp_timestamp: u32,
+    },
+    Video {
+        access_unit: Bytes,
+        keyframe: bool,
+        rtp_timestamp: u32,
+    },
+}
+
+#[derive(Clone)]
+pub(crate) enum AudioMessage {
+    Wake,
+    Frame {
+        access_unit: Bytes,
+        rtp_timestamp: u32,
+    },
 }
 
 #[derive(Clone)]
 pub(crate) enum VideoMessage {
     Wake,
-    Frame { access_unit: Bytes, keyframe: bool },
+    Frame {
+        access_unit: Bytes,
+        keyframe: bool,
+        rtp_timestamp: u32,
+    },
 }
 
 pub(crate) fn validate_aac_access_unit(access_unit: &[u8]) -> Result<(), &'static str> {
@@ -39,32 +62,38 @@ pub(crate) fn parse_streamer_media_frame(
 
     match kind {
         0x00 => {
-            let access_unit = frame.slice(1..);
+            if frame.len() < MEDIA_FRAME_HEADER_BYTES {
+                return Err("audio frame header is too small");
+            }
+            let rtp_timestamp = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
+            let access_unit = frame.slice(MEDIA_FRAME_HEADER_BYTES..);
             if access_unit.len() > config.max_aac_frame_bytes {
                 return Err("aac frame is too large");
             }
             validate_aac_access_unit(&access_unit)?;
-            Ok(StreamerMediaFrame::Audio(access_unit))
+            Ok(StreamerMediaFrame::Audio {
+                access_unit,
+                rtp_timestamp,
+            })
         }
         0x01 | 0x02 => {
             if !config.video_enabled {
                 return Err("video is disabled on this server");
             }
+            if frame.len() < MEDIA_FRAME_HEADER_BYTES {
+                return Err("video frame header is too small");
+            }
             let keyframe = kind == 0x01;
-            let access_unit = frame.slice(1..);
+            let rtp_timestamp = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
+            let access_unit = frame.slice(MEDIA_FRAME_HEADER_BYTES..);
             validate_h264_access_unit(&access_unit, keyframe, config.max_h264_frame_bytes)?;
             Ok(StreamerMediaFrame::Video {
                 access_unit,
                 keyframe,
+                rtp_timestamp,
             })
         }
-        _ => {
-            if frame.len() > config.max_aac_frame_bytes {
-                return Err("aac frame is too large");
-            }
-            validate_aac_access_unit(&frame)?;
-            Ok(StreamerMediaFrame::Audio(frame))
-        }
+        _ => Err("unknown media frame type"),
     }
 }
 
@@ -110,13 +139,40 @@ pub(crate) fn validate_h264_access_unit(
     Ok(())
 }
 
-pub(crate) fn h264_nal_count(access_unit: &[u8]) -> Result<usize, &'static str> {
-    let mut count = 0usize;
-    for_each_h264_nal(access_unit, |_| {
-        count += 1;
+pub(crate) fn h264_sdp_fmtp(access_unit: &[u8]) -> Result<String, &'static str> {
+    let mut profile = None;
+    let mut sps = None;
+    let mut pps = None;
+
+    for_each_h264_nal(access_unit, |nal| {
+        match nal[0] & 0x1f {
+            7 if sps.is_none() => {
+                if nal.len() < 4 {
+                    return Err("h264 sps is too small");
+                }
+                if nal.len() > H264_MAX_PARAMETER_SET_BYTES {
+                    return Err("h264 sps is too large");
+                }
+                profile = Some([nal[1], nal[2], nal[3]]);
+                sps = Some(STANDARD.encode(nal));
+            }
+            8 if pps.is_none() => {
+                if nal.len() > H264_MAX_PARAMETER_SET_BYTES {
+                    return Err("h264 pps is too large");
+                }
+                pps = Some(STANDARD.encode(nal));
+            }
+            _ => {}
+        }
         Ok(())
     })?;
-    Ok(count)
+
+    let [profile, compatibility, level] = profile.ok_or("h264 access unit has no sps")?;
+    let sps = sps.ok_or("h264 access unit has no sps")?;
+    let pps = pps.ok_or("h264 access unit has no pps")?;
+    Ok(format!(
+        "packetization-mode=1; profile-level-id={profile:02x}{compatibility:02x}{level:02x}; sprop-parameter-sets={sps},{pps}"
+    ))
 }
 
 fn for_each_h264_nal<F>(access_unit: &[u8], mut f: F) -> Result<(), &'static str>
