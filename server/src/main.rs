@@ -54,7 +54,9 @@ const AAC_AUDIO_SPECIFIC_CONFIG: &str = "1190";
 const AAC_SILENCE_ACCESS_UNIT: &[u8] = &[0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c];
 const AAC_FRAME_DURATION: Duration =
     Duration::from_micros((AAC_SAMPLES_PER_FRAME as u64 * 1_000_000) / AAC_SAMPLE_RATE as u64);
+const AAC_MAX_BITRATE_KBPS: usize = 320;
 const AAC_MAX_ACCESS_UNIT_BYTES: usize = 4 * 1024;
+const AAC_MAX_INGEST_BYTES_PER_SECOND: usize = AAC_MAX_BITRATE_KBPS * 1000 / 8 * 6 / 5;
 const MEDIA_FRAME_HEADER_BYTES: usize = 5;
 const H264_CLOCK_RATE: u32 = 90_000;
 const H264_MAX_ACCESS_UNIT_BYTES: usize = 512 * 1024;
@@ -124,11 +126,7 @@ struct Config {
     max_rtsp_requests_per_connection: usize,
     rtsp_handshake_timeout: Duration,
     http_rate_limit_window: Duration,
-    max_tracked_ips: usize,
     egress_kbps_per_listener: usize,
-    max_aac_frame_bytes: usize,
-    max_audio_ingest_bytes_per_sec: usize,
-    max_h264_frame_bytes: usize,
     channel_buffer: usize,
     streamer_idle_timeout: Duration,
     passwords: Vec<String>,
@@ -221,7 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let bind_addr = config.bind_addr;
-    let placeholders = match load_placeholders(&config) {
+    let placeholders = match load_placeholders() {
         Ok(placeholders) => placeholders,
         Err(error) => {
             error!(
@@ -309,7 +307,7 @@ impl Config {
         if tls_cert_path.is_some() != tls_key_path.is_some() {
             return Err("TLS_CERT_PATH and TLS_KEY_PATH must be set together".into());
         }
-        let video_enabled = env_bool("VIDEO", false);
+        let video_enabled = env_bool("VIDEO", true);
         let video_qualities = parse_video_qualities(
             &env::var("AVALIABLE_VIDEO_QUALITY")
                 .unwrap_or_else(|_| DEFAULT_VIDEO_QUALITIES.to_owned()),
@@ -317,7 +315,7 @@ impl Config {
         let max_connections = env_usize("MAX_CONNECTIONS", 320);
         let max_streamers = env_usize("MAX_STREAMERS", 0);
         let max_listeners_total = env_usize("MAX_LISTENERS_TOTAL", 0);
-        let max_listeners_per_stream = env_usize("MAX_LISTENERS_PER_STREAM", 85);
+        let max_listeners_per_stream = env_usize("MAX_LISTENERS_PER_STREAM", 105);
         let max_listeners_per_ip = env_usize("MAX_LISTENERS_PER_IP", 6);
         let egress_kbps_per_listener = env_usize("EGRESS_KBPS_PER_LISTENER", 384);
 
@@ -326,7 +324,8 @@ impl Config {
                 .unwrap_or_else(|_| "Self-Hosted Instance".to_owned()),
             server_description: env::var("SERVER_DESCRIPTION").unwrap_or_default(),
             redirect_url: parse_redirect_url(
-                &env::var("REDIRECT_URL").unwrap_or_else(|_| "https://stream.vard.cc".to_owned()),
+                &env::var("ROOT_REDIRECT_URL")
+                    .unwrap_or_else(|_| "https://stream.vard.cc".to_owned()),
             )?,
             bind_addr,
             rtsp_bind_addr,
@@ -341,7 +340,7 @@ impl Config {
             max_listeners_total,
             max_listeners_per_stream,
             max_listeners_per_ip,
-            max_http_requests_per_ip: env_usize("MAX_HTTP_REQUESTS_PER_IP", 120),
+            max_http_requests_per_ip: env_usize("MAX_HTTP_REQUESTS_PER_IP", 60),
             max_rtsp_requests_per_connection: env_usize("MAX_RTSP_REQUESTS_PER_CONNECTION", 4096),
             rtsp_handshake_timeout: Duration::from_secs(
                 env_u64("RTSP_HANDSHAKE_TIMEOUT_SECS", 30).max(1),
@@ -349,17 +348,13 @@ impl Config {
             http_rate_limit_window: Duration::from_secs(
                 env_u64("HTTP_RATE_LIMIT_WINDOW_SECS", 60).max(1),
             ),
-            max_tracked_ips: env_usize("MAX_TRACKED_IPS", 8192),
             egress_kbps_per_listener,
-            max_aac_frame_bytes: env_usize("MAX_AAC_FRAME_BYTES", AAC_MAX_ACCESS_UNIT_BYTES),
-            max_audio_ingest_bytes_per_sec: env_usize("MAX_INGEST_BYTES_PER_SEC", 48 * 1024),
-            max_h264_frame_bytes: env_usize("MAX_H264_FRAME_BYTES", H264_MAX_ACCESS_UNIT_BYTES),
-            channel_buffer: env_usize("CHANNEL_BUFFER", 32).max(1),
+            channel_buffer: env_usize("CHANNEL_BUFFER", 128).max(1),
             streamer_idle_timeout: Duration::from_secs(env_u64("STREAMER_IDLE_TIMEOUT_SECS", 120)),
             passwords: env_list("PASSWORD"),
             allow_any_origin: env_bool("ALLOW_ANY_ORIGIN", false),
             allowed_origins: env::var("ALLOWED_ORIGINS")
-                .unwrap_or_else(|_| "https://vard.cc".to_owned())
+                .unwrap_or_else(|_| "https://stream.vard.cc".to_owned())
                 .split(',')
                 .map(str::trim)
                 .filter(|origin| !origin.is_empty())
@@ -369,12 +364,12 @@ impl Config {
     }
 }
 
-fn load_placeholders(config: &Config) -> Result<Placeholders, Box<dyn std::error::Error>> {
+fn load_placeholders() -> Result<Placeholders, Box<dyn std::error::Error>> {
     let offline_video = load_placeholder(PLACEHOLDERS_PATH, "offline.h264")?;
     let audio_only_video = load_placeholder(PLACEHOLDERS_PATH, "audio_only.h264")?;
-    validate_h264_access_unit(&offline_video, true, config.max_h264_frame_bytes)
+    validate_h264_access_unit(&offline_video, true, H264_MAX_ACCESS_UNIT_BYTES)
         .map_err(|reason| format!("offline.h264 is invalid: {reason}"))?;
-    validate_h264_access_unit(&audio_only_video, true, config.max_h264_frame_bytes)
+    validate_h264_access_unit(&audio_only_video, true, H264_MAX_ACCESS_UNIT_BYTES)
         .map_err(|reason| format!("audio_only.h264 is invalid: {reason}"))?;
     let offline_fmtp = Arc::from(
         h264_sdp_fmtp(&offline_video)
@@ -646,9 +641,9 @@ fn password_allowed(password: Option<&str>, config: &Config) -> bool {
 
 fn max_ws_message_bytes(config: &Config) -> usize {
     let media_bytes = if config.video_enabled {
-        config.max_h264_frame_bytes.max(config.max_aac_frame_bytes)
+        H264_MAX_ACCESS_UNIT_BYTES
     } else {
-        config.max_aac_frame_bytes
+        AAC_MAX_ACCESS_UNIT_BYTES
     };
     media_bytes.saturating_add(MEDIA_FRAME_HEADER_BYTES)
 }
@@ -906,7 +901,7 @@ fn parse_redirect_url(value: &str) -> Result<HeaderValue, Box<dyn std::error::Er
     if !matches!(uri.scheme_str(), Some(scheme) if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
         || uri.authority().is_none()
     {
-        return Err("REDIRECT_URL must be an absolute HTTP or HTTPS URL".into());
+        return Err("ROOT_REDIRECT_URL must be an absolute HTTP or HTTPS URL".into());
     }
     Ok(value.parse()?)
 }

@@ -2,6 +2,8 @@ use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Instant};
 
 use super::{AppState, Config};
 
+const MAX_IP_LIMIT_ENTRIES: usize = 8192;
+
 struct IpLimitEntry {
     window_started: Instant,
     request_count: usize,
@@ -102,10 +104,7 @@ pub(crate) fn allow_http_request(state: &Arc<AppState>, ip: IpAddr) -> bool {
     table.prune_if_due(now, &state.config);
     let limits = &mut table.entries;
 
-    if !limits.contains_key(&ip)
-        && state.config.max_tracked_ips != 0
-        && limits.len() >= state.config.max_tracked_ips
-    {
+    if !limits.contains_key(&ip) && limits.len() >= MAX_IP_LIMIT_ENTRIES {
         return false;
     }
 
@@ -140,10 +139,7 @@ pub(crate) fn try_acquire_streamer_ip(
     table.prune_if_due(now, &state.config);
     let limits = &mut table.entries;
 
-    if !limits.contains_key(&ip)
-        && state.config.max_tracked_ips != 0
-        && limits.len() >= state.config.max_tracked_ips
-    {
+    if !limits.contains_key(&ip) && limits.len() >= MAX_IP_LIMIT_ENTRIES {
         return Err("too many tracked IPs\n");
     }
 
@@ -176,10 +172,7 @@ pub(crate) fn try_acquire_listener_ip(
     table.prune_if_due(now, &state.config);
     let limits = &mut table.entries;
 
-    if !limits.contains_key(&ip)
-        && state.config.max_tracked_ips != 0
-        && limits.len() >= state.config.max_tracked_ips
-    {
+    if !limits.contains_key(&ip) && limits.len() >= MAX_IP_LIMIT_ENTRIES {
         return Err("453 Not Enough Bandwidth");
     }
 

@@ -1,7 +1,10 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 
-use super::{AAC_MAX_ACCESS_UNIT_BYTES, Config, H264_MAX_NAL_UNITS, MEDIA_FRAME_HEADER_BYTES};
+use super::{
+    AAC_MAX_ACCESS_UNIT_BYTES, Config, H264_MAX_ACCESS_UNIT_BYTES, H264_MAX_NAL_UNITS,
+    MEDIA_FRAME_HEADER_BYTES,
+};
 
 const H264_MAX_PARAMETER_SET_BYTES: usize = 1024;
 
@@ -67,9 +70,6 @@ pub(crate) fn parse_streamer_media_frame(
             }
             let rtp_timestamp = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
             let access_unit = frame.slice(MEDIA_FRAME_HEADER_BYTES..);
-            if access_unit.len() > config.max_aac_frame_bytes {
-                return Err("aac frame is too large");
-            }
             validate_aac_access_unit(&access_unit)?;
             Ok(StreamerMediaFrame::Audio {
                 access_unit,
@@ -86,7 +86,7 @@ pub(crate) fn parse_streamer_media_frame(
             let keyframe = kind == 0x01;
             let rtp_timestamp = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
             let access_unit = frame.slice(MEDIA_FRAME_HEADER_BYTES..);
-            validate_h264_access_unit(&access_unit, keyframe, config.max_h264_frame_bytes)?;
+            validate_h264_access_unit(&access_unit, keyframe, H264_MAX_ACCESS_UNIT_BYTES)?;
             Ok(StreamerMediaFrame::Video {
                 access_unit,
                 keyframe,

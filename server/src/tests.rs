@@ -39,11 +39,7 @@ fn test_config() -> Config {
         max_rtsp_requests_per_connection: 4096,
         rtsp_handshake_timeout: Duration::from_secs(30),
         http_rate_limit_window: Duration::from_secs(60),
-        max_tracked_ips: 16,
         egress_kbps_per_listener: 384,
-        max_aac_frame_bytes: AAC_MAX_ACCESS_UNIT_BYTES,
-        max_audio_ingest_bytes_per_sec: 128 * 1024,
-        max_h264_frame_bytes: H264_MAX_ACCESS_UNIT_BYTES,
         channel_buffer: 8,
         streamer_idle_timeout: Duration::from_secs(1),
         passwords: Vec::new(),
@@ -368,18 +364,16 @@ fn estimated_egress_uses_listener_limit_and_per_listener_cost() {
 fn websocket_message_limit_ignores_h264_size_when_video_is_disabled() {
     let mut config = test_config();
     config.video_enabled = false;
-    config.max_aac_frame_bytes = 4096;
-    config.max_h264_frame_bytes = 512 * 1024;
 
     assert_eq!(
         max_ws_message_bytes(&config),
-        4096 + MEDIA_FRAME_HEADER_BYTES
+        AAC_MAX_ACCESS_UNIT_BYTES + MEDIA_FRAME_HEADER_BYTES
     );
 
     config.video_enabled = true;
     assert_eq!(
         max_ws_message_bytes(&config),
-        512 * 1024 + MEDIA_FRAME_HEADER_BYTES
+        H264_MAX_ACCESS_UNIT_BYTES + MEDIA_FRAME_HEADER_BYTES
     );
 }
 

@@ -21,12 +21,13 @@ use super::media::{
     AudioMessage, StreamerMediaFrame, VideoMessage, h264_sdp_fmtp, parse_streamer_media_frame,
 };
 use super::{
-    AppState, Channel, KEYFRAME_REQUEST_MESSAGE, STREAMER_CONTROL_MESSAGES_PER_SECOND,
-    STREAMER_LISTENER_UPDATE_INTERVAL, active_listeners, allow_http_request, cleanup_channel,
-    connection_limit_allows, force_resync_channel, get_or_create_channel, hash_code, limit_allows,
-    max_ws_message_bytes, origin_allowed, password_allowed, peer_id, public_rtsp_base,
-    streamer_hello_message, streamer_listeners_message, text_response, text_response_with_cors,
-    validate_code, wake_media_listeners, wake_video_listeners,
+    AAC_MAX_INGEST_BYTES_PER_SECOND, AppState, Channel, KEYFRAME_REQUEST_MESSAGE,
+    STREAMER_CONTROL_MESSAGES_PER_SECOND, STREAMER_LISTENER_UPDATE_INTERVAL, active_listeners,
+    allow_http_request, cleanup_channel, connection_limit_allows, force_resync_channel,
+    get_or_create_channel, hash_code, limit_allows, max_ws_message_bytes, origin_allowed,
+    password_allowed, peer_id, public_rtsp_base, streamer_hello_message,
+    streamer_listeners_message, text_response, text_response_with_cors, validate_code,
+    wake_media_listeners, wake_video_listeners,
 };
 
 pub(crate) enum StreamerTextCommand {
@@ -225,8 +226,7 @@ async fn streamer_session(
             Message::Binary(frame) => {
                 match frame.first().copied() {
                     Some(0x00)
-                        if !audio_ingest
-                            .allow(frame.len(), state.config.max_audio_ingest_bytes_per_sec) =>
+                        if !audio_ingest.allow(frame.len(), AAC_MAX_INGEST_BYTES_PER_SECOND) =>
                     {
                         warn!(%peer, %key, "streamer exceeded aac ingest rate");
                         let _ = socket.send(Message::Close(None)).await;

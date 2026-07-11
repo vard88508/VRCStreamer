@@ -1,7 +1,8 @@
 # VRCStreamer
-Minimal Rust WebSocket-to-RTSP audio/video server for VRChat.
 
-This install guide has only been checked on Debian 13 with the root user.
+WebSocket-to-RTSP audio/video server for VRChat.
+
+This installation guide has only been tested on Debian 13. All commands below assume that you are using the root user.
 
 ## 1. Install Rust
 
@@ -11,60 +12,64 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 . "$HOME/.cargo/env"
 ```
 
-## 2. Clone And Build
+## 2. Clone and Build
 
-Clone the repo wherever you want to keep it:
+Clone the repository into the directory where you want to keep the server, then build it:
 
 ```bash
 git clone https://github.com/vard88508/VRCStreamer.git
 cd VRCStreamer/server
-chmod +x build.sh create_service.sh
+chmod +x build.sh create_service.sh kill_service.sh
 ./build.sh
 ```
 
-`build.sh` compiles the Rust server and writes:
+The compiled executable is written to `VRCStreamer/server/VRCStreamer`.
 
-```text
-VRCStreamer/server/VRCStreamer
-```
+## 3. Configure the Server
 
-## 3. Configure `.env`
-
-On the first install:
+Create your local `.env` file from the provided example:
 
 ```bash
 cp .env.example .env
 nano .env
 ```
 
-Set your domain certificates in `TLS_CERT_PATH`, `TLS_KEY_PATH`.
+Before starting the server, check your TLS path settings:
 
-## 4. Create Service
+- `TLS_CERT_PATH` and `TLS_KEY_PATH`: paths to the certificate and private key for your API domain. You can make them using Certbot
+
+The complete list of settings is available in the [Environment](#environment) section.
+
+## 4. Install the Service
 
 ```bash
 ./create_service.sh
 ```
 
-The script writes `/etc/systemd/system/VRCStreamer.service`, enables it, and starts/restarts the service.
+The script creates `/etc/systemd/system/VRCStreamer.service`, enables automatic startup, and starts the server.
 
-Check logs:
+Useful commands:
 
 ```bash
+systemctl status VRCStreamer
+systemctl restart VRCStreamer
 journalctl -u VRCStreamer -f
 ```
 
-## 5. Start Streaming
+To stop the server and remove its systemd service:
 
-Open:
-
-```text
-https://stream.vard.cc
+```bash
+./kill_service.sh
 ```
 
-Choose `Custom Server` and enter your API server address:
+This does not delete the executable, `.env`, placeholders, or source files.
+
+## 5. Start Streaming
+
+Open [stream.vard.cc](https://stream.vard.cc), choose `Custom Server`, and enter your server's API address:
 
 ```text
-HTTP API Address: https://example.com
+https://example.com
 ```
 
 ## Updating
@@ -76,38 +81,38 @@ cd server
 ./build.sh
 ```
 
+If the systemd service is installed, `build.sh` automatically restarts it after a successful build.
+
 ## Environment
+
+The values below match `.env.example` and the server's built-in defaults. A limit of `0` disables that specific limit unless stated otherwise.
 
 | Name | Default | Meaning |
 | --- | ---: | --- |
-| `SERVER_NAME` | `Self-Hosted Instance` | Public server name sent to clients |
-| `SERVER_DESCRIPTION` | empty | Public server description sent to clients |
-| `REDIRECT_URL` | `https://stream.vard.cc` | Absolute HTTP/HTTPS URL returned by `GET /` as a temporary `302 Found` redirect |
-| `BIND_ADDR` | `0.0.0.0:443` | HTTP/HTTPS API and WebSocket ingest listen address |
-| `TLS_CERT_PATH` | `/etc/letsencrypt/live/example.com/fullchain.pem` | PEM certificate path |
-| `TLS_KEY_PATH` | `/etc/letsencrypt/live/example.com/privkey.pem` | PEM private key path |
-| `RTSP_BIND_ADDR` | `0.0.0.0:554` | RTSP listen address |
-| `RTSP_PUBLIC_BASE` | `none` | Public RTSPT URL sent by `/stats` and streamer hello; `none` derives from API Host header and `RTSP_BIND_ADDR` |
-| `ALLOWED_ORIGINS` | `https://vard.cc` | Comma-separated browser origins allowed to stream |
-| `ALLOW_ANY_ORIGIN` | `false` | Disable Origin protection when `true` |
-| `VIDEO` | `false` | Allow browser streamers to send H.264 video; `false` makes clients audio-only while RTSP still keeps one-shot placeholders |
-| `AVALIABLE_VIDEO_QUALITY` | `1280x720*30/2000,1280x720*60/4000,1920x1080*30/3000,1920x1080*60/6000` | Comma-separated video presets in `widthxheight*fps/bitrate-kbps` format; the selected bitrate is the sustained H.264 ingest limit |
-| `MAX_CONNECTIONS` | `320` | Max simultaneously active streamers + RTSP listeners; `0` disables this limit |
-| `MAX_STREAMERS` | `0` | Max simultaneously active streamers; `0` disables this limit |
-| `MAX_STREAMERS_PER_IP` | `3` | Max simultaneous streamers from one IP; `0` disables this limit |
-| `MAX_LISTENERS_TOTAL` | `0` | Max simultaneously connected RTSP listeners; `0` disables this limit |
-| `MAX_LISTENERS_PER_STREAM` | `85` | Max RTSP listeners connected to one stream URL |
-| `MAX_LISTENERS_PER_IP` | `6` | Max RTSP listeners from one IP; `0` disables this limit |
-| `EGRESS_KBPS_PER_LISTENER` | `384` | Estimated bandwidth cost of one RTSP listener in kilobits/sec; if `MAX_LISTENERS_TOTAL` is non-zero, estimated max outgoing bandwidth is `MAX_LISTENERS_TOTAL * EGRESS_KBPS_PER_LISTENER` |
-| `MAX_HTTP_REQUESTS_PER_IP` | `120` | Max `/healthz`, `/stats`, and `/ingest` WebSocket handshake requests from one IP per window; `0` disables this limit |
-| `MAX_RTSP_REQUESTS_PER_CONNECTION` | `4096` | Max RTSP commands on one TCP connection; normal playback uses `DESCRIBE`, `SETUP`, `PLAY`, and keepalives; `0` disables this limit |
-| `RTSP_HANDSHAKE_TIMEOUT_SECS` | `30` | Max seconds a raw RTSP TCP connection may stay open before `SETUP` |
-| `HTTP_RATE_LIMIT_WINDOW_SECS` | `60` | HTTP request rate-limit window |
-| `MAX_TRACKED_IPS` | `8192` | Max IP entries kept by the in-memory limiter; `0` disables the cap |
-| `MAX_AAC_FRAME_BYTES` | `4096` | Max size of one raw AAC access unit from a streamer WebSocket frame |
-| `MAX_INGEST_BYTES_PER_SEC` | `49152` | Sustained AAC ingest bytes/sec per streamer; allows up to about 393 kbps including the media header |
-| `MAX_H264_FRAME_BYTES` | `524288` | Max size of one Annex-B H.264 access unit from a streamer WebSocket frame |
-| `CHANNEL_BUFFER` | `32` | Per-stream frame queue for RTSP listeners; higher tolerates more listener jitter but uses more memory per active stream |
-| `STREAMER_IDLE_TIMEOUT_SECS` | `120` | Disconnect a streamer if no WebSocket messages arrive for this many seconds |
-| `PASSWORD` | empty | Optional comma-separated passwords; empty disables password auth |
-| `RUST_LOG` | `warn` | Server log level |
+| `SERVER_NAME` | `Self-Hosted Instance` | Server name shown by the web client |
+| `SERVER_DESCRIPTION` | empty | Optional server description sent to the web client |
+| `ROOT_REDIRECT_URL` | `https://stream.vard.cc` | Destination for visitors who open the API root `/` in a browser |
+| `BIND_ADDR` | `0.0.0.0:443` | Address and port used by the HTTP/HTTPS API and streamer WebSocket |
+| `TLS_CERT_PATH` | `/etc/letsencrypt/live/example.com/fullchain.pem` | Path to the PEM certificate; set both TLS paths to `none` to disable TLS |
+| `TLS_KEY_PATH` | `/etc/letsencrypt/live/example.com/privkey.pem` | Path to the PEM private key; set both TLS paths to `none` to disable TLS |
+| `RTSP_BIND_ADDR` | `0.0.0.0:554` | Address and port used by RTSP listeners |
+| `RTSP_PUBLIC_BASE` | `none` | Public RTSPT base URL sent to clients; `none` derives it from the API hostname and RTSP port |
+| `ALLOWED_ORIGINS` | `https://stream.vard.cc` | Comma-separated web client origins allowed to publish streams |
+| `ALLOW_ANY_ORIGIN` | `false` | Allow publishing from any website; keep this `false` unless you specifically need it |
+| `PASSWORD` | empty | Optional comma-separated publishing passwords; listeners do not need a password |
+| `VIDEO` | `true` | Enable H.264 video publishing; `false` restricts publishers to audio |
+| `AVALIABLE_VIDEO_QUALITY` | `1280x720*30/2000,1280x720*60/4000,1920x1080*30/3000,1920x1080*60/6000` | Video presets in `widthxheight*fps/bitrate-kbps` format; each preset's bitrate is also its sustained ingest limit |
+| `MAX_CONNECTIONS` | `320` | Maximum active streamers and RTSP listeners combined |
+| `MAX_STREAMERS` | `0` | Maximum active streamers |
+| `MAX_STREAMERS_PER_IP` | `3` | Maximum active streamers from one IP address |
+| `MAX_LISTENERS_TOTAL` | `0` | Maximum active RTSP listeners across all streams |
+| `MAX_LISTENERS_PER_STREAM` | `105` | Maximum RTSP listeners on one stream URL |
+| `MAX_LISTENERS_PER_IP` | `6` | Maximum active RTSP listeners from one IP address |
+| `EGRESS_KBPS_PER_LISTENER` | `384` | Per-listener value used only to estimate outgoing bandwidth in server statistics |
+| `MAX_HTTP_REQUESTS_PER_IP` | `60` | Maximum `/healthz`, `/stats`, and `/ingest` handshake requests from one IP per rate-limit window |
+| `HTTP_RATE_LIMIT_WINDOW_SECS` | `60` | HTTP rate-limit window in seconds |
+| `MAX_RTSP_REQUESTS_PER_CONNECTION` | `4096` | Maximum RTSP commands on one TCP connection, including playback setup and keepalives |
+| `RTSP_HANDSHAKE_TIMEOUT_SECS` | `30` | Seconds allowed for a new RTSP connection to complete `SETUP` |
+| `CHANNEL_BUFFER` | `128` | Shared frame queue per stream; larger values tolerate more listener jitter but retain more media in memory |
+| `STREAMER_IDLE_TIMEOUT_SECS` | `120` | Disconnect a streamer after this many seconds without a WebSocket message |
+| `RUST_LOG` | `warn` | Server log level, such as `error`, `warn`, `info`, or `debug` |
