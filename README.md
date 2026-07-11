@@ -93,15 +93,15 @@ The values below match `.env.example` and the server's built-in defaults. A limi
 | `SERVER_DESCRIPTION` | empty | Optional server description sent to the web client |
 | `ROOT_REDIRECT_URL` | `https://stream.vard.cc` | Destination for visitors who open the API root `/` in a browser |
 | `BIND_ADDR` | `0.0.0.0:443` | Address and port used by the HTTP/HTTPS API and streamer WebSocket |
-| `TLS_CERT_PATH` | `/etc/letsencrypt/live/example.com/fullchain.pem` | Path to the PEM certificate; set both TLS paths to `none` to disable TLS |
-| `TLS_KEY_PATH` | `/etc/letsencrypt/live/example.com/privkey.pem` | Path to the PEM private key; set both TLS paths to `none` to disable TLS |
+| `TLS_CERT_PATH` | <code>/etc/letsencrypt/live/<br>example.com/fullchain.pem</code> | Path to the PEM certificate; set both TLS paths to `none` to disable TLS |
+| `TLS_KEY_PATH` | <code>/etc/letsencrypt/live/<br>example.com/privkey.pem</code> | Path to the PEM private key; set both TLS paths to `none` to disable TLS |
 | `RTSP_BIND_ADDR` | `0.0.0.0:554` | Address and port used by RTSP listeners |
 | `RTSP_PUBLIC_BASE` | `none` | Public RTSPT base URL sent to clients; `none` derives it from the API hostname and RTSP port |
 | `ALLOWED_ORIGINS` | `https://stream.vard.cc` | Comma-separated web client origins allowed to publish streams |
 | `ALLOW_ANY_ORIGIN` | `false` | Allow publishing from any website; keep this `false` unless you specifically need it |
 | `PASSWORD` | empty | Optional comma-separated publishing passwords; listeners do not need a password |
 | `VIDEO` | `true` | Enable H.264 video publishing; `false` restricts publishers to audio |
-| `AVALIABLE_VIDEO_QUALITY` | `1280x720*30/2000,1280x720*60/4000,1920x1080*30/3000,1920x1080*60/6000` | Video presets in `widthxheight*fps/bitrate-kbps` format; each preset's bitrate is also its sustained ingest limit |
+| `AVALIABLE_VIDEO_QUALITY` | <code>1280x720*30/2000,<br>1280x720*60/4000,<br>1920x1080*30/3000,<br>1920x1080*60/6000</code> | Video presets in `widthxheight*fps/bitrate-kbps` format; each preset's bitrate is also its sustained ingest limit |
 | `MAX_CONNECTIONS` | `320` | Maximum active streamers and RTSP listeners combined |
 | `MAX_STREAMERS` | `0` | Maximum active streamers |
 | `MAX_STREAMERS_PER_IP` | `3` | Maximum active streamers from one IP address |
