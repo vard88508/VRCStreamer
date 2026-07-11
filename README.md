@@ -87,32 +87,32 @@ If the systemd service is installed, `build.sh` automatically restarts it after 
 
 The values below match `.env.example` and the server's built-in defaults. A limit of `0` disables that specific limit unless stated otherwise.
 
-| Name | Default | Meaning |
-| --- | ---: | --- |
-| `SERVER_NAME` | `Self-Hosted Instance` | Server name shown by the web client |
-| `SERVER_DESCRIPTION` | empty | Optional server description sent to the web client |
-| `ROOT_REDIRECT_URL` | `https://stream.vard.cc` | Destination for visitors who open the API root `/` in a browser |
-| `BIND_ADDR` | `0.0.0.0:443` | Address and port used by the HTTP/HTTPS API and streamer WebSocket |
-| `TLS_CERT_PATH` | <code>/etc/letsencrypt/live/<br>example.com/fullchain.pem</code> | Path to the PEM certificate; set both TLS paths to `none` to disable TLS |
-| `TLS_KEY_PATH` | <code>/etc/letsencrypt/live/<br>example.com/privkey.pem</code> | Path to the PEM private key; set both TLS paths to `none` to disable TLS |
-| `RTSP_BIND_ADDR` | `0.0.0.0:554` | Address and port used by RTSP listeners |
-| `RTSP_PUBLIC_BASE` | `none` | Public RTSPT base URL sent to clients; `none` derives it from the API hostname and RTSP port |
-| `ALLOWED_ORIGINS` | `https://stream.vard.cc` | Comma-separated web client origins allowed to publish streams |
-| `ALLOW_ANY_ORIGIN` | `false` | Allow publishing from any website; keep this `false` unless you specifically need it |
-| `PASSWORD` | empty | Optional comma-separated publishing passwords; listeners do not need a password |
-| `VIDEO` | `true` | Enable H.264 video publishing; `false` restricts publishers to audio |
-| `AVALIABLE_VIDEO_QUALITY` | <code>1280x720*30/2000,<br>1280x720*60/4000,<br>1920x1080*30/3000,<br>1920x1080*60/6000</code> | Video presets in `widthxheight*fps/bitrate-kbps` format; each preset's bitrate is also its sustained ingest limit |
-| `MAX_CONNECTIONS` | `320` | Maximum active streamers and RTSP listeners combined |
-| `MAX_STREAMERS` | `0` | Maximum active streamers |
-| `MAX_STREAMERS_PER_IP` | `3` | Maximum active streamers from one IP address |
-| `MAX_LISTENERS_TOTAL` | `0` | Maximum active RTSP listeners across all streams |
-| `MAX_LISTENERS_PER_STREAM` | `105` | Maximum RTSP listeners on one stream URL |
-| `MAX_LISTENERS_PER_IP` | `6` | Maximum active RTSP listeners from one IP address |
-| `EGRESS_KBPS_PER_LISTENER` | `384` | Per-listener value used only to estimate outgoing bandwidth in server statistics |
-| `MAX_HTTP_REQUESTS_PER_IP` | `60` | Maximum `/healthz`, `/stats`, and `/ingest` handshake requests from one IP per rate-limit window |
-| `HTTP_RATE_LIMIT_WINDOW_SECS` | `60` | HTTP rate-limit window in seconds |
-| `MAX_RTSP_REQUESTS_PER_CONNECTION` | `4096` | Maximum RTSP commands on one TCP connection, including playback setup and keepalives |
-| `RTSP_HANDSHAKE_TIMEOUT_SECS` | `30` | Seconds allowed for a new RTSP connection to complete `SETUP` |
-| `CHANNEL_BUFFER` | `128` | Shared frame queue per stream; larger values tolerate more listener jitter but retain more media in memory |
-| `STREAMER_IDLE_TIMEOUT_SECS` | `120` | Disconnect a streamer after this many seconds without a WebSocket message |
-| `RUST_LOG` | `warn` | Server log level, such as `error`, `warn`, `info`, or `debug` |
+| Name | Meaning |
+| --- | --- |
+| `SERVER_NAME` | Server name shown by the web client<br>Default value: `Self-Hosted Instance` |
+| `SERVER_DESCRIPTION` | Optional server description sent to the web client<br>Default value: empty |
+| `ROOT_REDIRECT_URL` | Destination for visitors who open the API root `/` in a browser<br>Default value: `https://stream.vard.cc` |
+| `BIND_ADDR` | Address and port used by the HTTP/HTTPS API and streamer WebSocket<br>Default value: `0.0.0.0:443` |
+| `TLS_CERT_PATH` | Path to the PEM certificate; set both TLS paths to `none` to disable TLS<br>Default value: `/etc/letsencrypt/live/example.com/fullchain.pem` |
+| `TLS_KEY_PATH` | Path to the PEM private key; set both TLS paths to `none` to disable TLS<br>Default value: `/etc/letsencrypt/live/example.com/privkey.pem` |
+| `RTSP_BIND_ADDR` | Address and port used by RTSP listeners<br>Default value: `0.0.0.0:554` |
+| `RTSP_PUBLIC_BASE` | Public RTSPT base URL sent to clients; `none` derives it from the API hostname and RTSP port<br>Default value: `none` |
+| `ALLOWED_ORIGINS` | Comma-separated web client origins allowed to publish streams<br>Default value: `https://stream.vard.cc` |
+| `ALLOW_ANY_ORIGIN` | Allow publishing from any website; keep this `false` unless you specifically need it<br>Default value: `false` |
+| `PASSWORD` | Optional comma-separated publishing passwords; listeners do not need a password<br>Default value: empty |
+| `VIDEO` | Enable H.264 video publishing; `false` restricts publishers to audio<br>Default value: `true` |
+| `AVALIABLE_VIDEO_QUALITY` | Video presets in `widthxheight*fps/bitrate-kbps` format; each preset's bitrate is also its sustained ingest limit<br>Default value: <code>1280x720*30/2000,<br>1280x720*60/4000,<br>1920x1080*30/3000,<br>1920x1080*60/6000</code> |
+| `MAX_CONNECTIONS` | Maximum active streamers and RTSP listeners combined<br>Default value: `320` |
+| `MAX_STREAMERS` | Maximum active streamers<br>Default value: `0` |
+| `MAX_STREAMERS_PER_IP` | Maximum active streamers from one IP address<br>Default value: `3` |
+| `MAX_LISTENERS_TOTAL` | Maximum active RTSP listeners across all streams<br>Default value: `0` |
+| `MAX_LISTENERS_PER_STREAM` | Maximum RTSP listeners on one stream URL<br>Default value: `105` |
+| `MAX_LISTENERS_PER_IP` | Maximum active RTSP listeners from one IP address<br>Default value: `6` |
+| `EGRESS_KBPS_PER_LISTENER` | Per-listener value used only to estimate outgoing bandwidth in server statistics<br>Default value: `384` |
+| `MAX_HTTP_REQUESTS_PER_IP` | Maximum `/healthz`, `/stats`, and `/ingest` handshake requests from one IP per rate-limit window<br>Default value: `60` |
+| `HTTP_RATE_LIMIT_WINDOW_SECS` | HTTP rate-limit window in seconds<br>Default value: `60` |
+| `MAX_RTSP_REQUESTS_PER_CONNECTION` | Maximum RTSP commands on one TCP connection, including playback setup and keepalives<br>Default value: `4096` |
+| `RTSP_HANDSHAKE_TIMEOUT_SECS` | Seconds allowed for a new RTSP connection to complete `SETUP`<br>Default value: `30` |
+| `CHANNEL_BUFFER` | Shared frame queue per stream; larger values tolerate more listener jitter but retain more media in memory<br>Default value: `128` |
+| `STREAMER_IDLE_TIMEOUT_SECS` | Disconnect a streamer after this many seconds without a WebSocket message<br>Default value: `120` |
+| `RUST_LOG` | Server log level, such as `error`, `warn`, `info`, or `debug`<br>Default value: `warn` |
