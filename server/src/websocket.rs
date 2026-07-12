@@ -21,13 +21,13 @@ use super::media::{
     AudioMessage, StreamerMediaFrame, VideoMessage, h264_sdp_fmtp, parse_streamer_media_frame,
 };
 use super::{
-    AAC_MAX_INGEST_BYTES_PER_SECOND, AppState, Channel, KEYFRAME_REQUEST_MESSAGE,
-    STREAMER_CONTROL_MESSAGES_PER_SECOND, STREAMER_LISTENER_UPDATE_INTERVAL, active_listeners,
-    allow_http_request, cleanup_channel, connection_limit_allows, force_resync_channel,
-    get_or_create_channel, hash_code, limit_allows, max_ws_message_bytes, origin_allowed,
-    password_allowed, peer_id, public_rtsp_base, streamer_hello_message,
-    streamer_listeners_message, text_response, text_response_with_cors, validate_code,
-    wake_media_listeners, wake_video_listeners,
+    AAC_MAX_INGEST_BYTES_PER_SECOND, AppState, Channel, DEFAULT_TOKEN_BUCKET_BURST_SECS,
+    KEYFRAME_REQUEST_MESSAGE, STREAMER_CONTROL_MESSAGES_PER_SECOND,
+    STREAMER_LISTENER_UPDATE_INTERVAL, active_listeners, allow_http_request, cleanup_channel,
+    connection_limit_allows, force_resync_channel, get_or_create_channel, hash_code, limit_allows,
+    max_ws_message_bytes, origin_allowed, password_allowed, peer_id, public_rtsp_base,
+    streamer_hello_message, streamer_listeners_message, text_response, text_response_with_cors,
+    validate_code, wake_media_listeners, wake_video_listeners,
 };
 
 pub(crate) enum StreamerTextCommand {
@@ -226,7 +226,11 @@ async fn streamer_session(
             Message::Binary(frame) => {
                 match frame.first().copied() {
                     Some(0x00)
-                        if !audio_ingest.allow(frame.len(), AAC_MAX_INGEST_BYTES_PER_SECOND) =>
+                        if !audio_ingest.allow(
+                            frame.len(),
+                            AAC_MAX_INGEST_BYTES_PER_SECOND,
+                            DEFAULT_TOKEN_BUCKET_BURST_SECS,
+                        ) =>
                     {
                         warn!(%peer, %key, "streamer exceeded aac ingest rate");
                         let _ = socket.send(Message::Close(None)).await;
@@ -238,9 +242,23 @@ async fn streamer_session(
                                 frame.len(),
                                 state.config.video_qualities[video_quality]
                                     .video_bytes_per_second(),
+                                state.config.video_ingest_burst_secs,
                             ) =>
                     {
-                        warn!(%peer, %key, video_quality, "streamer exceeded selected video ingest rate");
+                        let bytes_per_second =
+                            state.config.video_qualities[video_quality].video_bytes_per_second();
+                        warn!(
+                            %peer,
+                            %key,
+                            video_quality,
+                            frame_bytes = frame.len(),
+                            available_bytes = video_ingest.available_units(),
+                            capacity_bytes = bytes_per_second
+                                .saturating_mul(state.config.video_ingest_burst_secs),
+                            target_kbps = state.config.video_qualities[video_quality].bitrate_kbps,
+                            burst_secs = state.config.video_ingest_burst_secs,
+                            "streamer exceeded selected video ingest rate"
+                        );
                         let _ = socket.send(Message::Close(None)).await;
                         break;
                     }
@@ -324,7 +342,11 @@ async fn streamer_session(
                 }
             }
             Message::Ping(payload) => {
-                if !control_ingest.allow(1, STREAMER_CONTROL_MESSAGES_PER_SECOND) {
+                if !control_ingest.allow(
+                    1,
+                    STREAMER_CONTROL_MESSAGES_PER_SECOND,
+                    DEFAULT_TOKEN_BUCKET_BURST_SECS,
+                ) {
                     warn!(%peer, %key, "streamer exceeded control message rate");
                     let _ = socket.send(Message::Close(None)).await;
                     break;
@@ -332,7 +354,11 @@ async fn streamer_session(
                 let _ = socket.send(Message::Pong(payload)).await;
             }
             Message::Pong(_) => {
-                if !control_ingest.allow(1, STREAMER_CONTROL_MESSAGES_PER_SECOND) {
+                if !control_ingest.allow(
+                    1,
+                    STREAMER_CONTROL_MESSAGES_PER_SECOND,
+                    DEFAULT_TOKEN_BUCKET_BURST_SECS,
+                ) {
                     warn!(%peer, %key, "streamer exceeded control message rate");
                     let _ = socket.send(Message::Close(None)).await;
                     break;
@@ -343,7 +369,11 @@ async fn streamer_session(
                 break;
             }
             Message::Text(text) => {
-                if !control_ingest.allow(1, STREAMER_CONTROL_MESSAGES_PER_SECOND) {
+                if !control_ingest.allow(
+                    1,
+                    STREAMER_CONTROL_MESSAGES_PER_SECOND,
+                    DEFAULT_TOKEN_BUCKET_BURST_SECS,
+                ) {
                     warn!(%peer, %key, "streamer exceeded control message rate");
                     let _ = socket.send(Message::Close(None)).await;
                     break;

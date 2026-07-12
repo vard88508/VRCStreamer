@@ -29,6 +29,8 @@ fn test_config() -> Config {
         tls_key_path: None,
         video_enabled: true,
         video_qualities: parse_video_qualities(DEFAULT_VIDEO_QUALITIES).unwrap(),
+        max_h264_frame_bytes: H264_DEFAULT_MAX_ACCESS_UNIT_BYTES,
+        video_ingest_burst_secs: DEFAULT_TOKEN_BUCKET_BURST_SECS,
         max_connections: 0,
         max_streamers: 1,
         max_streamers_per_ip: 3,
@@ -206,8 +208,13 @@ fn redirect_url_requires_absolute_http_url() {
 #[test]
 fn media_rate_limiter_bounds_initial_burst() {
     let mut limiter = TokenBucket::new();
-    assert!(limiter.allow(2000, 1000));
-    assert!(!limiter.allow(1000, 1000));
+    assert!(limiter.allow(2000, 1000, 2));
+    assert!(!limiter.allow(1000, 1000, 2));
+    assert_eq!(limiter.available_units(), 0);
+
+    let mut larger_burst = TokenBucket::new();
+    assert!(larger_burst.allow(3000, 1000, 3));
+    assert!(!larger_burst.allow(1, 1000, 3));
 }
 
 #[test]
@@ -363,6 +370,7 @@ fn estimated_egress_uses_listener_limit_and_per_listener_cost() {
 #[test]
 fn websocket_message_limit_ignores_h264_size_when_video_is_disabled() {
     let mut config = test_config();
+    config.max_h264_frame_bytes = 2 * 1024 * 1024;
     config.video_enabled = false;
 
     assert_eq!(
@@ -373,7 +381,7 @@ fn websocket_message_limit_ignores_h264_size_when_video_is_disabled() {
     config.video_enabled = true;
     assert_eq!(
         max_ws_message_bytes(&config),
-        H264_MAX_ACCESS_UNIT_BYTES + MEDIA_FRAME_HEADER_BYTES
+        config.max_h264_frame_bytes + MEDIA_FRAME_HEADER_BYTES
     );
 }
 
@@ -462,7 +470,9 @@ fn validator_accepts_annex_b_h264_keyframe() {
     let access_unit = [
         0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x1f, 0, 0, 1, 0x65, 0x88, 0x84,
     ];
-    assert!(validate_h264_access_unit(&access_unit, true, H264_MAX_ACCESS_UNIT_BYTES).is_ok());
+    assert!(
+        validate_h264_access_unit(&access_unit, true, H264_DEFAULT_MAX_ACCESS_UNIT_BYTES).is_ok()
+    );
 }
 
 #[test]
@@ -495,6 +505,20 @@ fn streamer_preserves_video_rtp_timestamp() {
     assert!(keyframe);
     assert_eq!(rtp_timestamp, 0x1234_5678);
     assert_eq!(access_unit[4] & 0x1f, 7);
+}
+
+#[test]
+fn streamer_applies_configured_h264_frame_limit() {
+    let frame = Bytes::from_static(&[
+        0x01, 0, 0, 0, 0, 0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x1f, 0, 0, 1, 0x65, 0x88, 0x84,
+    ]);
+    let mut config = test_config();
+    config.max_h264_frame_bytes = frame.len() - MEDIA_FRAME_HEADER_BYTES - 1;
+
+    assert!(matches!(
+        parse_streamer_media_frame(frame, &config),
+        Err("h264 access unit is too large")
+    ));
 }
 
 #[test]
@@ -539,7 +563,7 @@ fn streamer_rejects_video_frames_when_video_is_disabled() {
 fn validator_rejects_h264_keyframe_without_idr() {
     let access_unit = [0, 0, 0, 1, 0x41, 0x9a, 0x22];
     assert_eq!(
-        validate_h264_access_unit(&access_unit, true, H264_MAX_ACCESS_UNIT_BYTES),
+        validate_h264_access_unit(&access_unit, true, H264_DEFAULT_MAX_ACCESS_UNIT_BYTES),
         Err("h264 keyframe has no idr slice")
     );
 }

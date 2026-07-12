@@ -28,7 +28,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, Notify, broadcast};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
 mod limits;
@@ -59,7 +59,8 @@ const AAC_MAX_ACCESS_UNIT_BYTES: usize = 4 * 1024;
 const AAC_MAX_INGEST_BYTES_PER_SECOND: usize = AAC_MAX_BITRATE_KBPS * 1000 / 8 * 6 / 5;
 const MEDIA_FRAME_HEADER_BYTES: usize = 5;
 const H264_CLOCK_RATE: u32 = 90_000;
-const H264_MAX_ACCESS_UNIT_BYTES: usize = 512 * 1024;
+const H264_DEFAULT_MAX_ACCESS_UNIT_BYTES: usize = 512 * 1024;
+const H264_HARD_MAX_ACCESS_UNIT_BYTES: usize = 8 * 1024 * 1024;
 const H264_MAX_NAL_UNITS: usize = 64;
 const RTP_MAX_PAYLOAD_BYTES: usize = 1200;
 const RTSP_MAX_LINE_BYTES: usize = 4096;
@@ -79,6 +80,8 @@ const KEYFRAME_REQUEST_MESSAGE: &str = "{\"type\":\"keyframe\"}";
 const DEFAULT_VIDEO_QUALITIES: &str =
     "1280x720*30/2000,1280x720*60/4000,1920x1080*30/3000,1920x1080*60/6000";
 const MAX_VIDEO_QUALITIES: usize = 32;
+const DEFAULT_TOKEN_BUCKET_BURST_SECS: usize = 2;
+const MAX_VIDEO_INGEST_BURST_SECS: usize = 60;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct VideoQuality {
@@ -116,6 +119,8 @@ struct Config {
     tls_key_path: Option<String>,
     video_enabled: bool,
     video_qualities: Vec<VideoQuality>,
+    max_h264_frame_bytes: usize,
+    video_ingest_burst_secs: usize,
     max_connections: usize,
     max_streamers: usize,
     max_streamers_per_ip: usize,
@@ -219,7 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let bind_addr = config.bind_addr;
-    let placeholders = match load_placeholders() {
+    let placeholders = match load_placeholders(&config) {
         Ok(placeholders) => placeholders,
         Err(error) => {
             error!(
@@ -308,9 +313,18 @@ impl Config {
             return Err("TLS_CERT_PATH and TLS_KEY_PATH must be set together".into());
         }
         let video_enabled = env_bool("VIDEO", true);
-        let video_qualities = parse_video_qualities(
-            &env::var("AVALIABLE_VIDEO_QUALITY")
-                .unwrap_or_else(|_| DEFAULT_VIDEO_QUALITIES.to_owned()),
+        let video_qualities = parse_video_qualities(&video_qualities_env())?;
+        let max_h264_frame_bytes = env_usize_in_range(
+            "MAX_H264_FRAME_BYTES",
+            H264_DEFAULT_MAX_ACCESS_UNIT_BYTES,
+            1,
+            H264_HARD_MAX_ACCESS_UNIT_BYTES,
+        )?;
+        let video_ingest_burst_secs = env_usize_in_range(
+            "VIDEO_INGEST_BURST_SECS",
+            DEFAULT_TOKEN_BUCKET_BURST_SECS,
+            1,
+            MAX_VIDEO_INGEST_BURST_SECS,
         )?;
         let max_connections = env_usize("MAX_CONNECTIONS", 320);
         let max_streamers = env_usize("MAX_STREAMERS", 0);
@@ -334,6 +348,8 @@ impl Config {
             tls_key_path,
             video_enabled,
             video_qualities,
+            max_h264_frame_bytes,
+            video_ingest_burst_secs,
             max_connections,
             max_streamers,
             max_streamers_per_ip: env_usize("MAX_STREAMERS_PER_IP", 3),
@@ -364,12 +380,12 @@ impl Config {
     }
 }
 
-fn load_placeholders() -> Result<Placeholders, Box<dyn std::error::Error>> {
+fn load_placeholders(config: &Config) -> Result<Placeholders, Box<dyn std::error::Error>> {
     let offline_video = load_placeholder(PLACEHOLDERS_PATH, "offline.h264")?;
     let audio_only_video = load_placeholder(PLACEHOLDERS_PATH, "audio_only.h264")?;
-    validate_h264_access_unit(&offline_video, true, H264_MAX_ACCESS_UNIT_BYTES)
+    validate_h264_access_unit(&offline_video, true, config.max_h264_frame_bytes)
         .map_err(|reason| format!("offline.h264 is invalid: {reason}"))?;
-    validate_h264_access_unit(&audio_only_video, true, H264_MAX_ACCESS_UNIT_BYTES)
+    validate_h264_access_unit(&audio_only_video, true, config.max_h264_frame_bytes)
         .map_err(|reason| format!("audio_only.h264 is invalid: {reason}"))?;
     let offline_fmtp = Arc::from(
         h264_sdp_fmtp(&offline_video)
@@ -641,7 +657,7 @@ fn password_allowed(password: Option<&str>, config: &Config) -> bool {
 
 fn max_ws_message_bytes(config: &Config) -> usize {
     let media_bytes = if config.video_enabled {
-        H264_MAX_ACCESS_UNIT_BYTES
+        config.max_h264_frame_bytes
     } else {
         AAC_MAX_ACCESS_UNIT_BYTES
     };
@@ -865,6 +881,24 @@ fn env_usize(key: &str, default: usize) -> usize {
     env_usize_optional(key).unwrap_or(default)
 }
 
+fn env_usize_in_range(
+    key: &str,
+    default: usize,
+    min: usize,
+    max: usize,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let value = match env::var(key) {
+        Ok(value) => value
+            .parse::<usize>()
+            .map_err(|_| format!("{key} must be an integer"))?,
+        Err(_) => default,
+    };
+    if !(min..=max).contains(&value) {
+        return Err(format!("{key} must be between {min} and {max}").into());
+    }
+    Ok(value)
+}
+
 fn env_usize_optional(key: &str) -> Option<usize> {
     env::var(key).ok().and_then(|value| value.parse().ok())
 }
@@ -969,6 +1003,22 @@ fn env_list(key: &str) -> Vec<String> {
         .collect()
 }
 
+fn video_qualities_env() -> String {
+    if let Ok(value) = env::var("AVAILABLE_VIDEO_QUALITY") {
+        if env::var_os("AVALIABLE_VIDEO_QUALITY").is_some() {
+            warn!(
+                "AVALIABLE_VIDEO_QUALITY is deprecated and ignored because AVAILABLE_VIDEO_QUALITY is set"
+            );
+        }
+        return value;
+    }
+    if let Ok(value) = env::var("AVALIABLE_VIDEO_QUALITY") {
+        warn!("AVALIABLE_VIDEO_QUALITY is deprecated; use AVAILABLE_VIDEO_QUALITY");
+        return value;
+    }
+    DEFAULT_VIDEO_QUALITIES.to_owned()
+}
+
 fn parse_video_qualities(value: &str) -> Result<Vec<VideoQuality>, Box<dyn std::error::Error>> {
     let mut qualities = Vec::new();
     for entry in value
@@ -978,19 +1028,19 @@ fn parse_video_qualities(value: &str) -> Result<Vec<VideoQuality>, Box<dyn std::
     {
         if qualities.len() >= MAX_VIDEO_QUALITIES {
             return Err(format!(
-                "AVALIABLE_VIDEO_QUALITY supports at most {MAX_VIDEO_QUALITIES} presets"
+                "AVAILABLE_VIDEO_QUALITY supports at most {MAX_VIDEO_QUALITIES} presets"
             )
             .into());
         }
         let (size_and_fps, bitrate) = entry
             .split_once('/')
-            .ok_or_else(|| format!("invalid AVALIABLE_VIDEO_QUALITY preset: {entry}"))?;
+            .ok_or_else(|| format!("invalid AVAILABLE_VIDEO_QUALITY preset: {entry}"))?;
         let (size, fps) = size_and_fps
             .split_once('*')
-            .ok_or_else(|| format!("invalid AVALIABLE_VIDEO_QUALITY preset: {entry}"))?;
+            .ok_or_else(|| format!("invalid AVAILABLE_VIDEO_QUALITY preset: {entry}"))?;
         let (width, height) = size
             .split_once(['x', 'X'])
-            .ok_or_else(|| format!("invalid AVALIABLE_VIDEO_QUALITY preset: {entry}"))?;
+            .ok_or_else(|| format!("invalid AVAILABLE_VIDEO_QUALITY preset: {entry}"))?;
         let quality = VideoQuality {
             width: parse_nonzero(width, entry)?,
             height: parse_nonzero(height, entry)?,
@@ -998,12 +1048,12 @@ fn parse_video_qualities(value: &str) -> Result<Vec<VideoQuality>, Box<dyn std::
             bitrate_kbps: parse_nonzero(bitrate, entry)?,
         };
         if qualities.contains(&quality) {
-            return Err(format!("duplicate AVALIABLE_VIDEO_QUALITY preset: {entry}").into());
+            return Err(format!("duplicate AVAILABLE_VIDEO_QUALITY preset: {entry}").into());
         }
         qualities.push(quality);
     }
     if qualities.is_empty() {
-        return Err("AVALIABLE_VIDEO_QUALITY must contain at least one preset".into());
+        return Err("AVAILABLE_VIDEO_QUALITY must contain at least one preset".into());
     }
     Ok(qualities)
 }
@@ -1015,7 +1065,7 @@ where
 {
     let parsed = value.trim().parse::<T>()?;
     if parsed == T::default() {
-        return Err(format!("zero value in AVALIABLE_VIDEO_QUALITY preset: {preset}").into());
+        return Err(format!("zero value in AVAILABLE_VIDEO_QUALITY preset: {preset}").into());
     }
     Ok(parsed)
 }

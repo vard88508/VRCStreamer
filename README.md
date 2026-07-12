@@ -101,7 +101,9 @@ The values below match `.env.example` and the server's built-in defaults.
 | `ALLOW_ANY_ORIGIN` | Allow publishing from any website; keep this `false` unless you specifically need it<br>Default value: `false` |
 | `PASSWORD` | Optional comma-separated publishing passwords; listeners do not need a password<br>Default value: empty |
 | `VIDEO` | Enable H.264 video publishing; `false` restricts publishers to audio<br>Default value: `true` |
-| `AVALIABLE_VIDEO_QUALITY` | Video presets in `widthxheight*fps/bitrate-kbps` format; each preset's bitrate is also its sustained ingest limit<br>Default value: <code>1280x720&#42;30/2000,<br>1280x720&#42;60/4000,<br>1920x1080&#42;30/3000,<br>1920x1080&#42;60/6000</code> |
+| `AVAILABLE_VIDEO_QUALITY` | Video presets in `widthxheight*fps/bitrate-kbps` format; each preset's bitrate is also its sustained ingest limit<br>Default value: <code>1280x720&#42;30/2000,<br>1280x720&#42;60/4000,<br>1920x1080&#42;30/3000,<br>1920x1080&#42;60/6000</code> |
+| `MAX_H264_FRAME_BYTES` | Maximum size of one H.264 access unit. Values above `8388608` are rejected to bound single-message memory use<br>Default value: `524288` |
+| `VIDEO_INGEST_BURST_SECS` | Token-bucket capacity measured in seconds at the selected video bitrate. Higher values allow longer short-term bitrate spikes without changing the encoder target or allocating a media queue<br>Default value: `2` |
 | `MAX_CONNECTIONS` | Maximum active streamers and RTSP listeners combined. Set to `0` to disable this limit<br>Default value: `320` |
 | `MAX_STREAMERS` | Maximum active streamers. Set to `0` to disable this limit<br>Default value: `0` |
 | `MAX_STREAMERS_PER_IP` | Maximum active streamers from one IP address. Set to `0` to disable this limit<br>Default value: `3` |

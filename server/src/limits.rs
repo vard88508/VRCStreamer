@@ -66,13 +66,18 @@ impl TokenBucket {
         }
     }
 
-    pub(crate) fn allow(&mut self, units: usize, units_per_second: usize) -> bool {
-        if units_per_second == 0 {
+    pub(crate) fn allow(
+        &mut self,
+        units: usize,
+        units_per_second: usize,
+        burst_seconds: usize,
+    ) -> bool {
+        if units_per_second == 0 || burst_seconds == 0 {
             return false;
         }
 
         let now = Instant::now();
-        let capacity = units_per_second.saturating_mul(2) as f64;
+        let capacity = units_per_second.saturating_mul(burst_seconds) as f64;
         if self.initialized {
             self.available = (self.available
                 + now.duration_since(self.updated_at).as_secs_f64() * units_per_second as f64)
@@ -88,6 +93,10 @@ impl TokenBucket {
         }
         self.available -= units as f64;
         true
+    }
+
+    pub(crate) fn available_units(&self) -> usize {
+        self.available.max(0.0) as usize
     }
 }
 
