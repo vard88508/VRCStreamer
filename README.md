@@ -85,7 +85,7 @@ If the systemd service is installed, `build.sh` automatically restarts it after 
 
 ## Environment
 
-The values below match `.env.example` and the server's built-in defaults. A limit of `0` disables that specific limit unless stated otherwise.
+The values below match `.env.example` and the server's built-in defaults.
 
 | Name | Meaning |
 | --- | --- |
@@ -101,17 +101,17 @@ The values below match `.env.example` and the server's built-in defaults. A limi
 | `ALLOW_ANY_ORIGIN` | Allow publishing from any website; keep this `false` unless you specifically need it<br>Default value: `false` |
 | `PASSWORD` | Optional comma-separated publishing passwords; listeners do not need a password<br>Default value: empty |
 | `VIDEO` | Enable H.264 video publishing; `false` restricts publishers to audio<br>Default value: `true` |
-| `AVALIABLE_VIDEO_QUALITY` | Video presets in `widthxheight*fps/bitrate-kbps` format; each preset's bitrate is also its sustained ingest limit<br>Default value: <code>1280x720*30/2000,<br>1280x720*60/4000,<br>1920x1080*30/3000,<br>1920x1080*60/6000</code> |
-| `MAX_CONNECTIONS` | Maximum active streamers and RTSP listeners combined<br>Default value: `320` |
-| `MAX_STREAMERS` | Maximum active streamers<br>Default value: `0` |
-| `MAX_STREAMERS_PER_IP` | Maximum active streamers from one IP address<br>Default value: `3` |
-| `MAX_LISTENERS_TOTAL` | Maximum active RTSP listeners across all streams<br>Default value: `0` |
-| `MAX_LISTENERS_PER_STREAM` | Maximum RTSP listeners on one stream URL<br>Default value: `105` |
-| `MAX_LISTENERS_PER_IP` | Maximum active RTSP listeners from one IP address<br>Default value: `6` |
+| `AVALIABLE_VIDEO_QUALITY` | Video presets in `widthxheight*fps/bitrate-kbps` format; each preset's bitrate is also its sustained ingest limit<br>Default value: <code>1280x720&#42;30/2000,<br>1280x720&#42;60/4000,<br>1920x1080&#42;30/3000,<br>1920x1080&#42;60/6000</code> |
+| `MAX_CONNECTIONS` | Maximum active streamers and RTSP listeners combined. Set to `0` to disable this limit<br>Default value: `320` |
+| `MAX_STREAMERS` | Maximum active streamers. Set to `0` to disable this limit<br>Default value: `0` |
+| `MAX_STREAMERS_PER_IP` | Maximum active streamers from one IP address. Set to `0` to disable this limit<br>Default value: `3` |
+| `MAX_LISTENERS_TOTAL` | Maximum active RTSP listeners across all streams. Set to `0` to disable this limit<br>Default value: `0` |
+| `MAX_LISTENERS_PER_STREAM` | Maximum RTSP listeners on one stream URL. Set to `0` to disable this limit<br>Default value: `105` |
+| `MAX_LISTENERS_PER_IP` | Maximum active RTSP listeners from one IP address. Set to `0` to disable this limit<br>Default value: `6` |
 | `EGRESS_KBPS_PER_LISTENER` | Per-listener value used only to estimate outgoing bandwidth in server statistics<br>Default value: `384` |
-| `MAX_HTTP_REQUESTS_PER_IP` | Maximum `/healthz`, `/stats`, and `/ingest` handshake requests from one IP per rate-limit window<br>Default value: `60` |
+| `MAX_HTTP_REQUESTS_PER_IP` | Maximum `/healthz`, `/stats`, and `/ingest` handshake requests from one IP per rate-limit window. Set to `0` to disable this limit<br>Default value: `60` |
 | `HTTP_RATE_LIMIT_WINDOW_SECS` | HTTP rate-limit window in seconds<br>Default value: `60` |
-| `MAX_RTSP_REQUESTS_PER_CONNECTION` | Maximum RTSP commands on one TCP connection, including playback setup and keepalives<br>Default value: `4096` |
+| `MAX_RTSP_REQUESTS_PER_CONNECTION` | Maximum RTSP commands on one TCP connection, including playback setup and keepalives. Set to `0` to disable this limit<br>Default value: `4096` |
 | `RTSP_HANDSHAKE_TIMEOUT_SECS` | Seconds allowed for a new RTSP connection to complete `SETUP`<br>Default value: `30` |
 | `CHANNEL_BUFFER` | Shared frame queue per stream; larger values tolerate more listener jitter but retain more media in memory<br>Default value: `128` |
 | `STREAMER_IDLE_TIMEOUT_SECS` | Disconnect a streamer after this many seconds without a WebSocket message<br>Default value: `120` |
