@@ -1,5 +1,5 @@
 import { createStreamer } from "./streamer.js?v=2r36";
-import { createUi } from "./ui.js?v=2r47";
+import { createUi } from "./ui.js?v=2r48";
 
 const assetVersion = new URL(import.meta.url).search;
 const aacWorkerUrl = new URL(`aac-worker.js${assetVersion}`, import.meta.url);

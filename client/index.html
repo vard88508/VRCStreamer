@@ -6,10 +6,10 @@
   <title>VRCStreamer - Easy low-latency streaming into VRChat</title>
   <meta name="description" content="Stream audio and video into VRChat directly from your browser. Low latency, no setup, and no extra software required.">
   <link rel="icon" href="static/logo.webp" type="image/webp">
-  <link rel="stylesheet" href="style.css?v=2r46">
-  <link rel="modulepreload" href="scripts/ui.js?v=2r47">
+  <link rel="stylesheet" href="style.css?v=2r49">
+  <link rel="modulepreload" href="scripts/ui.js?v=2r48">
   <link rel="modulepreload" href="scripts/streamer.js?v=2r36">
-  <script type="module" src="scripts/client.js?v=2r49"></script>
+  <script type="module" src="scripts/client.js?v=2r50"></script>
 </head>
 <body>
   <main>
@@ -56,13 +56,13 @@
           </div>
         </div>
         <div class="source-choice">
-          <button id="displayAudio" type="button" disabled>
+          <button id="displayAudio" class="is-browser-disabled" type="button" disabled>
             <img src="static/audio.webp" width="256" height="256" alt="">
             <span id="displayAudioLabel">Tab / Window / System Audio</span>
           </button>
         </div>
         <div id="videoChoice" class="source-choice" hidden>
-          <button id="displayVideo" type="button" disabled>
+          <button id="displayVideo" class="is-browser-disabled" type="button" disabled>
             <img src="static/video.webp" width="256" height="256" alt="">
             <span id="displayVideoLabel">Tab / Window / Display Video</span>
           </button>

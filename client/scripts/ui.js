@@ -734,7 +734,8 @@ function updateSourceControls() {
 function setMicDeviceSelectionReady(ready) {
   micDeviceSelectionReady = ready;
   micDeviceWrapEl.hidden = !ready;
-  micDeviceLabelEl.hidden = ready;
+  micDeviceLabelEl.hidden = false;
+  micDeviceLabelEl.classList.toggle("is-select-placeholder", ready);
   updateMicDeviceDisplay();
 }
 

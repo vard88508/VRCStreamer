@@ -209,7 +209,7 @@ header{
   justify-self:start;
   white-space:nowrap
 }
-.stream-panel,.first-source-selection{
+.stream-panel{
   min-height:20.9rem;
   position:relative
 }
@@ -221,7 +221,8 @@ header{
   padding-bottom:1.2rem
 }
 .first-source-selection{
-  margin:1.8rem auto 0
+  margin:1.8rem auto 0;
+  position:relative
 }
 .first-source-selection>h2,.stream-panel>h2{
   color:#3ba85e;
@@ -244,7 +245,7 @@ header{
   color:#a6b2a9;
   font-size:.72rem;
   line-height:1.35;
-  margin:2rem auto 3rem;
+  margin:2rem auto;
   max-width:28rem;
   text-align:center
 }
@@ -270,17 +271,28 @@ header{
   flex:1 1 0;
   flex-direction:column;
   gap:.2rem;
-  min-width:0
+  min-width:0;
+  position:relative
 }
 .source-choice>button{
   align-items:center;
   display:flex;
   flex-direction:column;
   gap:.5rem;
-  justify-content:center;
+  justify-content:flex-start;
   min-height:7rem;
   padding:.2rem .25rem;
   width:100%
+}
+.source-choice>button>span{
+  align-items:center;
+  display:flex;
+  justify-content:center;
+  min-height:2.3rem;
+  width:100%
+}
+.source-choice>button>span.is-select-placeholder{
+  visibility:hidden
 }
 .source-choice>button:hover>img{
   transform:scale(1.05)
@@ -316,10 +328,14 @@ header{
   direction:ltr;
 }
 .source-label-select-wrap{
+  bottom:.2rem;
   justify-content:center;
-  max-width:14rem;
+  left:.25rem;
+  max-width:none;
   min-height:2.3rem;
-  width:100%
+  position:absolute;
+  right:.25rem;
+  width:auto
 }
 .source-label-select-display{
   overflow-wrap:anywhere;
