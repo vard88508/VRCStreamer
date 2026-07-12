@@ -7,6 +7,9 @@ const textEncoder = new TextEncoder();
 const streamCodeCharset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&()*+,-./:;<=>?@[]^_{|}~";
 const storagePrefix = "vrc-audio-streamer-";
 const storageVersion = "2";
+const systemCaptureSupported = /\b(?:Chrome|Chromium|Edg|OPR)\//i.test(navigator.userAgent)
+  && !/\b(?:CriOS|EdgiOS|OPiOS)\//i.test(navigator.userAgent)
+  && typeof navigator.mediaDevices?.getDisplayMedia === "function";
 
 const storageKeys = {
   version: `${storagePrefix}storage-version`,
@@ -40,7 +43,7 @@ const config = {
   videoPlaceholderHoldMs: 15000,
   maxAudioWsBufferedBytes: 256 * 1024,
   maxVideoWsBufferedBytes: 1024 * 1024,
-  isFirefoxBased: /\b(Firefox|FxiOS|Waterfox|LibreWolf|Iceweasel)\b/i.test(navigator.userAgent),
+  systemCaptureSupported,
   patronTiers: [
     { key: "Tier4", className: "tier4" },
     { key: "Tier3", className: "tier3" },

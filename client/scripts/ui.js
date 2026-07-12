@@ -405,7 +405,7 @@ function hideStreamInfoHint() {
 }
 
 function systemCaptureDisabled() {
-  return app.config.isFirefoxBased;
+  return !app.config.systemCaptureSupported;
 }
 
 function showSystemSourceHint(kind) {
