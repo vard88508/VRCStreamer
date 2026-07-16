@@ -616,7 +616,7 @@ header{
   white-space:nowrap
 }
 .source-preview{
-  aspect-ratio:16/9;
+  aspect-ratio:var(--video-preview-aspect-ratio,16/9);
   background:#050805;
   border:1px solid color-mix(in srgb,var(--source-soft,#3ba85e) 45%,#071008);
   border-radius:5px;

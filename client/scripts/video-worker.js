@@ -92,8 +92,8 @@ function sendVideoPacket(chunk, header) {
 }
 
 function drawFrame(frame) {
-  const srcWidth = frame.displayWidth || frame.codedWidth || width;
-  const srcHeight = frame.displayHeight || frame.codedHeight || height;
+  const srcWidth = frame.displayWidth || frame.codedWidth || frame.width || width;
+  const srcHeight = frame.displayHeight || frame.codedHeight || frame.height || height;
   const scale = Math.min(width / srcWidth, height / srcHeight);
   const drawWidth = Math.max(1, Math.round(srcWidth * scale));
   const drawHeight = Math.max(1, Math.round(srcHeight * scale));
@@ -108,7 +108,7 @@ function drawFrame(frame) {
 
 function drawPlaceholder() {
   if (placeholderImage) {
-    ctx.drawImage(placeholderImage, 0, 0, width, height);
+    drawFrame(placeholderImage);
   } else {
     ctx.fillStyle = "#000";
     ctx.fillRect(0, 0, width, height);

@@ -1,8 +1,7 @@
-import { createStreamer } from "./streamer.js?v=2r37";
-import { createUi } from "./ui.js?v=2r49";
+import { createStreamer } from "./streamer.js";
+import { createUi } from "./ui.js";
 
-const assetVersion = new URL(import.meta.url).search;
-const aacWorkerUrl = new URL(`aac-worker.js${assetVersion}`, import.meta.url);
+const aacWorkerUrl = new URL("aac-worker.js", import.meta.url);
 const textEncoder = new TextEncoder();
 const streamCodeCharset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&()*+,-./:;<=>?@[]^_{|}~";
 const storagePrefix = "vrc-audio-streamer-";
@@ -731,6 +730,7 @@ function applyVideoQuality(quality) {
   config.videoBitrate = quality.bitrate;
   config.videoKeyframeInterval = quality.fps * 2;
   config.videoFramePeriodUs = Math.round(1000000 / quality.fps);
+  app.ui?.setVideoPreviewAspectRatio(quality.width, quality.height);
 }
 
 function savedVideoQuality() {

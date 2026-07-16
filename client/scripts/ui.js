@@ -985,6 +985,12 @@ function updateSourceVideoPreview(source) {
   source.previewEl.play().catch(() => {});
 }
 
+function setVideoPreviewAspectRatio(width, height) {
+  if (width > 0 && height > 0) {
+    sourcesEl.style.setProperty("--video-preview-aspect-ratio", `${width}/${height}`);
+  }
+}
+
 function createMicSourceSelect(source) {
   const wrap = document.createElement("span");
   const display = document.createElement("span");
@@ -1234,6 +1240,7 @@ function createSourceBlock(source) {
     updateMuteState,
     createSourceBlock,
     updateSourceVideoPreview,
+    setVideoPreviewAspectRatio,
     sourceDisplayName,
     activeSourceSpecs,
     updateStreamStatus

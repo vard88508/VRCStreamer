@@ -1,11 +1,10 @@
 export function createStreamer(app) {
   const config = app.config;
   const ui = app.ui;
-  const assetVersion = new URL(import.meta.url).search;
-  const audioWorkletUrl = new URL(`audio-worklet.js${assetVersion}`, import.meta.url);
-  const aacWorkerUrl = new URL(`aac-worker.js${assetVersion}`, import.meta.url);
-  const videoWorkerUrl = new URL(`video-worker.js${assetVersion}`, import.meta.url);
-  const videoPlaceholderUrl = new URL(`static/live-placeholder-1080.webp${assetVersion}`, location.href).href;
+  const audioWorkletUrl = new URL("audio-worklet.js", import.meta.url);
+  const aacWorkerUrl = new URL("aac-worker.js", import.meta.url);
+  const videoWorkerUrl = new URL("video-worker.js", import.meta.url);
+  const videoPlaceholderUrl = new URL("static/live-placeholder-1080.webp", location.href).href;
   const maxAudioSwapBufferBlocks = 32;
   const audioSwapFlushTimeoutMs = 2000;
 
