@@ -342,7 +342,7 @@ async fn handle_rtsp_request(
                 "200 OK",
                 cseq,
                 &[
-                    ("Range", "npt=0.000-"),
+                    ("Range", "npt=now-"),
                     ("RTP-Info", rtp_info.as_str()),
                     ("Session", session.id.as_deref().unwrap_or("1")),
                 ],
@@ -683,6 +683,14 @@ async fn rtsp_video_rtp_task(task: RtspVideoTask) {
                     if channel_video_state(&stream) != VideoStreamState::Video {
                         continue;
                     }
+                    if last_state != Some(VideoStreamState::Video) {
+                        seen_keyframe = false;
+                        last_state = Some(VideoStreamState::Video);
+                        timestamps.reset();
+                        if !keyframe {
+                            request_video_keyframe(&stream);
+                        }
+                    }
                     if keyframe {
                         seen_keyframe = true;
                     }
@@ -1002,15 +1010,14 @@ impl RtpPacketWriter {
         }
 
         self.packet.clear();
-        self.packet.push(b'$');
-        self.packet.push(self.channel);
-        self.packet
-            .extend_from_slice(&(packet_len as u16).to_be_bytes());
-        self.packet.push(0x80);
-        self.packet.push(RTP_AUDIO_PAYLOAD_TYPE);
-        self.packet.extend_from_slice(&rtp.sequence.to_be_bytes());
-        self.packet.extend_from_slice(&rtp.timestamp.to_be_bytes());
-        self.packet.extend_from_slice(&RTP_AUDIO_SSRC.to_be_bytes());
+        self.push_rtp_interleaved_header(
+            4 + access_unit.len(),
+            RTP_AUDIO_PAYLOAD_TYPE,
+            true,
+            rtp.sequence,
+            rtp.timestamp,
+            RTP_AUDIO_SSRC,
+        );
         self.packet.extend_from_slice(&16u16.to_be_bytes());
 
         let au_size = access_unit.len() as u16;
@@ -1211,6 +1218,8 @@ pub(crate) fn rtsp_sdp(video_fmtp: &str) -> String {
          s= \r\n\
          c=IN IP4 0.0.0.0\r\n\
          t=0 0\r\n\
+         a=range:npt=now-\r\n\
+         a=control:*\r\n\
          m=audio 0 RTP/AVP {RTP_AUDIO_PAYLOAD_TYPE}\r\n\
          a=control:trackID=0\r\n\
          a=rtpmap:{RTP_AUDIO_PAYLOAD_TYPE} mpeg4-generic/{AAC_SAMPLE_RATE}/{AAC_CHANNELS}\r\n\

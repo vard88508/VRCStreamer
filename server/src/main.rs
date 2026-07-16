@@ -207,9 +207,8 @@ struct Placeholders {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("warn".parse()?))
-        .init();
+    let log_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    fmt().with_env_filter(log_filter).init();
 
     let config = match Config::from_env() {
         Ok(config) => config,

@@ -677,9 +677,11 @@ fn rtcp_sender_report_contains_counts_and_cname() {
 }
 
 #[test]
-fn rtsp_sdp_matches_topaz_audio_shape() {
+fn rtsp_sdp_describes_live_aggregate_session() {
     let sdp = rtsp_sdp(TEST_VIDEO_FMTP);
 
+    assert!(sdp.contains("a=range:npt=now-\r\n"));
+    assert!(sdp.contains("a=control:*\r\n"));
     assert!(sdp.contains("m=audio 0 RTP/AVP 96\r\n"));
     assert!(sdp.contains("a=control:trackID=0\r\n"));
     assert!(sdp.contains("a=rtpmap:96 mpeg4-generic/48000/2\r\n"));
