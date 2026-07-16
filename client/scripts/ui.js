@@ -719,13 +719,18 @@ function updateSourceControls() {
   displayVideoBtn.classList.toggle("is-browser-disabled", systemDisabled);
   displayAudioBtn.setAttribute("aria-disabled", String(systemDisabled));
   displayVideoBtn.setAttribute("aria-disabled", String(systemDisabled));
-  micDeviceEl.disabled = app.sourceRequestInFlight || !micDeviceSelectionReady || !serverReady;
-  encoderModeWrapEl.hidden = !streaming || !hasAudioSource;
+    micDeviceEl.disabled = app.sourceRequestInFlight || !micDeviceSelectionReady || !serverReady;
+    encoderModeEl.disabled = !streaming
+      || !hasAudioSource
+      || app.sourceRequestInFlight
+      || app.linkRestartInFlight
+      || app.encoderSwapInFlight;
+    encoderModeWrapEl.hidden = !streaming || !hasAudioSource;
   videoQualityWrapEl.hidden = !streaming
     || !videoEnabled
     || !app.active.sources.video
     || videoQualityEl.options.length === 0;
-  newLinkBtn.disabled = app.linkRestartInFlight;
+    newLinkBtn.disabled = app.linkRestartInFlight || app.encoderSwapInFlight;
   stopBtn.disabled = !streaming;
   updateStartTitle();
   renderAddSourceButtons();

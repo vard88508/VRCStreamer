@@ -6,6 +6,7 @@ let channels = 2;
 let bitrate = 320000;
 let expectedAacConfigHex = "1190";
 let nativeAacBitrates = [320000, 256000, 192000, 160000, 128000, 96000];
+let rtpTimestampBase = 0;
 
 let nativeEncoder = null;
 let nativeNextSample = 0;
@@ -206,7 +207,9 @@ async function initNative() {
       const description = metadata && metadata.decoderConfig && metadata.decoderConfig.description;
       if (description) configHex = bytesToHex(new Uint8Array(description));
 
-      const rtpTimestamp = Math.round(chunk.timestamp * sampleRate / 1000000) >>> 0;
+      const rtpTimestamp = (
+        rtpTimestampBase + Math.round(chunk.timestamp * sampleRate / 1000000)
+      ) >>> 0;
       const packet = createMediaPacket(chunk.byteLength, rtpTimestamp);
       chunk.copyTo(packet.subarray(MEDIA_FRAME_HEADER_BYTES));
       try {
@@ -286,7 +289,7 @@ function drainWasmPackets() {
     const pts = Number(getEncodedPtsFn(ctx));
     if (pts < 0) continue;
 
-    const packet = createMediaPacket(size, pts >>> 0);
+    const packet = createMediaPacket(size, (rtpTimestampBase + pts) >>> 0);
     packet.set(module.HEAPU8.subarray(ptr, ptr + size), MEDIA_FRAME_HEADER_BYTES);
     self.postMessage(
       { type: "packet", packet: packet.buffer, bytes: size },
@@ -356,6 +359,13 @@ function close() {
   mode = "";
   closeNative();
   closeWasm();
+  rtpTimestampBase = 0;
+}
+
+async function flush() {
+  if (mode === "native" && nativeEncoder) await nativeEncoder.flush();
+  else if (mode === "wasm") drainWasmPackets();
+  self.postMessage({ type: "flushed" });
 }
 
 async function init(message) {
@@ -365,6 +375,7 @@ async function init(message) {
   bitrate = message.bitrate;
   expectedAacConfigHex = message.expectedAacConfigHex || expectedAacConfigHex;
   nativeAacBitrates = message.nativeAacBitrates || nativeAacBitrates;
+  rtpTimestampBase = Number(message.rtpTimestampBase) >>> 0;
 
   if (message.preferNative === false) {
     await initWasm("");
@@ -393,6 +404,8 @@ self.onmessage = event => {
     .then(async () => {
       if (message.type === "init") await init(message);
       else if (message.type === "encode") encode(message.pcm);
+      else if (message.type === "timestamp") rtpTimestampBase = Number(message.value) >>> 0;
+      else if (message.type === "flush") await flush();
       else if (message.type === "close") close();
     })
     .catch(error => {

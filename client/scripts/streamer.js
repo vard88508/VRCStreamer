@@ -6,6 +6,8 @@ export function createStreamer(app) {
   const aacWorkerUrl = new URL(`aac-worker.js${assetVersion}`, import.meta.url);
   const videoWorkerUrl = new URL(`video-worker.js${assetVersion}`, import.meta.url);
   const videoPlaceholderUrl = new URL(`static/live-placeholder-1080.webp${assetVersion}`, location.href).href;
+  const maxAudioSwapBufferBlocks = 32;
+  const audioSwapFlushTimeoutMs = 2000;
 
 async function requestScreenWakeLock() {
   if (!("wakeLock" in navigator)) return null;
@@ -169,10 +171,14 @@ async function createCaptureNode(audioContext, onBlock) {
   return node;
 }
 
-function createAacEncoder(onPacket, onError) {
+function createAacEncoder(encoderMode, onPacket, onError) {
   const worker = new Worker(aacWorkerUrl, { type: "module" });
-  const encoderMode = app.selectedEncoderMode();
+  let closed = false;
   let readySettled = false;
+  let rejectReady = null;
+  let flushPromise = null;
+  let resolveFlush = null;
+  let rejectFlush = null;
   let pcmBlocks = 0;
   let encodedFrames = 0;
   let encodedBytes = 0;
@@ -185,7 +191,19 @@ function createAacEncoder(onPacket, onError) {
   let detail = "";
   let fallbackReason = "";
 
+  function settleFlush(error = null) {
+    if (error) {
+      if (rejectFlush) rejectFlush(error);
+    } else if (resolveFlush) {
+      resolveFlush();
+    }
+    flushPromise = null;
+    resolveFlush = null;
+    rejectFlush = null;
+  }
+
   const ready = new Promise((resolve, reject) => {
+    rejectReady = reject;
     worker.onmessage = event => {
       const message = event.data;
       if (message.type === "ready") {
@@ -198,12 +216,15 @@ function createAacEncoder(onPacket, onError) {
         encodedFrames++;
         encodedBytes += message.bytes;
         onPacket(message.packet);
+      } else if (message.type === "flushed") {
+        settleFlush();
       } else if (message.type === "error") {
         const error = new Error(message.message || "AAC worker failed.");
         if (!readySettled) {
           readySettled = true;
           reject(error);
         }
+        settleFlush(error);
         onError(error);
       }
     };
@@ -213,6 +234,7 @@ function createAacEncoder(onPacket, onError) {
         readySettled = true;
         reject(error);
       }
+      settleFlush(error);
       onError(error);
     };
     worker.postMessage({
@@ -223,19 +245,42 @@ function createAacEncoder(onPacket, onError) {
       expectedAacConfigHex: config.expectedAacConfigHex,
       nativeAacBitrates: encoderMode.nativeAacBitrates,
       preferNative: encoderMode.preferNative,
-      allowWasmFallback: encoderMode.allowWasmFallback
+      allowWasmFallback: encoderMode.allowWasmFallback,
+      rtpTimestampBase: 0
     });
   });
 
   return {
     ready,
     encode(buffer) {
+      if (closed) return;
       pcmBlocks++;
       worker.postMessage({ type: "encode", pcm: buffer }, [buffer]);
     },
     close() {
+      if (closed) return;
+      closed = true;
+      const error = new Error("AAC encoder closed.");
+      if (!readySettled) {
+        readySettled = true;
+        rejectReady(error);
+      }
+      settleFlush(error);
       try { worker.postMessage({ type: "close" }); } catch (_) {}
       worker.terminate();
+    },
+    flush() {
+      if (closed) return Promise.reject(new Error("AAC encoder is closed."));
+      if (flushPromise) return flushPromise;
+      flushPromise = new Promise((resolve, reject) => {
+        resolveFlush = resolve;
+        rejectFlush = reject;
+        worker.postMessage({ type: "flush" });
+      });
+      return flushPromise;
+    },
+    setTimestamp(value) {
+      if (!closed) worker.postMessage({ type: "timestamp", value: value >>> 0 });
     },
     lagFrames() {
       return pcmBlocks - encodedFrames;
@@ -263,6 +308,137 @@ function createAacEncoder(onPacket, onError) {
       };
     }
   };
+}
+
+function sendAudioPacket(session, encoder, packet) {
+  if (!session
+      || app.active !== session
+      || session.encoder !== encoder
+      || session.ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  if (session.ws.bufferedAmount > config.maxAudioWsBufferedBytes) {
+    failActive();
+    return;
+  }
+  session.ws.send(packet);
+  session.nextAudioTimestamp = (
+    session.nextAudioTimestamp + config.framesPerChunk
+  ) >>> 0;
+}
+
+function handleAacEncoderError(session, encoder, error) {
+  if (!session || app.active !== session) return;
+  if (session.encoder === encoder) {
+    failActive();
+    return;
+  }
+  const swap = session.audioEncoderSwap;
+  if (!swap || swap.encoder !== encoder) return;
+  if (swap.draining) {
+    failActive();
+    return;
+  }
+  session.audioEncoderSwap = null;
+  encoder.close();
+  swap.reject(error);
+}
+
+function encodeAudioBlock(session, buffer) {
+  if (!session || app.active !== session) return;
+  const swap = session.audioEncoderSwap;
+  if (swap) {
+    if (swap.buffers.length >= maxAudioSwapBufferBlocks) {
+      failActive();
+      return;
+    }
+    swap.buffers.push(buffer);
+    if (!swap.draining) {
+      swap.draining = true;
+      completeAudioEncoderSwap(session, swap);
+    }
+    return;
+  }
+
+  const encoder = session.encoder;
+  if (encoder.lagFrames() > 128) {
+    failActive();
+    return;
+  }
+  encoder.encode(buffer);
+}
+
+async function completeAudioEncoderSwap(session, swap) {
+  const previous = session.encoder;
+  try {
+    await withTimeout(
+      previous.flush(),
+      audioSwapFlushTimeoutMs,
+      "AAC encoder flush timeout"
+    );
+    if (app.active !== session || session.audioEncoderSwap !== swap) {
+      throw new Error("AAC encoder swap cancelled.");
+    }
+
+    swap.encoder.setTimestamp(session.nextAudioTimestamp);
+    session.encoder = swap.encoder;
+    session.encoderModeKey = swap.modeKey;
+    session.audioEncoderSwap = null;
+    previous.close();
+    for (const buffer of swap.buffers) session.encoder.encode(buffer);
+    swap.buffers.length = 0;
+    swap.resolve(swap.info);
+  } catch (error) {
+    swap.encoder.close();
+    swap.reject(error);
+    if (app.active === session) failActive();
+  }
+}
+
+async function replaceAudioEncoder() {
+  const session = app.active;
+  if (!session) return null;
+  const modeKey = app.selectedEncoderModeKey();
+  if (modeKey === session.encoderModeKey) return session.encoder.stats();
+  if (session.preparingAudioEncoder || session.audioEncoderSwap) {
+    throw new Error("AAC encoder swap is already running.");
+  }
+
+  let nextEncoder = null;
+  const mode = app.selectedEncoderMode();
+  nextEncoder = createAacEncoder(
+    mode,
+    packet => sendAudioPacket(session, nextEncoder, packet),
+    error => handleAacEncoderError(session, nextEncoder, error)
+  );
+  session.preparingAudioEncoder = nextEncoder;
+
+  let info;
+  try {
+    info = await withTimeout(nextEncoder.ready, 10000, "AAC encoder initialization timeout");
+  } catch (error) {
+    nextEncoder.close();
+    throw error;
+  } finally {
+    if (session.preparingAudioEncoder === nextEncoder) session.preparingAudioEncoder = null;
+  }
+
+  if (app.active !== session) {
+    nextEncoder.close();
+    throw new Error("AAC encoder swap cancelled.");
+  }
+
+  return await new Promise((resolve, reject) => {
+    session.audioEncoderSwap = {
+      encoder: nextEncoder,
+      modeKey,
+      info,
+      buffers: [],
+      draining: false,
+      resolve,
+      reject
+    };
+  });
 }
 
 function createVideoWorker(ws, onError) {
@@ -857,6 +1033,7 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
   let audioContext = null;
   let ws = null;
   let encoder = null;
+  let session = null;
   let pendingStreamListeners = 0;
   let pendingVideoKeyframe = false;
   let resolveHello = null;
@@ -871,17 +1048,9 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
     }
 
     encoder = createAacEncoder(
-      packet => {
-        if (!app.active || app.active.encoder !== encoder || ws.readyState !== WebSocket.OPEN) return;
-        if (ws.bufferedAmount > config.maxAudioWsBufferedBytes) {
-          failActive();
-          return;
-        }
-        ws.send(packet);
-      },
-      () => {
-        if (app.active && app.active.encoder === encoder) failActive();
-      }
+      app.selectedEncoderMode(),
+      packet => sendAudioPacket(session, encoder, packet),
+      error => handleAacEncoderError(session, encoder, error)
     );
     let encoderReadyError = null;
     const encoderReady = encoder.ready.catch(error => {
@@ -929,12 +1098,7 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
     }
 
     const captureNode = await createCaptureNode(audioContext, buffer => {
-      if (!app.active || app.active.encoder !== encoder) return;
-      if (encoder.lagFrames() > 128) {
-        failActive();
-        return;
-      }
-      encoder.encode(buffer);
+      encodeAudioBlock(session, buffer);
     });
     const mixer = audioContext.createGain();
     mixer.channelCount = config.channels;
@@ -945,10 +1109,14 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
     const wakeLock = await requestScreenWakeLock();
     setMediaSessionPlaying(true);
 
-    app.active = {
+    session = {
       audioContext,
       ws,
       encoder,
+      encoderModeKey: app.selectedEncoderModeKey(),
+      nextAudioTimestamp: 0,
+      preparingAudioEncoder: null,
+      audioEncoderSwap: null,
       video: null,
       mixer,
       captureNode,
@@ -958,6 +1126,7 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
       sources: { mic: null, screen: null, video: null },
       streamListeners: pendingStreamListeners
     };
+    app.active = session;
 
     if (kind === "video") {
       await installVideoSource(mediaStream, settings);
@@ -987,8 +1156,9 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
 
     ui.updateStreamStatus(encoderInfo);
     app.active.statsTimer = setInterval(() => {
-      if (!app.active || app.active.ws !== ws) return;
-      ui.updateStreamStatus(encoder.stats());
+      const current = app.active;
+      if (!current || current.ws !== ws) return;
+      ui.updateStreamStatus(current.encoder.stats());
     }, 1000);
   } catch (error) {
     console.error("Stream start failed:", error);
@@ -1069,6 +1239,13 @@ function cleanup({ stopStreams = true, updateControls = true } = {}) {
   if (!current) return;
 
   if (current.statsTimer) clearInterval(current.statsTimer);
+  if (current.preparingAudioEncoder) current.preparingAudioEncoder.close();
+  if (current.audioEncoderSwap) {
+    const swap = current.audioEncoderSwap;
+    current.audioEncoderSwap = null;
+    swap.encoder.close();
+    swap.reject(new Error("AAC encoder swap cancelled."));
+  }
   try { current.captureNode.disconnect(); } catch (_) {}
   try { current.mixer.disconnect(); } catch (_) {}
   try { current.monitor.disconnect(); } catch (_) {}
@@ -1123,6 +1300,7 @@ function cleanup({ stopStreams = true, updateControls = true } = {}) {
     start,
     stop,
     forceResync,
+    replaceAudioEncoder,
     setVideoQuality,
     refreshScreenWakeLock,
     addOrReplaceSource,

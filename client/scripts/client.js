@@ -1,5 +1,5 @@
-import { createStreamer } from "./streamer.js?v=2r36";
-import { createUi } from "./ui.js?v=2r48";
+import { createStreamer } from "./streamer.js?v=2r37";
+import { createUi } from "./ui.js?v=2r49";
 
 const assetVersion = new URL(import.meta.url).search;
 const aacWorkerUrl = new URL(`aac-worker.js${assetVersion}`, import.meta.url);
@@ -112,6 +112,7 @@ let videoQualities = [];
 let nativeAacAvailable = true;
 let sourceRequestInFlight = false;
 let linkRestartInFlight = false;
+let encoderSwapInFlight = false;
 let customConnectRequested = false;
 let serverOnline = false;
 let streamUrlRequestSeq = 0;
@@ -132,11 +133,13 @@ const app = {
   get sourceRequestInFlight() { return sourceRequestInFlight; },
   set sourceRequestInFlight(value) { sourceRequestInFlight = Boolean(value); },
   get linkRestartInFlight() { return linkRestartInFlight; },
+  get encoderSwapInFlight() { return encoderSwapInFlight; },
   readStorage,
   writeStorage,
   readJsonStorage,
   writeJsonStorage,
   selectedEncoderMode,
+  selectedEncoderModeKey,
   selectedVideoQuality,
   applyVideoQuality,
   selectedServer,
@@ -689,6 +692,10 @@ function selectedEncoderMode() {
   return encoderModes[ui.els.encoderModeEl.value] || encoderModes.native192;
 }
 
+function selectedEncoderModeKey() {
+  return ui.els.encoderModeEl.value;
+}
+
 function normalizeVideoQuality(value, index) {
   const match = typeof value === "string"
     ? value.trim().match(/^(\d+)x(\d+)\*(\d+)\/(\d+)$/i)
@@ -892,7 +899,7 @@ async function copyUrl() {
 }
 
 async function newLink() {
-  if (sourceRequestInFlight || linkRestartInFlight) return;
+  if (sourceRequestInFlight || linkRestartInFlight || encoderSwapInFlight) return;
   linkRestartInFlight = true;
   ui.updateSourceControls();
   try {
@@ -963,15 +970,33 @@ function bindEvents() {
     ui.updateSourceControls();
   });
 
-  els.encoderModeEl.onchange = () => {
+  els.encoderModeEl.onchange = async () => {
+    const session = active;
+    const previousMode = session && session.encoderModeKey;
     writeStorage(storageKeys.encoderMode, els.encoderModeEl.value);
-    if (!active || sourceRequestInFlight || linkRestartInFlight) return;
-    linkRestartInFlight = true;
+    if (!session) return;
+    if (sourceRequestInFlight || linkRestartInFlight || encoderSwapInFlight) {
+      els.encoderModeEl.value = previousMode;
+      writeStorage(storageKeys.encoderMode, previousMode);
+      ui.updateSelectDisplay(els.encoderModeEl);
+      return;
+    }
+    encoderSwapInFlight = true;
     ui.updateSourceControls();
-    streamer.restartActiveWithCurrentSources().finally(() => {
-      linkRestartInFlight = false;
+    try {
+      const info = await streamer.replaceAudioEncoder();
+      if (active === session && info) ui.updateStreamStatus(info);
+    } catch (error) {
+      console.error("AAC encoder swap failed:", error);
+      if (active === session) {
+        els.encoderModeEl.value = session.encoderModeKey;
+        writeStorage(storageKeys.encoderMode, session.encoderModeKey);
+        ui.updateSelectDisplay(els.encoderModeEl);
+      }
+    } finally {
+      encoderSwapInFlight = false;
       ui.updateSourceControls();
-    });
+    }
   };
 
   els.videoQualityEl.onchange = async () => {
