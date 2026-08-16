@@ -195,6 +195,9 @@ header{
   text-align:center;
   white-space:pre-wrap
 }
+.motd a{
+  color:inherit
+}
 [hidden]{
   display:none!important
 }

@@ -50,6 +50,7 @@ const reportAbuseSeparatorEl = $("reportAbuseSeparator");
 const reportAbuseLinkEl = $("reportAbuseLink");
 const languageSelectEl = $("languageSelect");
 const languageSelectDisplayEl = $("languageSelectDisplay");
+const motdLinkPattern = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/gi;
 
 let currentLanguage = "en";
 let languageOptions = { en: "English" };
@@ -252,8 +253,27 @@ function localizedMotdText(motd) {
 
 function renderMotd() {
   const text = localizedMotdText(motdPayload);
-  motdEl.textContent = text;
   motdEl.hidden = !text;
+  if (!text) {
+    motdEl.textContent = "";
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  let offset = 0;
+  motdLinkPattern.lastIndex = 0;
+  for (let match; (match = motdLinkPattern.exec(text));) {
+    fragment.append(text.slice(offset, match.index));
+    const link = document.createElement("a");
+    link.href = match[2];
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = match[1];
+    fragment.append(link);
+    offset = motdLinkPattern.lastIndex;
+  }
+  fragment.append(text.slice(offset));
+  motdEl.replaceChildren(fragment);
 }
 
 function setMotdPayload(payload) {
