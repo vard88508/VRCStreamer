@@ -111,6 +111,8 @@ impl VideoQuality {
 struct Config {
     server_name: String,
     server_description: String,
+    policies_link: Option<String>,
+    report_abuse_link: Option<String>,
     redirect_url: HeaderValue,
     bind_addr: SocketAddr,
     rtsp_bind_addr: SocketAddr,
@@ -336,6 +338,8 @@ impl Config {
             server_name: env::var("SERVER_NAME")
                 .unwrap_or_else(|_| "Self-Hosted Instance".to_owned()),
             server_description: env::var("SERVER_DESCRIPTION").unwrap_or_default(),
+            policies_link: env_optional_http_url("POLICIES_LINK")?,
+            report_abuse_link: env_optional_http_url("REPORT_ABUSE_LINK")?,
             redirect_url: parse_redirect_url(
                 &env::var("ROOT_REDIRECT_URL")
                     .unwrap_or_else(|_| "https://stream.vard.cc".to_owned()),
@@ -456,6 +460,10 @@ async fn healthz(
 struct StatsResponse<'a> {
     name: &'a str,
     description: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policies_link: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    report_abuse_link: Option<&'a str>,
     rtsp_base: String,
     video: bool,
     active_connections: usize,
@@ -489,6 +497,8 @@ async fn stats(
     let mut response = axum::Json(StatsResponse {
         name: &state.config.server_name,
         description: &state.config.server_description,
+        policies_link: state.config.policies_link.as_deref(),
+        report_abuse_link: state.config.report_abuse_link.as_deref(),
         rtsp_base: public_rtsp_base(&state.config, &headers),
         video: state.config.video_enabled,
         active_connections: active_streamers.saturating_add(active_listeners),
@@ -736,6 +746,8 @@ fn streamer_hello_message(config: &Config, listeners: usize, rtsp_base: &str) ->
     let mut out = String::with_capacity(
         136 + config.server_name.len()
             + config.server_description.len()
+            + config.policies_link.as_ref().map_or(0, String::len)
+            + config.report_abuse_link.as_ref().map_or(0, String::len)
             + rtsp_base.len()
             + config.video_qualities.len() * 24,
     );
@@ -743,6 +755,14 @@ fn streamer_hello_message(config: &Config, listeners: usize, rtsp_base: &str) ->
     push_json_string(&mut out, &config.server_name);
     out.push_str(",\"description\":");
     push_json_string(&mut out, &config.server_description);
+    if let Some(link) = &config.policies_link {
+        out.push_str(",\"policies_link\":");
+        push_json_string(&mut out, link);
+    }
+    if let Some(link) = &config.report_abuse_link {
+        out.push_str(",\"report_abuse_link\":");
+        push_json_string(&mut out, link);
+    }
     out.push_str(",\"rtsp_base\":");
     push_json_string(&mut out, rtsp_base);
     out.push_str(",\"video\":");
@@ -937,6 +957,23 @@ fn parse_redirect_url(value: &str) -> Result<HeaderValue, Box<dyn std::error::Er
         return Err("ROOT_REDIRECT_URL must be an absolute HTTP or HTTPS URL".into());
     }
     Ok(value.parse()?)
+}
+
+fn env_optional_http_url(key: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Ok(value) = env::var(key) else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    let uri: Uri = value.parse()?;
+    if !matches!(uri.scheme_str(), Some(scheme) if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        || uri.authority().is_none()
+    {
+        return Err(format!("{key} must be an absolute HTTP or HTTPS URL").into());
+    }
+    Ok(Some(value.to_owned()))
 }
 
 fn normalize_public_base(value: &str, default_scheme: &str) -> Option<String> {

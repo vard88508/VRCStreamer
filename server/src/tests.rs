@@ -22,6 +22,8 @@ fn test_config() -> Config {
     Config {
         server_name: "VRCStreamer".to_owned(),
         server_description: "Test server".to_owned(),
+        policies_link: None,
+        report_abuse_link: None,
         redirect_url: HeaderValue::from_static("https://stream.vard.cc"),
         bind_addr: "127.0.0.1:8080".parse().unwrap(),
         rtsp_bind_addr: "127.0.0.1:8554".parse().unwrap(),
@@ -299,6 +301,17 @@ fn streamer_hello_message_escapes_json_strings() {
         streamer_hello_message(&config, 7, "rtspt://example.com"),
         "{\"type\":\"hello\",\"name\":\"Name \\\"A\\\"\",\"description\":\"Line\\nTwo\",\"rtsp_base\":\"rtspt://example.com\",\"video\":true,\"video_qualities\":[\"1280x720*30/2000\",\"1280x720*60/4000\",\"1920x1080*30/3000\",\"1920x1080*60/6000\"],\"listeners\":7}"
     );
+}
+
+#[test]
+fn streamer_hello_message_includes_optional_links() {
+    let mut config = test_config();
+    config.policies_link = Some("https://example.com/policies".to_owned());
+    config.report_abuse_link = Some("https://example.com/report-abuse".to_owned());
+
+    let message = streamer_hello_message(&config, 0, "rtspt://example.com");
+    assert!(message.contains("\"policies_link\":\"https://example.com/policies\""));
+    assert!(message.contains("\"report_abuse_link\":\"https://example.com/report-abuse\""));
 }
 
 #[test]

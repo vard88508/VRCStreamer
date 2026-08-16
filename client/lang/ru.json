@@ -14,6 +14,8 @@
   "streamUrlPasteHint": "Вставь эту ссылку в видеоплеер",
   "footerSourceCodeLink": "Исходный код",
   "footerReportBugLink": "Зарепортить баг",
+  "footerPoliciesLink": "Правила",
+  "footerReportAbuseLink": "Репорт",
   "serverStatusLoading": "Загрузка",
   "serverStatusOffline": "Не в сети",
   "serverStatusOnline": "В сети",

@@ -44,6 +44,10 @@ const displayAudioBtn = $("displayAudio");
 const stopBtn = $("stop");
 const sourceCodeLinkEl = $("sourceCodeLink");
 const reportBugLinkEl = $("reportBugLink");
+const policiesSeparatorEl = $("policiesSeparator");
+const policiesLinkEl = $("policiesLink");
+const reportAbuseSeparatorEl = $("reportAbuseSeparator");
+const reportAbuseLinkEl = $("reportAbuseLink");
 const languageSelectEl = $("languageSelect");
 const languageSelectDisplayEl = $("languageSelectDisplay");
 
@@ -338,6 +342,8 @@ function applyLanguage() {
   customPasswordEl.placeholder = tr("customServerPasswordPlaceholder");
   setElementText(sourceCodeLinkEl, "footerSourceCodeLink");
   setElementText(reportBugLinkEl, "footerReportBugLink");
+  setElementText(policiesLinkEl, "footerPoliciesLink");
+  setElementText(reportAbuseLinkEl, "footerReportAbuseLink");
   micDeviceLabelEl.textContent = micDeviceStartLabel();
   updateMicDeviceDisplay();
   updateActiveSourceLabels();
@@ -1180,6 +1186,18 @@ function createSourceBlock(source) {
     updateNativeEncoderOption();
   }
 
+  function setServerLinks(policiesLink, reportAbuseLink) {
+    for (const [link, separator, url] of [
+      [policiesLinkEl, policiesSeparatorEl, policiesLink],
+      [reportAbuseLinkEl, reportAbuseSeparatorEl, reportAbuseLink]
+    ]) {
+      const visible = Boolean(url);
+      link.hidden = separator.hidden = !visible;
+      if (visible) link.href = url;
+      else link.removeAttribute("href");
+    }
+  }
+
   function resetCopiedHint() {
     clearTimeout(rtspHintResetTimer);
     rtspHintResetTimer = setTimeout(() => setRtspHint(tr("streamUrlCopyHint")), 900);
@@ -1204,6 +1222,7 @@ function createSourceBlock(source) {
     },
     loadTranslations,
     setNativeAacAvailable,
+    setServerLinks,
     setVideoQualities,
     setMotdPayload,
     setPatronsPayload,

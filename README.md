@@ -91,6 +91,8 @@ The values below match `.env.example` and the server's built-in defaults.
 | --- | --- |
 | `SERVER_NAME` | Server name shown by the web client<br>Default value: `Self-Hosted Instance` |
 | `SERVER_DESCRIPTION` | Optional server description sent to the web client<br>Default value: empty |
+| `POLICIES_LINK` | Optional policies page<br>Default value: empty |
+| `REPORT_ABUSE_LINK` | Optional abuse report page<br>Default value: empty |
 | `ROOT_REDIRECT_URL` | Destination for visitors who open the API root `/` in a browser<br>Default value: `https://stream.vard.cc` |
 | `BIND_ADDR` | Address and port used by the HTTP/HTTPS API and streamer WebSocket<br>Default value: `0.0.0.0:443` |
 | `TLS_CERT_PATH` | Path to the PEM certificate; set both TLS paths to `none` to disable TLS<br>Default value: `/etc/letsencrypt/live/example.com/fullchain.pem` |

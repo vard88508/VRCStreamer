@@ -14,6 +14,8 @@
   "streamUrlPasteHint": "Paste this link into video player",
   "footerSourceCodeLink": "Source Code",
   "footerReportBugLink": "Report a bug",
+  "footerPoliciesLink": "Policies",
+  "footerReportAbuseLink": "Report Abuse",
   "serverStatusLoading": "Loading",
   "serverStatusOffline": "Offline",
   "serverStatusOnline": "Online",

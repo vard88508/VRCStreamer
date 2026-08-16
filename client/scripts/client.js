@@ -290,6 +290,15 @@ function safeRtspBaseForServer(server, value) {
   return !isLoopbackBase(server.apiBase, "https://") && isLoopbackBase(base, "rtspt://") ? "" : base;
 }
 
+function safeHttpUrl(value) {
+  try {
+    const url = new URL(String(value || "").trim());
+    return url.protocol === "http:" || url.protocol === "https:" ? url.href : "";
+  } catch (_) {
+    return "";
+  }
+}
+
 function sameServer(left, right) {
   return normalizeBase(left.apiBase, "https://") === normalizeBase(right.apiBase, "https://");
 }
@@ -305,6 +314,8 @@ function normalizeServerMeta(meta) {
     name: String(meta.name || "").trim(),
     description: String(meta.description || "").trim(),
     rtspBase: String(meta.rtspBase || meta.rtsp_base || "").trim(),
+    policiesLink: safeHttpUrl(meta.policiesLink || meta.policies_link),
+    reportAbuseLink: safeHttpUrl(meta.reportAbuseLink || meta.report_abuse_link),
     video: Boolean(meta.video)
   };
 }
@@ -315,7 +326,9 @@ function loadServerMetaCache() {
   if (!saved || typeof saved !== "object" || Array.isArray(saved)) return;
   for (const [key, value] of Object.entries(saved)) {
     const meta = normalizeServerMeta(value);
-    if (meta && (meta.name || meta.description || meta.rtspBase || meta.video)) serverMetaCache[key] = meta;
+    if (meta && (meta.name || meta.description || meta.rtspBase || meta.policiesLink || meta.reportAbuseLink || meta.video)) {
+      serverMetaCache[key] = meta;
+    }
   }
 }
 
@@ -512,6 +525,7 @@ function canRequestSelectedServer() {
 
 function setServerStatus(state, streams = 0, listeners = 0) {
   serverOnline = state === "online";
+  if (!serverOnline) ui.setServerLinks("", "");
   ui.setServerStatus(state, streams, listeners);
   ui.updateSourceControls();
 }
@@ -542,12 +556,15 @@ function applyServerInfo(info, targetKey = currentServerKey()) {
     name: typeof info.name === "string" ? info.name.trim() || previous.name || "" : previous.name || "",
     description: typeof info.description === "string" ? info.description.trim() : previous.description || "",
     rtspBase: safeRtspBaseForServer(selected, rawRtspBase) || safeRtspBaseForServer(selected, previous.rtspBase || ""),
+    policiesLink: safeHttpUrl(info.policies_link || info.policiesLink),
+    reportAbuseLink: safeHttpUrl(info.report_abuse_link || info.reportAbuseLink),
     video: Boolean(info.video)
   };
 
   serverInfo = { key: targetKey, ...meta };
   serverMetaCache[targetKey] = meta;
   saveServerMetaCache();
+  ui.setServerLinks(meta.policiesLink, meta.reportAbuseLink);
 
   if (ui.els.serverSelectEl.value !== "custom") {
     const index = Number(ui.els.serverSelectEl.value);
