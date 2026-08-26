@@ -6,8 +6,6 @@ const BITRATE_HEADROOM = 0.9;
 const MIN_QUANTIZER = 20;
 const MAX_QUANTIZER = 51;
 const INITIAL_QUANTIZER = 51;
-const QUANTIZER_RATE_CONTROL = "quantizer";
-const CONSTANT_RATE_CONTROL = "constant";
 
 let encoder = null;
 let canvas = null;
@@ -27,7 +25,6 @@ let width = 1280;
 let height = 720;
 let fps = 30;
 let bitrateLimit = 2000000;
-let rateControlMode = QUANTIZER_RATE_CONTROL;
 let quantizer = INITIAL_QUANTIZER;
 let keyframeInterval = 60;
 let framePeriodMs = 1000 / 30;
@@ -202,10 +199,7 @@ function submitFrame(source, repeated = false) {
   try {
     const keyFrame = forceNextKeyframe
       || timestamp - lastKeyframeTimestampUs >= keyframeInterval * framePeriodUs;
-    const options = rateControlMode === QUANTIZER_RATE_CONTROL
-      ? { keyFrame, avc: { quantizer } }
-      : { keyFrame };
-    encoder.encode(frame, options);
+    encoder.encode(frame, { keyFrame, avc: { quantizer } });
     forceNextKeyframe = false;
     if (keyFrame) lastKeyframeTimestampUs = timestamp;
     if (repeated) repeatedFrames++;
@@ -361,15 +355,7 @@ function postStats() {
   lastEncoded = encoded;
   lastSourceFrames = sourceFrames;
   lastEncodedBytes = encodedBytes;
-  if (
-    rateControlMode === QUANTIZER_RATE_CONTROL
-    && !closed
-    && !paused
-    && !placeholder
-    && encodedDelta > 0
-  ) {
-    adaptQuantizer(actualBitrate);
-  }
+  if (!closed && !paused && !placeholder && encodedDelta > 0) adaptQuantizer(actualBitrate);
   postMessage({
     type: "stats",
     stats: {
@@ -382,12 +368,8 @@ function postStats() {
       queue: encoder ? encoder.encodeQueueSize : 0,
       path: outputPath,
       limitKbps: bitrateLimit / 1000,
-      targetKbps: rateControlMode === CONSTANT_RATE_CONTROL
-        ? bitrateLimit * BITRATE_HEADROOM / 1000
-        : 0,
-      rateControlMode,
       quantizerAdjustments,
-      quantizer: rateControlMode === QUANTIZER_RATE_CONTROL ? quantizer : null
+      quantizer
     }
   });
 }
@@ -419,15 +401,13 @@ function h264Codec(nextWidth, nextHeight, nextFps, nextBitrate) {
   return `avc1.42E0${level[0].toString(16).padStart(2, "0").toUpperCase()}`;
 }
 
-function encoderConfig(nextWidth, nextHeight, nextFps, nextBitrate, nextRateControlMode) {
+function encoderConfig(nextWidth, nextHeight, nextFps, nextBitrate) {
   return {
     codec: h264Codec(nextWidth, nextHeight, nextFps, nextBitrate),
     width: nextWidth,
     height: nextHeight,
-    bitrate: nextRateControlMode === CONSTANT_RATE_CONTROL
-      ? Math.max(1, Math.floor(nextBitrate * BITRATE_HEADROOM))
-      : nextBitrate,
-    bitrateMode: nextRateControlMode,
+    bitrate: nextBitrate,
+    bitrateMode: "quantizer",
     framerate: nextFps,
     hardwareAcceleration: "prefer-hardware",
     latencyMode: "realtime",
@@ -435,24 +415,12 @@ function encoderConfig(nextWidth, nextHeight, nextFps, nextBitrate, nextRateCont
   };
 }
 
-async function supportedEncoderConfig(nextWidth, nextHeight, nextFps, nextBitrate) {
-  if (!VideoEncoder.isConfigSupported) {
-    return encoderConfig(
-      nextWidth,
-      nextHeight,
-      nextFps,
-      nextBitrate,
-      CONSTANT_RATE_CONTROL
-    );
+async function assertEncoderSupport(config) {
+  if (!VideoEncoder.isConfigSupported) return;
+  const support = await VideoEncoder.isConfigSupported(config);
+  if (!support.supported || support.config?.bitrateMode !== "quantizer") {
+    throw new Error(`Native H.264 WebCodecs quantizer mode ${config.width}x${config.height}@${config.framerate} is not supported.`);
   }
-  for (const mode of [QUANTIZER_RATE_CONTROL, CONSTANT_RATE_CONTROL]) {
-    const config = encoderConfig(nextWidth, nextHeight, nextFps, nextBitrate, mode);
-    try {
-      const support = await VideoEncoder.isConfigSupported(config);
-      if (support.supported && support.config?.bitrateMode === mode) return config;
-    } catch (_) {}
-  }
-  throw new Error(`Native H.264 WebCodecs hardware encoding ${nextWidth}x${nextHeight}@${nextFps} is not supported.`);
 }
 
 function adaptQuantizer(actualBitrate) {
@@ -492,14 +460,15 @@ function createEncoder(config) {
 }
 
 async function reconfigure(message) {
+  const config = encoderConfig(
+    message.width,
+    message.height,
+    message.fps,
+    message.bitrate
+  );
   let nextEncoder = null;
   try {
-    const config = await supportedEncoderConfig(
-      message.width,
-      message.height,
-      message.fps,
-      message.bitrate
-    );
+    await assertEncoderSupport(config);
     nextEncoder = createEncoder(config);
     paused = true;
     clearPacingTimer();
@@ -513,9 +482,7 @@ async function reconfigure(message) {
     height = message.height;
     fps = message.fps;
     bitrateLimit = message.bitrate;
-    rateControlMode = config.bitrateMode;
     quantizer = INITIAL_QUANTIZER;
-    quantizerAdjustments = 0;
     keyframeInterval = fps * 2;
     framePeriodMs = 1000 / fps;
     framePeriodUs = Math.round(1000000 / fps);
@@ -543,7 +510,6 @@ async function init(message) {
   height = message.height;
   fps = message.fps;
   bitrateLimit = message.bitrate;
-  rateControlMode = QUANTIZER_RATE_CONTROL;
   quantizer = INITIAL_QUANTIZER;
   keyframeInterval = fps * 2;
   framePeriodMs = 1000 / Math.max(1, fps);
@@ -575,8 +541,8 @@ async function init(message) {
     throw new Error("Worker video pipeline is not available in this browser.");
   }
 
-  const config = await supportedEncoderConfig(width, height, fps, bitrateLimit);
-  rateControlMode = config.bitrateMode;
+  const config = encoderConfig(width, height, fps, bitrateLimit);
+  await assertEncoderSupport(config);
   canvas = new OffscreenCanvas(width, height);
   ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
   if (!ctx) throw new Error("OffscreenCanvas 2D context is not available.");

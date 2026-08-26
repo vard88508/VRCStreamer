@@ -1,9 +1,9 @@
 export function createStreamer(app) {
   const config = app.config;
   const ui = app.ui;
-  const audioWorkletUrl = new URL("audio-worklet.js?v=2r64", import.meta.url);
-  const aacWorkerUrl = new URL("aac-worker.js?v=2r64", import.meta.url);
-  const videoWorkerUrl = new URL("video-worker.js?v=2r64", import.meta.url);
+  const audioWorkletUrl = new URL("audio-worklet.js?v=2r63", import.meta.url);
+  const aacWorkerUrl = new URL("aac-worker.js?v=2r63", import.meta.url);
+  const videoWorkerUrl = new URL("video-worker.js?v=2r63", import.meta.url);
   const videoPlaceholderUrl = new URL("static/live-placeholder-1080.webp", location.href).href;
   const maxAudioBufferedBlocks = 6;
   const audioSwapFlushTimeoutMs = 2000;
@@ -460,8 +460,7 @@ function createVideoWorker(ws, onError) {
     sourceFps: 0,
     kbps: 0,
     queue: 0,
-    path: "placeholder",
-    rateControlMode: "unknown"
+    path: "placeholder"
   };
 
   let resolveReady;
