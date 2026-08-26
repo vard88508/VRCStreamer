@@ -887,10 +887,18 @@ function videoStatsSection(video) {
   const captureSize = video.trackWidth > 0 && video.trackHeight > 0
     ? `${video.trackWidth}×${video.trackHeight}`
     : "unknown";
+  const rateControl = video.rateControlMode === "quantizer"
+    ? `adaptive quantizer (QP ${video.quantizer ?? "-"}, limit ${video.limitKbps?.toFixed(0) || "-"} kbps)`
+    : video.rateControlMode === "constant"
+      ? `constant bitrate fallback (target ${video.targetKbps?.toFixed(0) || "-"} kbps, limit ${video.limitKbps?.toFixed(0) || "-"} kbps)`
+      : "detecting";
+  const rateControlStats = [`Rate control: ${rateControl}`];
+  if (video.rateControlMode === "quantizer") {
+    rateControlStats.push(`Quantizer adjustments: ${video.quantizerAdjustments || 0}`);
+  }
   return statsSection("VIDEO", [
     "Codec: H.264",
-    `Rate control: adaptive quantizer (QP ${video.quantizer ?? "-"}, limit ${video.limitKbps?.toFixed(0) || "-"} kbps)`,
-    `Quantizer adjustments: ${video.quantizerAdjustments || 0}`,
+    ...rateControlStats,
     `Output: ${app.config.videoWidth}×${app.config.videoHeight} @ ${app.config.videoFps} FPS`,
     `Capture track: ${captureSize} @ ${videoFpsLabel(video.trackFps)} FPS (${video.trackResizeMode || "unknown"})`,
     `Pipeline: dedicated worker, ${path}`,
