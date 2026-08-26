@@ -1,7 +1,7 @@
-import { createStreamer } from "./streamer.js?v=2r65";
-import { createUi } from "./ui.js?v=2r65";
+import { createStreamer } from "./streamer.js?v=2r64";
+import { createUi } from "./ui.js?v=2r64";
 
-const aacWorkerUrl = new URL("aac-worker.js?v=2r65", import.meta.url);
+const aacWorkerUrl = new URL("aac-worker.js?v=2r64", import.meta.url);
 const textEncoder = new TextEncoder();
 const streamCodeCharset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&()*+,-./:;<=>?@[]^_{|}~";
 const storagePrefix = "vrc-audio-streamer-";
