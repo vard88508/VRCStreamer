@@ -206,7 +206,7 @@ struct Placeholders {
     audio_only_fmtp: Arc<str>,
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
