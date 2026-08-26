@@ -891,8 +891,18 @@ function videoStatsSection(video) {
     ? `adaptive quantizer (QP ${video.quantizer ?? "-"}, limit ${video.limitKbps?.toFixed(0) || "-"} kbps)`
     : video.rateControlMode === "constant"
       ? `constant bitrate fallback (target ${video.targetKbps?.toFixed(0) || "-"} kbps, limit ${video.limitKbps?.toFixed(0) || "-"} kbps)`
+      : video.rateControlMode === "variable"
+        ? `variable bitrate fallback (target ${video.targetKbps?.toFixed(0) || "-"} kbps, limit ${video.limitKbps?.toFixed(0) || "-"} kbps)`
+        : "detecting";
+  const encoderSelection = video.hardwareAcceleration === "prefer-hardware"
+    ? "hardware required"
+    : video.hardwareAcceleration === "no-preference"
+      ? "browser-selected fallback"
       : "detecting";
-  const rateControlStats = [`Rate control: ${rateControl}`];
+  const rateControlStats = [
+    `Rate control: ${rateControl}`,
+    `Encoder selection: ${encoderSelection}`
+  ];
   if (video.rateControlMode === "quantizer") {
     rateControlStats.push(`Quantizer adjustments: ${video.quantizerAdjustments || 0}`);
   }

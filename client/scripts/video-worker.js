@@ -8,6 +8,16 @@ const MAX_QUANTIZER = 51;
 const INITIAL_QUANTIZER = 51;
 const QUANTIZER_RATE_CONTROL = "quantizer";
 const CONSTANT_RATE_CONTROL = "constant";
+const VARIABLE_RATE_CONTROL = "variable";
+const PREFER_HARDWARE = "prefer-hardware";
+const NO_PREFERENCE = "no-preference";
+const ENCODER_CANDIDATES = [
+  [QUANTIZER_RATE_CONTROL, PREFER_HARDWARE],
+  [CONSTANT_RATE_CONTROL, PREFER_HARDWARE],
+  [VARIABLE_RATE_CONTROL, PREFER_HARDWARE],
+  [CONSTANT_RATE_CONTROL, NO_PREFERENCE],
+  [VARIABLE_RATE_CONTROL, NO_PREFERENCE]
+];
 
 let encoder = null;
 let canvas = null;
@@ -28,6 +38,7 @@ let height = 720;
 let fps = 30;
 let bitrateLimit = 2000000;
 let rateControlMode = QUANTIZER_RATE_CONTROL;
+let hardwareAccelerationMode = PREFER_HARDWARE;
 let quantizer = INITIAL_QUANTIZER;
 let keyframeInterval = 60;
 let framePeriodMs = 1000 / 30;
@@ -382,10 +393,11 @@ function postStats() {
       queue: encoder ? encoder.encodeQueueSize : 0,
       path: outputPath,
       limitKbps: bitrateLimit / 1000,
-      targetKbps: rateControlMode === CONSTANT_RATE_CONTROL
+      targetKbps: rateControlMode !== QUANTIZER_RATE_CONTROL
         ? bitrateLimit * BITRATE_HEADROOM / 1000
         : 0,
       rateControlMode,
+      hardwareAcceleration: hardwareAccelerationMode,
       quantizerAdjustments,
       quantizer: rateControlMode === QUANTIZER_RATE_CONTROL ? quantizer : null
     }
@@ -419,17 +431,24 @@ function h264Codec(nextWidth, nextHeight, nextFps, nextBitrate) {
   return `avc1.42E0${level[0].toString(16).padStart(2, "0").toUpperCase()}`;
 }
 
-function encoderConfig(nextWidth, nextHeight, nextFps, nextBitrate, nextRateControlMode) {
+function encoderConfig(
+  nextWidth,
+  nextHeight,
+  nextFps,
+  nextBitrate,
+  nextRateControlMode,
+  nextHardwareAcceleration
+) {
   return {
     codec: h264Codec(nextWidth, nextHeight, nextFps, nextBitrate),
     width: nextWidth,
     height: nextHeight,
-    bitrate: nextRateControlMode === CONSTANT_RATE_CONTROL
-      ? Math.max(1, Math.floor(nextBitrate * BITRATE_HEADROOM))
-      : nextBitrate,
+    bitrate: nextRateControlMode === QUANTIZER_RATE_CONTROL
+      ? nextBitrate
+      : Math.max(1, Math.floor(nextBitrate * BITRATE_HEADROOM)),
     bitrateMode: nextRateControlMode,
     framerate: nextFps,
-    hardwareAcceleration: "prefer-hardware",
+    hardwareAcceleration: nextHardwareAcceleration,
     latencyMode: "realtime",
     avc: { format: "annexb" }
   };
@@ -442,17 +461,25 @@ async function supportedEncoderConfig(nextWidth, nextHeight, nextFps, nextBitrat
       nextHeight,
       nextFps,
       nextBitrate,
-      CONSTANT_RATE_CONTROL
+      CONSTANT_RATE_CONTROL,
+      NO_PREFERENCE
     );
   }
-  for (const mode of [QUANTIZER_RATE_CONTROL, CONSTANT_RATE_CONTROL]) {
-    const config = encoderConfig(nextWidth, nextHeight, nextFps, nextBitrate, mode);
+  for (const [mode, hardwareAcceleration] of ENCODER_CANDIDATES) {
+    const config = encoderConfig(
+      nextWidth,
+      nextHeight,
+      nextFps,
+      nextBitrate,
+      mode,
+      hardwareAcceleration
+    );
     try {
       const support = await VideoEncoder.isConfigSupported(config);
-      if (support.supported && support.config?.bitrateMode === mode) return config;
+      if (support.supported) return config;
     } catch (_) {}
   }
-  throw new Error(`Native H.264 WebCodecs hardware encoding ${nextWidth}x${nextHeight}@${nextFps} is not supported.`);
+  throw new Error(`Native H.264 WebCodecs encoding ${nextWidth}x${nextHeight}@${nextFps} is not supported.`);
 }
 
 function adaptQuantizer(actualBitrate) {
@@ -514,6 +541,7 @@ async function reconfigure(message) {
     fps = message.fps;
     bitrateLimit = message.bitrate;
     rateControlMode = config.bitrateMode;
+    hardwareAccelerationMode = config.hardwareAcceleration;
     quantizer = INITIAL_QUANTIZER;
     quantizerAdjustments = 0;
     keyframeInterval = fps * 2;
@@ -544,6 +572,7 @@ async function init(message) {
   fps = message.fps;
   bitrateLimit = message.bitrate;
   rateControlMode = QUANTIZER_RATE_CONTROL;
+  hardwareAccelerationMode = PREFER_HARDWARE;
   quantizer = INITIAL_QUANTIZER;
   keyframeInterval = fps * 2;
   framePeriodMs = 1000 / Math.max(1, fps);
@@ -577,6 +606,7 @@ async function init(message) {
 
   const config = await supportedEncoderConfig(width, height, fps, bitrateLimit);
   rateControlMode = config.bitrateMode;
+  hardwareAccelerationMode = config.hardwareAcceleration;
   canvas = new OffscreenCanvas(width, height);
   ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
   if (!ctx) throw new Error("OffscreenCanvas 2D context is not available.");

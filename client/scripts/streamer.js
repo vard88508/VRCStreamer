@@ -1,9 +1,9 @@
 export function createStreamer(app) {
   const config = app.config;
   const ui = app.ui;
-  const audioWorkletUrl = new URL("audio-worklet.js?v=2r64", import.meta.url);
-  const aacWorkerUrl = new URL("aac-worker.js?v=2r64", import.meta.url);
-  const videoWorkerUrl = new URL("video-worker.js?v=2r64", import.meta.url);
+  const audioWorkletUrl = new URL("audio-worklet.js?v=2r65", import.meta.url);
+  const aacWorkerUrl = new URL("aac-worker.js?v=2r65", import.meta.url);
+  const videoWorkerUrl = new URL("video-worker.js?v=2r65", import.meta.url);
   const videoPlaceholderUrl = new URL("static/live-placeholder-1080.webp", location.href).href;
   const maxAudioBufferedBlocks = 6;
   const audioSwapFlushTimeoutMs = 2000;
@@ -158,6 +158,13 @@ function removeVideoTracks(mediaStream) {
 
 function stopMediaStream(mediaStream) {
   if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
+}
+
+function closeAudioContext(audioContext) {
+  if (!audioContext || audioContext.state === "closed") return;
+  try {
+    void audioContext.close().catch(() => {});
+  } catch (_) {}
 }
 
 async function createCaptureNode(audioContext, onBlock) {
@@ -461,7 +468,8 @@ function createVideoWorker(ws, onError) {
     kbps: 0,
     queue: 0,
     path: "placeholder",
-    rateControlMode: "unknown"
+    rateControlMode: "unknown",
+    hardwareAcceleration: "unknown"
   };
 
   let resolveReady;
@@ -1192,17 +1200,19 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
     }, 1000);
   } catch (error) {
     console.error("Stream start failed:", error);
-    if (encoder) encoder.close();
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try { ws.close(3000, "start failed"); } catch (_) {
-        try { ws.close(); } catch (_) {}
+    if (app.active && app.active.ws === ws) {
+      cleanup();
+    } else {
+      if (encoder) encoder.close();
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        try { ws.close(3000, "start failed"); } catch (_) {
+          try { ws.close(); } catch (_) {}
+        }
       }
-    }
-    if (audioContext) {
-      try { audioContext.close(); } catch (_) {}
+      closeAudioContext(audioContext);
+      ui.setStreamingControls(false);
     }
     stopMediaStream(mediaStream);
-    cleanup();
   } finally {
     ui.setSourceRequestBusy(false);
   }
@@ -1287,7 +1297,7 @@ function cleanup({ stopStreams = true, updateControls = true } = {}) {
   if (current.ws.readyState === WebSocket.OPEN || current.ws.readyState === WebSocket.CONNECTING) {
     try { current.ws.close(1000, "stop"); } catch (_) {}
   }
-  try { current.audioContext.close(); } catch (_) {}
+  closeAudioContext(current.audioContext);
 }
 
   function applyAudioSourceSettings(source) {
