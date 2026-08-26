@@ -17,6 +17,14 @@
     transform:translateX(1px) rotate(-1deg)
   }
 }
+@keyframes experimentalPulse{
+  from{
+    transform:rotate(20deg) scale(.92)
+  }
+  to{
+    transform:rotate(20deg) scale(1.08)
+  }
+}
 html,body{
   overflow-x:hidden
 }
@@ -285,7 +293,21 @@ header{
   justify-content:flex-start;
   min-height:7rem;
   padding:.2rem .25rem;
+  position:relative;
   width:100%
+}
+.experimental-splash{
+  animation:experimentalPulse .7s ease-in-out infinite alternate;
+  color:#ff3b3b;
+  font-size:.7rem;
+  font-weight:800;
+  line-height:1;
+  pointer-events:none;
+  position:absolute;
+  right:-.5rem;
+  text-shadow:1px 1px #4a0000;
+  top:1.25rem;
+  white-space:nowrap
 }
 .source-choice>button>span{
   align-items:center;
@@ -852,6 +874,9 @@ header{
 }
 .patron-tier1{
   color:#fff
+}
+@media (prefers-reduced-motion:reduce){
+  .experimental-splash{animation:none}
 }
 @media (max-width:540px){
   .stream-bottom{gap:.35rem}

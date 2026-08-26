@@ -1,7 +1,7 @@
-import { createStreamer } from "./streamer.js";
-import { createUi } from "./ui.js";
+import { createStreamer } from "./streamer.js?v=2r63";
+import { createUi } from "./ui.js?v=2r63";
 
-const aacWorkerUrl = new URL("aac-worker.js", import.meta.url);
+const aacWorkerUrl = new URL("aac-worker.js?v=2r63", import.meta.url);
 const textEncoder = new TextEncoder();
 const streamCodeCharset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&()*+,-./:;<=>?@[]^_{|}~";
 const storagePrefix = "vrc-audio-streamer-";
@@ -37,7 +37,6 @@ const config = {
   videoWidth: 1280,
   videoHeight: 720,
   videoFps: 30,
-  videoCaptureFps: 30,
   videoBitrate: 2000000,
   videoPlaceholderHoldMs: 15000,
   maxAudioWsBufferedBytes: 256 * 1024,
@@ -53,8 +52,6 @@ const config = {
 
 config.expectedEncodedFps = config.sampleRate / config.framesPerChunk;
 config.expectedEncodedFpsLabel = config.expectedEncodedFps.toFixed(1);
-config.videoKeyframeInterval = config.videoFps * 2;
-config.videoFramePeriodUs = Math.round(1000000 / config.videoFps);
 
 const encoderModes = {
   native192: {
@@ -743,10 +740,7 @@ function applyVideoQuality(quality) {
   config.videoWidth = quality.width;
   config.videoHeight = quality.height;
   config.videoFps = quality.fps;
-  config.videoCaptureFps = quality.fps;
   config.videoBitrate = quality.bitrate;
-  config.videoKeyframeInterval = quality.fps * 2;
-  config.videoFramePeriodUs = Math.round(1000000 / quality.fps);
   app.ui?.setVideoPreviewAspectRatio(quality.width, quality.height);
 }
 

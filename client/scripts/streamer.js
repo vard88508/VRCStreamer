@@ -1,11 +1,11 @@
 export function createStreamer(app) {
   const config = app.config;
   const ui = app.ui;
-  const audioWorkletUrl = new URL("audio-worklet.js", import.meta.url);
-  const aacWorkerUrl = new URL("aac-worker.js", import.meta.url);
-  const videoWorkerUrl = new URL("video-worker.js", import.meta.url);
+  const audioWorkletUrl = new URL("audio-worklet.js?v=2r63", import.meta.url);
+  const aacWorkerUrl = new URL("aac-worker.js?v=2r63", import.meta.url);
+  const videoWorkerUrl = new URL("video-worker.js?v=2r63", import.meta.url);
   const videoPlaceholderUrl = new URL("static/live-placeholder-1080.webp", location.href).href;
-  const maxAudioSwapBufferBlocks = 32;
+  const maxAudioBufferedBlocks = 6;
   const audioSwapFlushTimeoutMs = 2000;
 
 async function requestScreenWakeLock() {
@@ -89,20 +89,32 @@ function displayMediaOptions(video, audio) {
   };
 }
 
-async function captureAudio(kind, deviceIdOverride = null) {
-  const audio = {
+function videoCaptureConstraints(width, height, fps) {
+  return {
+    width: { ideal: width },
+    height: { ideal: height },
+    frameRate: { ideal: fps, max: fps }
+  };
+}
+
+function audioCaptureConstraints() {
+  return {
     echoCancellation: false,
     noiseSuppression: false,
     autoGainControl: false,
     channelCount: 2,
     sampleRate: config.sampleRate
   };
+}
+
+async function captureAudio(kind, deviceIdOverride = null) {
+  const audio = audioCaptureConstraints();
   if (kind === "screen") {
-    const video = {
-      width: { ideal: config.videoWidth },
-      height: { ideal: config.videoHeight },
-      frameRate: { ideal: config.videoCaptureFps, max: config.videoCaptureFps }
-    };
+    const video = videoCaptureConstraints(
+      config.videoWidth,
+      config.videoHeight,
+      config.videoFps
+    );
     return await getDisplayMediaCompat(displayMediaOptions(video, audio), [
       { video, audio: true },
       { video: true, audio: true }
@@ -124,18 +136,12 @@ async function captureAudio(kind, deviceIdOverride = null) {
 }
 
 async function captureVideo() {
-  const audio = {
-    echoCancellation: false,
-    noiseSuppression: false,
-    autoGainControl: false,
-    channelCount: 2,
-    sampleRate: config.sampleRate
-  };
-  const video = {
-    width: { ideal: config.videoWidth },
-    height: { ideal: config.videoHeight },
-    frameRate: { ideal: config.videoCaptureFps, max: config.videoCaptureFps }
-  };
+  const audio = audioCaptureConstraints();
+  const video = videoCaptureConstraints(
+    config.videoWidth,
+    config.videoHeight,
+    config.videoFps
+  );
   return await getDisplayMediaCompat(displayMediaOptions(video, audio), [
     { video, audio: true },
     { video: true, audio: true },
@@ -166,7 +172,10 @@ async function createCaptureNode(audioContext, onBlock) {
       channels: config.channels
     }
   });
-  node.port.onmessage = event => onBlock(event.data);
+  node.port.onmessage = event => {
+    const block = event.data;
+    onBlock(block.pcm, block.timestamp);
+  };
   return node;
 }
 
@@ -179,6 +188,9 @@ function createAacEncoder(encoderMode, onPacket, onError) {
   let resolveFlush = null;
   let rejectFlush = null;
   let pcmBlocks = 0;
+  let pendingBlocks = 0;
+  let codecQueue = 0;
+  let droppedBlocks = 0;
   let encodedFrames = 0;
   let encodedBytes = 0;
   let statsAt = performance.now();
@@ -214,7 +226,11 @@ function createAacEncoder(encoderMode, onPacket, onError) {
       } else if (message.type === "packet") {
         encodedFrames++;
         encodedBytes += message.bytes;
+        codecQueue = Number(message.queue) || 0;
         onPacket(message.packet);
+      } else if (message.type === "consumed") {
+        pendingBlocks = Math.max(0, pendingBlocks - 1);
+        codecQueue = Number(message.queue) || 0;
       } else if (message.type === "flushed") {
         settleFlush();
       } else if (message.type === "error") {
@@ -244,17 +260,23 @@ function createAacEncoder(encoderMode, onPacket, onError) {
       expectedAacConfigHex: config.expectedAacConfigHex,
       nativeAacBitrates: encoderMode.nativeAacBitrates,
       preferNative: encoderMode.preferNative,
-      allowWasmFallback: encoderMode.allowWasmFallback,
-      rtpTimestampBase: 0
+      allowWasmFallback: encoderMode.allowWasmFallback
     });
   });
 
   return {
     ready,
-    encode(buffer) {
-      if (closed) return;
+    encode(buffer, timestampSamples) {
+      if (closed || pendingBlocks + codecQueue >= maxAudioBufferedBlocks) {
+        droppedBlocks++;
+        return;
+      }
       pcmBlocks++;
-      worker.postMessage({ type: "encode", pcm: buffer }, [buffer]);
+      pendingBlocks++;
+      worker.postMessage({ type: "encode", pcm: buffer, timestampSamples }, [buffer]);
+    },
+    recordDrop() {
+      droppedBlocks++;
     },
     close() {
       if (closed) return;
@@ -265,7 +287,6 @@ function createAacEncoder(encoderMode, onPacket, onError) {
         rejectReady(error);
       }
       settleFlush(error);
-      try { worker.postMessage({ type: "close" }); } catch (_) {}
       worker.terminate();
     },
     flush() {
@@ -277,12 +298,6 @@ function createAacEncoder(encoderMode, onPacket, onError) {
         worker.postMessage({ type: "flush" });
       });
       return flushPromise;
-    },
-    setTimestamp(value) {
-      if (!closed) worker.postMessage({ type: "timestamp", value: value >>> 0 });
-    },
-    lagFrames() {
-      return pcmBlocks - encodedFrames;
     },
     stats() {
       const now = performance.now();
@@ -303,7 +318,8 @@ function createAacEncoder(encoderMode, onPacket, onError) {
         encodedBytes,
         encodedFps: currentEncodedFps,
         encodedKbps: currentEncodedKbps,
-        queue: pcmBlocks - encodedFrames
+        queue: pendingBlocks + codecQueue,
+        dropped: droppedBlocks
       };
     }
   };
@@ -321,12 +337,9 @@ function sendAudioPacket(session, encoder, packet) {
     return;
   }
   session.ws.send(packet);
-  session.nextAudioTimestamp = (
-    session.nextAudioTimestamp + config.framesPerChunk
-  ) >>> 0;
 }
 
-function handleAacEncoderError(session, encoder, error) {
+function handleAacEncoderError(session, encoder) {
   if (!session || app.active !== session) return;
   if (session.encoder === encoder) {
     failActive();
@@ -334,37 +347,25 @@ function handleAacEncoderError(session, encoder, error) {
   }
   const swap = session.audioEncoderSwap;
   if (!swap || swap.encoder !== encoder) return;
-  if (swap.draining) {
-    failActive();
-    return;
-  }
-  session.audioEncoderSwap = null;
-  encoder.close();
-  swap.reject(error);
+  failActive();
 }
 
-function encodeAudioBlock(session, buffer) {
+function encodeAudioBlock(session, buffer, timestampSamples) {
   if (!session || app.active !== session) return;
+  if (!Number.isSafeInteger(timestampSamples) || timestampSamples < 0) return;
+
   const swap = session.audioEncoderSwap;
   if (swap) {
-    if (swap.buffers.length >= maxAudioSwapBufferBlocks) {
-      failActive();
-      return;
+    if (swap.buffers.length >= maxAudioBufferedBlocks) {
+      swap.buffers.shift();
+      swap.encoder.recordDrop();
     }
-    swap.buffers.push(buffer);
-    if (!swap.draining) {
-      swap.draining = true;
-      completeAudioEncoderSwap(session, swap);
-    }
+    swap.buffers.push({ buffer, timestampSamples });
     return;
   }
 
   const encoder = session.encoder;
-  if (encoder.lagFrames() > 128) {
-    failActive();
-    return;
-  }
-  encoder.encode(buffer);
+  encoder.encode(buffer, timestampSamples);
 }
 
 async function completeAudioEncoderSwap(session, swap) {
@@ -379,12 +380,13 @@ async function completeAudioEncoderSwap(session, swap) {
       throw new Error("AAC encoder swap cancelled.");
     }
 
-    swap.encoder.setTimestamp(session.nextAudioTimestamp);
     session.encoder = swap.encoder;
     session.encoderModeKey = swap.modeKey;
     session.audioEncoderSwap = null;
     previous.close();
-    for (const buffer of swap.buffers) session.encoder.encode(buffer);
+    for (const block of swap.buffers) {
+      session.encoder.encode(block.buffer, block.timestampSamples);
+    }
     swap.buffers.length = 0;
     swap.resolve(swap.info);
   } catch (error) {
@@ -408,7 +410,7 @@ async function replaceAudioEncoder() {
   nextEncoder = createAacEncoder(
     mode,
     packet => sendAudioPacket(session, nextEncoder, packet),
-    error => handleAacEncoderError(session, nextEncoder, error)
+    () => handleAacEncoderError(session, nextEncoder)
   );
   session.preparingAudioEncoder = nextEncoder;
 
@@ -428,90 +430,127 @@ async function replaceAudioEncoder() {
   }
 
   return await new Promise((resolve, reject) => {
-    session.audioEncoderSwap = {
+    const swap = {
       encoder: nextEncoder,
       modeKey,
       info,
       buffers: [],
-      draining: false,
       resolve,
       reject
     };
+    session.audioEncoderSwap = swap;
+    void completeAudioEncoderSwap(session, swap);
   });
 }
 
 function createVideoWorker(ws, onError) {
   const worker = new Worker(videoWorkerUrl);
   let closed = false;
-  let framePending = false;
   let readySettled = false;
+  let pendingSource = null;
   let pendingReconfigure = null;
+  let closePromise = null;
+  let closeResolve = null;
+  let terminateTimer = 0;
   let latestStats = {
-    submitted: 0,
-    encoded: 0,
-    dropped: 0,
-    sourceFrames: 0,
+    queueDrops: 0,
+    repeatedFrames: 0,
+    submittedFps: 0,
     fps: 0,
     sourceFps: 0,
     kbps: 0,
-    queue: 0
+    queue: 0,
+    path: "placeholder"
   };
 
+  let resolveReady;
+  let rejectReady;
   const ready = new Promise((resolve, reject) => {
-    const failReady = error => {
-      if (pendingReconfigure) {
-        pendingReconfigure.reject(error);
-        pendingReconfigure = null;
-      }
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+
+  const rejectPending = error => {
+    if (pendingSource) {
+      clearTimeout(pendingSource.timer);
+      pendingSource.reject(error);
+      pendingSource = null;
+    }
+    if (pendingReconfigure) {
+      clearTimeout(pendingReconfigure.timer);
+      pendingReconfigure.reject(error);
+      pendingReconfigure = null;
+    }
+  };
+
+  const terminate = () => {
+    clearTimeout(terminateTimer);
+    terminateTimer = 0;
+    worker.terminate();
+    if (closeResolve) {
+      closeResolve();
+      closeResolve = null;
+    }
+  };
+
+  const fail = error => {
+    rejectPending(error);
+    const wasReady = readySettled;
+    if (!readySettled) {
+      readySettled = true;
+      rejectReady(error);
+    }
+    if (closed) return;
+    closed = true;
+    terminate();
+    if (wasReady) onError(error);
+  };
+
+  worker.onmessage = event => {
+    const message = event.data || {};
+    if (message.type === "ready") {
       if (!readySettled) {
         readySettled = true;
-        reject(error);
-      } else if (!closed) {
-        closed = true;
-        try { worker.postMessage({ type: "close" }); } catch (_) {}
-        worker.terminate();
-        onError(error);
+        resolveReady();
       }
-    };
-    worker.onmessage = event => {
-      const message = event.data || {};
-      if (message.type === "ready") {
-        readySettled = true;
-        resolve();
-      } else if (message.type === "packet") {
-        if (closed || !app.active || app.active.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
-        if (ws.bufferedAmount > config.maxVideoWsBufferedBytes) {
-          failReady(new Error("Network video queue is too slow; stopped video."));
-          return;
-        }
-        ws.send(message.packet);
-      } else if (message.type === "stats") {
-        latestStats = message.stats || latestStats;
-      } else if (message.type === "reconfigured" && pendingReconfigure) {
-        const pending = pendingReconfigure;
-        pendingReconfigure = null;
-        try {
-          if (ws.readyState !== WebSocket.OPEN) throw new Error("Streamer WebSocket is closed.");
-          ws.send(`video_quality:${pending.qualityIndex}`);
-          ws.send("video_reset");
-          worker.postMessage({ type: "resume" });
-          pending.resolve();
-        } catch (error) {
-          pending.reject(error);
-        }
-      } else if (message.type === "reconfigure-error" && pendingReconfigure) {
-        pendingReconfigure.reject(new Error(message.message || "Video reconfigure failed."));
-        pendingReconfigure = null;
-      } else if (message.type === "frame") {
-        framePending = false;
-      } else if (message.type === "error") {
-        failReady(new Error(message.message || "Video worker failed."));
+    } else if (message.type === "source-ready" && pendingSource) {
+      clearTimeout(pendingSource.timer);
+      pendingSource.resolve();
+      pendingSource = null;
+    } else if (message.type === "packet") {
+      if (closed || !app.active || app.active.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+      if (ws.bufferedAmount > config.maxVideoWsBufferedBytes) {
+        fail(new Error("Network video queue is too slow; stopped video."));
+        return;
       }
-    };
-    worker.onerror = event => {
-      failReady(new Error(event.message || "Video worker failed."));
-    };
-  });
+      ws.send(message.packet);
+    } else if (message.type === "stats") {
+      latestStats = message.stats || latestStats;
+    } else if (message.type === "reconfigured" && pendingReconfigure) {
+      const pending = pendingReconfigure;
+      pendingReconfigure = null;
+      clearTimeout(pending.timer);
+      try {
+        if (ws.readyState !== WebSocket.OPEN) throw new Error("Streamer WebSocket is closed.");
+        ws.send(`video_quality:${pending.qualityIndex}`);
+        ws.send("video_reset");
+        worker.postMessage({ type: "resume" });
+        pending.resolve();
+      } catch (error) {
+        pending.reject(error);
+        fail(error);
+      }
+    } else if (message.type === "reconfigure-error" && pendingReconfigure) {
+      clearTimeout(pendingReconfigure.timer);
+      pendingReconfigure.reject(new Error(message.message || "Video reconfigure failed."));
+      pendingReconfigure = null;
+    } else if (message.type === "closed") {
+      terminate();
+    } else if (message.type === "error") {
+      fail(new Error(message.message || "Video worker failed."));
+    }
+  };
+  worker.onerror = event => fail(new Error(event.message || "Video worker failed."));
 
   return {
     ready,
@@ -522,28 +561,35 @@ function createVideoWorker(ws, onError) {
         height: config.videoHeight,
         fps: config.videoFps,
         bitrate: config.videoBitrate,
-        keyframeInterval: config.videoKeyframeInterval,
-        framePeriodUs: config.videoFramePeriodUs,
+        timelineOffsetMs: app.active
+          ? Math.max(0, performance.now() - app.active.timelineStartedAt)
+          : 0,
         placeholderUrl: videoPlaceholderUrl
       });
     },
-    frame(frame) {
-      if (framePending) {
-        frame.close();
-        return false;
+    source(readable) {
+      if (closed) {
+        return Promise.reject(new Error("Video worker is closed."));
       }
-      try {
-        framePending = true;
-        worker.postMessage({ type: "frame", frame }, [frame]);
-        return true;
-      } catch (error) {
-        framePending = false;
-        frame.close();
-        throw error;
+      if (pendingSource) {
+        return Promise.reject(new Error("Video source change is already running."));
       }
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          if (pendingSource) fail(new Error("Video worker did not accept the capture stream."));
+        }, 5000);
+        pendingSource = { resolve, reject, timer };
+        try {
+          worker.postMessage({ type: "source", readable }, [readable]);
+        } catch (error) {
+          clearTimeout(timer);
+          pendingSource = null;
+          reject(error);
+        }
+      });
     },
     placeholder() {
-      worker.postMessage({ type: "placeholder" });
+      if (!closed) worker.postMessage({ type: "placeholder" });
     },
     forceKeyframe() {
       if (!closed) worker.postMessage({ type: "keyframe" });
@@ -552,18 +598,38 @@ function createVideoWorker(ws, onError) {
       if (closed) return Promise.reject(new Error("Video worker is closed."));
       if (pendingReconfigure) return Promise.reject(new Error("Video reconfigure is already running."));
       return new Promise((resolve, reject) => {
-        pendingReconfigure = { resolve, reject, qualityIndex: options.qualityIndex };
-        worker.postMessage({ type: "reconfigure", ...options });
+        const timer = setTimeout(() => {
+          if (pendingReconfigure) fail(new Error("Video reconfigure timed out."));
+        }, 10000);
+        pendingReconfigure = { resolve, reject, timer, qualityIndex: options.qualityIndex };
+        try {
+          worker.postMessage({ type: "reconfigure", ...options });
+        } catch (error) {
+          clearTimeout(timer);
+          pendingReconfigure = null;
+          reject(error);
+        }
       });
     },
     close() {
+      if (closePromise) return closePromise;
       closed = true;
-      if (pendingReconfigure) {
-        pendingReconfigure.reject(new Error("Video worker is closed."));
-        pendingReconfigure = null;
+      const error = new Error("Video worker is closed.");
+      rejectPending(error);
+      if (!readySettled) {
+        readySettled = true;
+        rejectReady(error);
       }
-      try { worker.postMessage({ type: "close" }); } catch (_) {}
-      worker.terminate();
+      closePromise = new Promise(resolve => {
+        closeResolve = resolve;
+      });
+      try {
+        worker.postMessage({ type: "close" });
+        terminateTimer = setTimeout(terminate, 1000);
+      } catch (_) {
+        terminate();
+      }
+      return closePromise;
     },
     stats() {
       return latestStats;
@@ -571,52 +637,44 @@ function createVideoWorker(ws, onError) {
   };
 }
 
-function videoTrackFrameRate(track) {
+function videoTrackSettings(track) {
   try {
-    const value = Number(track && track.getSettings && track.getSettings().frameRate);
-    return Number.isFinite(value) && value > 0 ? value : 0;
+    const settings = track?.getSettings?.() || {};
+    return {
+      width: Number(settings.width) || 0,
+      height: Number(settings.height) || 0,
+      fps: Number(settings.frameRate) || 0,
+      resizeMode: settings.resizeMode || "unknown"
+    };
   } catch (_) {
-    return 0;
+    return { width: 0, height: 0, fps: 0, resizeMode: "unknown" };
   }
 }
 
-function videoStats(worker, mode, track, captureFps = 0) {
-  const stats = worker.stats();
-  return {
-    ...stats,
-    mode,
-    captureFps: captureFps || stats.sourceFps,
-    trackFps: videoTrackFrameRate(track),
-    workerInputFps: stats.sourceFps
-  };
-}
-
-function videoConstraints(width, height, fps) {
-  return {
-    width: { ideal: width },
-    height: { ideal: height },
-    frameRate: { ideal: fps, max: fps }
-  };
+async function constrainVideoTrack(track, width, height, fps) {
+  try {
+    await track.applyConstraints({
+      width: { ideal: width, max: width },
+      height: { ideal: height, max: height },
+      frameRate: { min: fps, ideal: fps, max: fps }
+    });
+  } catch (_) {
+    try { await track.applyConstraints(videoCaptureConstraints(width, height, fps)); } catch (_) {}
+  }
 }
 
 async function createVideoStreamer(source, ws, onError) {
   if (!window.Worker) throw new Error("Video workers are not available.");
   if (!("MediaStreamTrackProcessor" in window)) {
-    throw new Error("MediaStreamTrackProcessor is not available on main thread.");
+    throw new Error("MediaStreamTrackProcessor is not available.");
   }
   if (!source || !source.mediaStream.getVideoTracks()[0]) {
     throw new Error("Selected source has no video track.");
   }
   const worker = createVideoWorker(ws, onError);
   let closed = false;
-  let currentSource = null;
-  let workerTrack = null;
-  let reader = null;
-  let readToken = 0;
+  let processorTrack = null;
   let api = null;
-  let captureFrames = 0;
-  let captureFps = 0;
-  let captureStatsAt = performance.now();
 
   const clearStopTimer = () => {
     if (!api) return;
@@ -624,79 +682,45 @@ async function createVideoStreamer(source, ws, onError) {
     api.stopTimer = 0;
   };
 
-  const closeReader = () => {
-    readToken++;
-    if (reader) {
-      try { reader.cancel(); } catch (_) {}
-      try { reader.releaseLock(); } catch (_) {}
-      reader = null;
-    }
-    if (workerTrack) {
-      try { workerTrack.stop(); } catch (_) {}
-      workerTrack = null;
-    }
-  };
-
-  const readFrames = async token => {
-    try {
-      while (!closed) {
-        if (token !== readToken) break;
-        const { done, value } = await reader.read();
-        if (token !== readToken) {
-          if (value) value.close();
-          break;
-        }
-        if (done || !value) break;
-        captureFrames++;
-        const now = performance.now();
-        const elapsed = now - captureStatsAt;
-        if (elapsed >= 1000) {
-          captureFps = (captureFrames * 1000) / elapsed;
-          captureFrames = 0;
-          captureStatsAt = now;
-        }
-        worker.frame(value);
-      }
-    } catch (error) {
-      if (!closed && token === readToken) onError(error);
-    }
-  };
-
-  const setSource = nextSource => {
+  const setSource = async nextSource => {
+    if (closed) throw new Error("Video streamer is closed.");
     const track = nextSource.mediaStream.getVideoTracks()[0];
     if (!track) throw new Error("Selected source has no video track.");
-    const replacingSource = currentSource !== null;
     clearStopTimer();
-    closeReader();
-    currentSource = nextSource;
-    if (replacingSource) worker.placeholder();
-    workerTrack = track.clone();
-    try { workerTrack.contentHint = "motion"; } catch (_) {}
-    const processor = new MediaStreamTrackProcessor({ track: workerTrack });
-    reader = processor.readable.getReader();
-    readFrames(++readToken);
+    const nextTrack = track.clone();
+    try { nextTrack.contentHint = "motion"; } catch (_) {}
+    await constrainVideoTrack(nextTrack, config.videoWidth, config.videoHeight, config.videoFps);
+    const nextProcessor = new MediaStreamTrackProcessor({ track: nextTrack, maxBufferSize: 1 });
+    try {
+      await worker.source(nextProcessor.readable);
+    } catch (error) {
+      nextTrack.stop();
+      throw error;
+    }
+    if (processorTrack) processorTrack.stop();
+    processorTrack = nextTrack;
+  };
+
+  const stopVideoTrack = () => {
+    if (processorTrack) processorTrack.stop();
+    processorTrack = null;
   };
 
   try {
-    try {
-      await source.mediaStream.getVideoTracks()[0].applyConstraints(
-        videoConstraints(config.videoWidth, config.videoHeight, config.videoFps)
-      );
-    } catch (_) {}
     worker.init();
     await worker.ready;
-    setSource(source);
+    if (!app.active || app.active.ws !== ws) throw new Error("Video start cancelled.");
+    await setSource(source);
     api = {
       source,
       stopTimer: 0,
-      setSource(nextSource) {
-        setSource(nextSource);
+      async setSource(nextSource) {
+        await setSource(nextSource);
         api.source = nextSource;
       },
       placeholder() {
         clearStopTimer();
-        closeReader();
-        currentSource = null;
+        stopVideoTrack();
         api.source = null;
         worker.placeholder();
       },
@@ -704,28 +728,33 @@ async function createVideoStreamer(source, ws, onError) {
         worker.forceKeyframe();
       },
       async reconfigure(options) {
-        const constraints = videoConstraints(options.width, options.height, options.fps);
-        const sourceTrack = currentSource && currentSource.mediaStream.getVideoTracks()[0];
-        const tracks = [sourceTrack, workerTrack].filter(Boolean);
-        await Promise.allSettled(tracks.map(track => track.applyConstraints(constraints)));
+        if (processorTrack) {
+          await constrainVideoTrack(processorTrack, options.width, options.height, options.fps);
+        }
         await worker.reconfigure(options);
       },
       close() {
         clearStopTimer();
         closed = true;
-        closeReader();
-        worker.close();
+        stopVideoTrack();
+        return worker.close();
       },
       stats() {
-        const currentTrack = currentSource && currentSource.mediaStream.getVideoTracks()[0];
-        return videoStats(worker, "processor", currentTrack, captureFps);
+        const track = videoTrackSettings(processorTrack);
+        return {
+          ...worker.stats(),
+          trackWidth: track.width,
+          trackHeight: track.height,
+          trackFps: track.fps,
+          trackResizeMode: track.resizeMode
+        };
       }
     };
     return api;
   } catch (error) {
     closed = true;
-    closeReader();
-    worker.close();
+    stopVideoTrack();
+    await worker.close();
     throw error;
   }
 }
@@ -886,7 +915,6 @@ async function requestVideoSource() {
     stopMediaStream(mediaStream);
     throw new Error("No video track selected");
   }
-  try { mediaStream.getVideoTracks()[0].contentHint = "motion"; } catch (_) {}
   return mediaStream;
 }
 
@@ -952,7 +980,7 @@ async function installVideoSource(mediaStream, settings = null) {
   let videoStartSent = false;
   try {
     if (app.active.video) {
-      app.active.video.setSource(next);
+      await app.active.video.setSource(next);
     } else {
       sendStreamerCommand("video_start");
       videoStartSent = true;
@@ -1049,7 +1077,7 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
     encoder = createAacEncoder(
       app.selectedEncoderMode(),
       packet => sendAudioPacket(session, encoder, packet),
-      error => handleAacEncoderError(session, encoder, error)
+      () => handleAacEncoderError(session, encoder)
     );
     let encoderReadyError = null;
     const encoderReady = encoder.ready.catch(error => {
@@ -1096,8 +1124,8 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
       throw new Error(`AudioContext returned ${audioContext.sampleRate} Hz, expected ${config.sampleRate} Hz.`);
     }
 
-    const captureNode = await createCaptureNode(audioContext, buffer => {
-      encodeAudioBlock(session, buffer);
+    const captureNode = await createCaptureNode(audioContext, (buffer, timestamp) => {
+      encodeAudioBlock(session, buffer, timestamp);
     });
     const mixer = audioContext.createGain();
     mixer.channelCount = config.channels;
@@ -1113,7 +1141,7 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
       ws,
       encoder,
       encoderModeKey: app.selectedEncoderModeKey(),
-      nextAudioTimestamp: 0,
+      timelineStartedAt: 0,
       preparingAudioEncoder: null,
       audioEncoderSwap: null,
       video: null,
@@ -1127,6 +1155,12 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
     };
     app.active = session;
 
+    mixer.connect(captureNode);
+    captureNode.connect(monitor);
+    monitor.connect(audioContext.destination);
+    await audioContext.resume();
+    session.timelineStartedAt = performance.now() - audioContext.currentTime * 1000;
+
     if (kind === "video") {
       await installVideoSource(mediaStream, settings);
       if (pendingVideoKeyframe && app.active.video) {
@@ -1137,10 +1171,6 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
       installAudioSource(kind, mediaStream, deviceId ?? undefined, settings);
     }
     mediaStream = null;
-    mixer.connect(captureNode);
-    captureNode.connect(monitor);
-    monitor.connect(audioContext.destination);
-    await audioContext.resume();
 
     ui.setStreamingControls(true);
 
@@ -1212,16 +1242,12 @@ async function setVideoQuality(quality) {
   if (!quality || !Number.isInteger(quality.index)) {
     throw new Error("Invalid video quality preset.");
   }
-  const keyframeInterval = quality.fps * 2;
-  const framePeriodUs = Math.round(1000000 / quality.fps);
   if (app.active && app.active.video) {
     await app.active.video.reconfigure({
       width: quality.width,
       height: quality.height,
       fps: quality.fps,
       bitrate: quality.bitrate,
-      keyframeInterval,
-      framePeriodUs,
       qualityIndex: quality.index
     });
   } else if (app.active) {
@@ -1285,7 +1311,16 @@ function cleanup({ stopStreams = true, updateControls = true } = {}) {
         app.active.video.placeholder();
         app.active.video.source = source;
       } else {
-        app.active.video.setSource(source);
+        const video = app.active.video;
+        void video.setSource(source).catch(error => {
+          console.error("Video source restore failed:", error);
+          if (!app.active || app.active.video !== video || app.active.sources.video !== source) return;
+          source.videoHidden = true;
+          if (source.muteEl) source.muteEl.checked = true;
+          applyAudioSourceSettings(source);
+          ui.updateSourceControls();
+          ui.updateStreamStatus();
+        });
       }
     }
     ui.updateStreamStatus();

@@ -32,6 +32,7 @@
   "sourceCardTabWindowDisplayVideoTitle": "Tab / Window / Display Video",
   "sourceCardTabWindowDisplayVideoAudioTitle": "Tab / Window / Display Video + Audio",
   "firstSourceTabWindowDisplayVideo": "Tab / Window / Display Video",
+  "firstSourceVideoExperimentalBadge": "EXPERIMENTAL!!!",
   "addSourceMicInputAudio": "Mic / Input Device Audio",
   "addSourceTabWindowSystemAudio": "Tab / Window / System Audio",
   "addSourceTabWindowDisplayVideo": "Tab / Window / Display Video"

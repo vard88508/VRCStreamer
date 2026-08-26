@@ -6,14 +6,17 @@ use super::media::{
     validate_aac_access_unit, validate_h264_access_unit,
 };
 use super::rtsp::{
-    RtpState, RtpTimestampMapper, RtspSession, RtspTrack, VideoStreamState,
+    RtpClock, RtpMediaTimeline, RtpState, RtspSession, RtspTrack, VideoStreamState,
     build_rtcp_sender_report, channel_video_state, key_from_rtsp_uri, placeholder_access_unit,
     read_rtsp_request, rtcp_requests_keyframe, rtsp_sdp, select_rtsp_interleaved_channel,
     should_advertise_video,
 };
-use super::websocket::{StreamerTextCommand, is_websocket_disconnect_noise, streamer_text_command};
+use super::websocket::{
+    MediaTimestampNormalizer, StreamerTextCommand, is_websocket_disconnect_noise,
+    streamer_text_command,
+};
 use super::*;
-use tokio::io::BufReader;
+use tokio::{io::BufReader, time::Instant as TokioInstant};
 
 const TEST_VIDEO_FMTP: &str =
     "packetization-mode=1; profile-level-id=42e01f; sprop-parameter-sets=Z0LgHw==,aM48gA==";
@@ -439,18 +442,18 @@ fn validator_accepts_raw_aac_access_unit() {
 }
 
 #[test]
-fn streamer_preserves_audio_rtp_timestamp() {
+fn streamer_preserves_audio_source_timestamp() {
     let frame = Bytes::from_static(&[0x00, 0x12, 0x34, 0x56, 0x78, 0x21, 0x10, 0x56, 0xe5]);
 
     let StreamerMediaFrame::Audio {
         access_unit,
-        rtp_timestamp,
+        source_timestamp,
     } = parse_streamer_media_frame(frame, &test_config()).unwrap()
     else {
         panic!("expected audio frame");
     };
 
-    assert_eq!(rtp_timestamp, 0x1234_5678);
+    assert_eq!(source_timestamp, 0x1234_5678);
     assert_eq!(access_unit.as_ref(), &[0x21, 0x10, 0x56, 0xe5]);
 }
 
@@ -523,7 +526,7 @@ fn h264_sdp_uses_in_band_sps_and_pps() {
 }
 
 #[test]
-fn streamer_preserves_video_rtp_timestamp() {
+fn streamer_preserves_video_source_timestamp() {
     let frame = Bytes::from_static(&[
         0x01, 0x12, 0x34, 0x56, 0x78, 0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x1f, 0, 0, 1, 0x65, 0x88, 0x84,
     ]);
@@ -531,14 +534,14 @@ fn streamer_preserves_video_rtp_timestamp() {
     let StreamerMediaFrame::Video {
         access_unit,
         keyframe,
-        rtp_timestamp,
+        source_timestamp,
     } = parse_streamer_media_frame(frame, &test_config()).unwrap()
     else {
         panic!("expected video frame");
     };
 
     assert!(keyframe);
-    assert_eq!(rtp_timestamp, 0x1234_5678);
+    assert_eq!(source_timestamp, 0x1234_5678);
     assert_eq!(access_unit[4] & 0x1f, 7);
 }
 
@@ -567,17 +570,43 @@ fn streamer_rejects_video_frame_without_timestamp_header() {
 }
 
 #[test]
-fn rtp_timestamp_mapper_preserves_gaps_and_wraps() {
-    let mut timestamps = RtpTimestampMapper::default();
-    assert_eq!(timestamps.map(90_000), None);
+fn shared_media_timeline_preserves_audio_video_offsets() {
+    let started_at = TokioInstant::now();
+    let audio_clock = RtpClock::new(0, AAC_SAMPLE_RATE, started_at);
+    let video_clock = RtpClock::new(0, H264_CLOCK_RATE, started_at);
+    let mut timeline = RtpMediaTimeline::default();
 
-    let output = u32::MAX - 100;
-    timestamps.start(90_000, output);
-    assert_eq!(timestamps.map(90_000), Some(output));
-    assert_eq!(timestamps.map(93_000), Some(output.wrapping_add(3_000)));
+    let audio_start = timeline.map(1, 10_000, &audio_clock);
+    let video_start = timeline.map(1, 10_000, &video_clock);
+    let audio_later = timeline.map(1, 11_024, &audio_clock);
+    let video_later = timeline.map(1, 11_024, &video_clock);
 
-    timestamps.reset();
-    assert_eq!(timestamps.map(93_000), None);
+    assert_eq!(audio_later.wrapping_sub(audio_start), 1_024);
+    assert_eq!(video_later.wrapping_sub(video_start), 1_920);
+
+    let long_source = 10_000 + MEDIA_CLOCK_RATE as u64 * 31 * 60;
+    let long_audio = timeline.map(1, long_source, &audio_clock);
+    let long_video = timeline.map(1, long_source, &video_clock);
+    let next_audio = timeline.map(1, long_source + 1_024, &audio_clock);
+    let next_video = timeline.map(1, long_source + 1_024, &video_clock);
+    assert_eq!(next_audio.wrapping_sub(long_audio), 1_024);
+    assert_eq!(next_video.wrapping_sub(long_video), 1_920);
+
+    let reset = timeline.map(2, 50, &audio_clock);
+    let reset_later = timeline.map(2, 1_074, &audio_clock);
+    assert_eq!(reset_later.wrapping_sub(reset), 1_024);
+}
+
+#[test]
+fn media_timestamps_normalize_native_clock_rates_and_wrap() {
+    let mut audio = MediaTimestampNormalizer::new(AAC_SAMPLE_RATE);
+    let mut video = MediaTimestampNormalizer::new(H264_CLOCK_RATE);
+    assert_eq!(audio.normalize(48_000), 48_000);
+    assert_eq!(video.normalize(90_000), 48_000);
+
+    let before_wrap = video.normalize(u32::MAX - 89_999);
+    let after_wrap = video.normalize(0);
+    assert_eq!(after_wrap - before_wrap, 48_000);
 }
 
 #[test]

@@ -1,41 +1,67 @@
 const VIDEO_FRAME_HEADER_BYTES = 5;
+const H264_CLOCK_RATE = 90000;
 const ANNEX_B_START_CODE = new Uint8Array([0, 0, 0, 1]);
+const MAX_ENCODER_QUEUE = 2;
+const BITRATE_HEADROOM = 0.9;
+const MIN_QUANTIZER = 20;
+const MAX_QUANTIZER = 51;
+const INITIAL_QUANTIZER = 51;
 
 let encoder = null;
 let canvas = null;
 let ctx = null;
+let sourceReader = null;
+let sourceGeneration = 0;
 let latestFrame = null;
-let timer = 0;
+let pacingTimer = 0;
 let statsTimer = 0;
 let closed = true;
+let failed = false;
+let paused = false;
 let placeholder = false;
 let placeholderImage = null;
 let placeholderImageUrl = "";
 let width = 1280;
 let height = 720;
 let fps = 30;
-let bitrate = 2000000;
+let bitrateLimit = 2000000;
+let quantizer = INITIAL_QUANTIZER;
 let keyframeInterval = 60;
 let framePeriodMs = 1000 / 30;
 let framePeriodUs = 33333;
-let nextEncodeAt = 0;
-let nextTimestampUs = 0;
+let timelineStartedAt = 0;
+let lastTimestampUs = -1;
 let lastKeyframeTimestampUs = -2000000;
 let submitted = 0;
 let encoded = 0;
-let dropped = 0;
 let sourceFrames = 0;
+let queueDrops = 0;
+let repeatedFrames = 0;
 let encodedBytes = 0;
+let outputPath = "placeholder";
 let lastStatsAt = 0;
+let lastSubmitted = 0;
 let lastEncoded = 0;
 let lastSourceFrames = 0;
 let lastEncodedBytes = 0;
+let quantizerAdjustments = 0;
 let avcHeader = null;
 let forceNextKeyframe = false;
+let commandQueue = Promise.resolve();
 
-function fail(error) {
-  postMessage({ type: "error", message: error && error.message ? error.message : String(error) });
-  closeAll();
+function errorText(error) {
+  return error && error.message ? error.message : String(error);
+}
+
+async function fail(error) {
+  if (failed) return;
+  failed = true;
+  postMessage({ type: "error", message: errorText(error) });
+  await closeAll();
+}
+
+function enqueue(task) {
+  commandQueue = commandQueue.then(task, task).catch(fail);
 }
 
 function avcDescriptionToAnnexB(description) {
@@ -47,21 +73,21 @@ function avcDescriptionToAnnexB(description) {
   const spsCount = data[offset++] & 0x1f;
   for (let i = 0; i < spsCount; i++) {
     if (offset + 2 > data.length) return null;
-    const len = (data[offset] << 8) | data[offset + 1];
+    const length = (data[offset] << 8) | data[offset + 1];
     offset += 2;
-    if (offset + len > data.length) return null;
-    parts.push(data.subarray(offset, offset + len));
-    offset += len;
+    if (offset + length > data.length) return null;
+    parts.push(data.subarray(offset, offset + length));
+    offset += length;
   }
   if (offset >= data.length) return null;
   const ppsCount = data[offset++];
   for (let i = 0; i < ppsCount; i++) {
     if (offset + 2 > data.length) return null;
-    const len = (data[offset] << 8) | data[offset + 1];
+    const length = (data[offset] << 8) | data[offset + 1];
     offset += 2;
-    if (offset + len > data.length) return null;
-    parts.push(data.subarray(offset, offset + len));
-    offset += len;
+    if (offset + length > data.length) return null;
+    parts.push(data.subarray(offset, offset + length));
+    offset += length;
   }
   const total = parts.reduce((sum, part) => sum + 4 + part.byteLength, 0);
   if (total === 0) return null;
@@ -79,7 +105,7 @@ function avcDescriptionToAnnexB(description) {
 function sendVideoPacket(chunk, header) {
   const headerLength = chunk.type === "key" && header ? header.byteLength : 0;
   const packet = new Uint8Array(chunk.byteLength + headerLength + VIDEO_FRAME_HEADER_BYTES);
-  const rtpTimestamp = Math.round(chunk.timestamp * 9 / 100) >>> 0;
+  const rtpTimestamp = Math.round(chunk.timestamp * H264_CLOCK_RATE / 1000000) >>> 0;
   packet[0] = chunk.type === "key" ? 0x01 : 0x02;
   packet[1] = rtpTimestamp >>> 24;
   packet[2] = rtpTimestamp >>> 16;
@@ -91,12 +117,24 @@ function sendVideoPacket(chunk, header) {
   postMessage({ type: "packet", packet: packet.buffer }, [packet.buffer]);
 }
 
+function frameWidth(frame) {
+  return frame.displayWidth || frame.codedWidth || frame.width || width;
+}
+
+function frameHeight(frame) {
+  return frame.displayHeight || frame.codedHeight || frame.height || height;
+}
+
+function frameMatchesOutput(frame) {
+  return frameWidth(frame) === width && frameHeight(frame) === height;
+}
+
 function drawFrame(frame) {
-  const srcWidth = frame.displayWidth || frame.codedWidth || frame.width || width;
-  const srcHeight = frame.displayHeight || frame.codedHeight || frame.height || height;
-  const scale = Math.min(width / srcWidth, height / srcHeight);
-  const drawWidth = Math.max(1, Math.round(srcWidth * scale));
-  const drawHeight = Math.max(1, Math.round(srcHeight * scale));
+  const sourceWidth = frameWidth(frame);
+  const sourceHeight = frameHeight(frame);
+  const scale = Math.min(width / sourceWidth, height / sourceHeight);
+  const drawWidth = Math.max(1, Math.round(sourceWidth * scale));
+  const drawHeight = Math.max(1, Math.round(sourceHeight * scale));
   const x = Math.floor((width - drawWidth) / 2);
   const y = Math.floor((height - drawHeight) / 2);
   if (drawWidth !== width || drawHeight !== height) {
@@ -107,12 +145,10 @@ function drawFrame(frame) {
 }
 
 function drawPlaceholder() {
-  if (placeholderImage) {
-    drawFrame(placeholderImage);
-  } else {
+  if (placeholderImage) drawFrame(placeholderImage);
+  else {
     ctx.fillStyle = "#000";
     ctx.fillRect(0, 0, width, height);
-    forceNextKeyframe = true;
   }
 }
 
@@ -123,109 +159,217 @@ async function loadPlaceholderImage(url) {
   if (!response.ok) throw new Error(`Video placeholder image failed to load: ${response.status}`);
   const image = await createImageBitmap(await response.blob());
   if (closed || url !== placeholderImageUrl) {
-    try { image.close(); } catch (_) {}
+    image.close();
     return;
   }
-  if (placeholderImage) {
-    try { placeholderImage.close(); } catch (_) {}
-  }
+  if (placeholderImage) placeholderImage.close();
   placeholderImage = image;
-  forceNextKeyframe = true;
 }
 
-function submitFrame(timestamp) {
-  if (!encoder || encoder.state !== "configured") return;
-  if (encoder.encodeQueueSize > 2) {
-    dropped++;
+function mediaTimestampUs() {
+  const elapsed = Math.round((performance.now() - timelineStartedAt) * 1000);
+  lastTimestampUs = Math.max(lastTimestampUs + 1, elapsed);
+  return lastTimestampUs;
+}
+
+function createOutputFrame(source, timestamp) {
+  if (source && frameMatchesOutput(source)) {
+    outputPath = "direct";
+    return new VideoFrame(source, { timestamp, duration: framePeriodUs });
+  }
+  if (source) {
+    drawFrame(source);
+    outputPath = "scaled";
+  } else {
+    drawPlaceholder();
+    outputPath = "placeholder";
+  }
+  return new VideoFrame(canvas, { timestamp, duration: framePeriodUs });
+}
+
+function submitFrame(source, repeated = false) {
+  if (closed || paused || !encoder || encoder.state !== "configured") return;
+  if (encoder.encodeQueueSize >= MAX_ENCODER_QUEUE) {
+    queueDrops++;
     return;
   }
 
-  let frame = null;
+  const timestamp = mediaTimestampUs();
+  const frame = createOutputFrame(source, timestamp);
   try {
-    frame = new VideoFrame(canvas, { timestamp, duration: framePeriodUs });
     const keyFrame = forceNextKeyframe
       || timestamp - lastKeyframeTimestampUs >= keyframeInterval * framePeriodUs;
+    encoder.encode(frame, { keyFrame, avc: { quantizer } });
     forceNextKeyframe = false;
-    encoder.encode(frame, { keyFrame });
     if (keyFrame) lastKeyframeTimestampUs = timestamp;
+    if (repeated) repeatedFrames++;
     submitted++;
   } finally {
-    if (frame) frame.close();
+    frame.close();
   }
 }
 
-function encodeLatest() {
-  if (closed) return;
-  const now = performance.now();
-  const missedFrames = Math.max(0, Math.floor((now - nextEncodeAt) / framePeriodMs));
-  nextEncodeAt += missedFrames * framePeriodMs;
-  nextTimestampUs += missedFrames * framePeriodUs;
-  dropped += missedFrames;
+function clearPacingTimer() {
+  clearTimeout(pacingTimer);
+  pacingTimer = 0;
+}
 
+function runPlaceholder() {
+  pacingTimer = 0;
+  if (closed || paused || !placeholder) return;
   try {
-    if (latestFrame && !placeholder) drawFrame(latestFrame);
-    else drawPlaceholder();
-    submitFrame(nextTimestampUs);
+    submitFrame(null);
   } catch (error) {
-    fail(error);
+    void fail(error);
     return;
   }
-
-  nextEncodeAt += framePeriodMs;
-  nextTimestampUs += framePeriodUs;
-  timer = setTimeout(encodeLatest, Math.max(0, nextEncodeAt - performance.now()));
+  pacingTimer = setTimeout(runPlaceholder, framePeriodMs);
 }
 
-function startEncoderLoop() {
-  if (timer || closed) return;
-  nextEncodeAt = performance.now() + framePeriodMs;
-  timer = setTimeout(encodeLatest, framePeriodMs);
+function repeatStalledFrame() {
+  pacingTimer = 0;
+  if (closed || paused || placeholder || !latestFrame) return;
+  try {
+    submitFrame(latestFrame, true);
+  } catch (error) {
+    void fail(error);
+    return;
+  }
+  pacingTimer = setTimeout(repeatStalledFrame, framePeriodMs);
 }
 
-function setLatestFrame(frame) {
+function scheduleStallFallback() {
+  clearPacingTimer();
+  if (!closed && !paused && !placeholder && latestFrame) {
+    pacingTimer = setTimeout(repeatStalledFrame, framePeriodMs * 1.5);
+  }
+}
+
+function startCurrentOutput() {
+  clearPacingTimer();
+  if (closed || paused) return;
+  if (placeholder || !latestFrame) {
+    placeholder = true;
+    runPlaceholder();
+  } else {
+    try {
+      submitFrame(latestFrame);
+    } catch (error) {
+      void fail(error);
+      return;
+    }
+    scheduleStallFallback();
+  }
+}
+
+function closeLatestFrame() {
+  if (latestFrame) latestFrame.close();
+  latestFrame = null;
+}
+
+function enterPlaceholder(start = true) {
+  closeLatestFrame();
+  placeholder = true;
+  forceNextKeyframe = true;
+  if (start) startCurrentOutput();
+}
+
+function onSourceFrame(frame) {
   sourceFrames++;
   const previous = latestFrame;
   latestFrame = frame;
   if (previous) previous.close();
   placeholder = false;
-  startEncoderLoop();
-  postMessage({ type: "frame" });
+  clearPacingTimer();
+  if (closed || paused) return;
+  try {
+    submitFrame(frame);
+  } catch (error) {
+    void fail(error);
+    return;
+  }
+  scheduleStallFallback();
 }
 
-function closeLatestFrame() {
-  if (!latestFrame) return;
-  try { latestFrame.close(); } catch (_) {}
-  latestFrame = null;
+async function stopSource() {
+  sourceGeneration++;
+  const reader = sourceReader;
+  sourceReader = null;
+  if (reader) {
+    try { await reader.cancel(); } catch (_) {}
+    try { reader.releaseLock(); } catch (_) {}
+  }
 }
 
-function usePlaceholder() {
-  closeLatestFrame();
-  placeholder = true;
-  forceNextKeyframe = true;
-  startEncoderLoop();
+async function readSource(reader, generation) {
+  try {
+    while (!closed && generation === sourceGeneration) {
+      const { done, value } = await reader.read();
+      if (generation !== sourceGeneration) {
+        if (value) value.close();
+        return;
+      }
+      if (done || !value) break;
+      onSourceFrame(value);
+    }
+    if (!closed && generation === sourceGeneration) enterPlaceholder();
+  } catch (error) {
+    if (!closed && generation === sourceGeneration) await fail(error);
+  } finally {
+    if (generation === sourceGeneration && sourceReader === reader) {
+      try { reader.releaseLock(); } catch (_) {}
+      sourceReader = null;
+    }
+  }
+}
+
+async function setSource(readable) {
+  if (!readable || typeof readable.getReader !== "function") {
+    throw new Error("Video worker received an invalid capture stream.");
+  }
+  await stopSource();
+  if (!placeholder) enterPlaceholder();
+
+  sourceReader = readable.getReader();
+  const generation = ++sourceGeneration;
+  void readSource(sourceReader, generation);
+  postMessage({ type: "source-ready" });
+}
+
+async function usePlaceholder() {
+  if (placeholder && !sourceReader) return;
+  await stopSource();
+  enterPlaceholder();
 }
 
 function postStats() {
   const now = performance.now();
   const elapsed = Math.max((now - lastStatsAt) / 1000, 0.001);
+  const submittedDelta = submitted - lastSubmitted;
   const encodedDelta = encoded - lastEncoded;
   const sourceDelta = sourceFrames - lastSourceFrames;
   const byteDelta = encodedBytes - lastEncodedBytes;
+  const actualBitrate = byteDelta * 8 / elapsed;
   lastStatsAt = now;
+  lastSubmitted = submitted;
   lastEncoded = encoded;
   lastSourceFrames = sourceFrames;
   lastEncodedBytes = encodedBytes;
+  if (!closed && !paused && !placeholder && encodedDelta > 0) adaptQuantizer(actualBitrate);
   postMessage({
     type: "stats",
     stats: {
-      submitted,
-      encoded,
-      dropped,
-      sourceFrames,
+      queueDrops,
+      repeatedFrames,
+      submittedFps: submittedDelta / elapsed,
       fps: encodedDelta / elapsed,
       sourceFps: sourceDelta / elapsed,
-      kbps: (byteDelta * 8 / 1000) / elapsed,
-      queue: encoder ? encoder.encodeQueueSize : 0
+      kbps: actualBitrate / 1000,
+      queue: encoder ? encoder.encodeQueueSize : 0,
+      path: outputPath,
+      limitKbps: bitrateLimit / 1000,
+      quantizerAdjustments,
+      quantizer
     }
   });
 }
@@ -263,24 +407,42 @@ function encoderConfig(nextWidth, nextHeight, nextFps, nextBitrate) {
     width: nextWidth,
     height: nextHeight,
     bitrate: nextBitrate,
-    bitrateMode: "constant",
+    bitrateMode: "quantizer",
     framerate: nextFps,
     hardwareAcceleration: "prefer-hardware",
     latencyMode: "realtime",
-    contentHint: "motion",
     avc: { format: "annexb" }
   };
 }
 
-async function assertEncoderSupport(nextConfig) {
+async function assertEncoderSupport(config) {
   if (!VideoEncoder.isConfigSupported) return;
-  const support = await VideoEncoder.isConfigSupported(nextConfig);
-  if (!support.supported) {
-    throw new Error(`Native H.264 WebCodecs ${nextConfig.width}x${nextConfig.height}@${nextConfig.framerate} is not supported.`);
+  const support = await VideoEncoder.isConfigSupported(config);
+  if (!support.supported || support.config?.bitrateMode !== "quantizer") {
+    throw new Error(`Native H.264 WebCodecs quantizer mode ${config.width}x${config.height}@${config.framerate} is not supported.`);
   }
 }
 
-function createEncoder(nextConfig) {
+function adaptQuantizer(actualBitrate) {
+  const budget = bitrateLimit * BITRATE_HEADROOM;
+  if (actualBitrate > budget) {
+    const step = Math.max(1, Math.ceil(6 * Math.log2(actualBitrate / budget)));
+    const nextQuantizer = Math.min(MAX_QUANTIZER, quantizer + step);
+    if (nextQuantizer !== quantizer) {
+      quantizer = nextQuantizer;
+      quantizerAdjustments++;
+    }
+    return;
+  }
+
+  if (actualBitrate < budget * 0.7 && quantizer > MIN_QUANTIZER) {
+    const step = Math.max(1, Math.floor(6 * Math.log2(budget / Math.max(actualBitrate, 1))));
+    quantizer = Math.max(MIN_QUANTIZER, quantizer - Math.min(step, 6));
+    quantizerAdjustments++;
+  }
+}
+
+function createEncoder(config) {
   const next = new VideoEncoder({
     output(chunk, metadata) {
       if (closed) return;
@@ -290,127 +452,147 @@ function createEncoder(nextConfig) {
       sendVideoPacket(chunk, avcHeader);
     },
     error(error) {
-      if (!closed) fail(error);
+      if (!closed) void fail(error);
     }
   });
-  next.configure(nextConfig);
+  next.configure(config);
   return next;
 }
 
 async function reconfigure(message) {
-  const nextConfig = encoderConfig(message.width, message.height, message.fps, message.bitrate);
+  const config = encoderConfig(
+    message.width,
+    message.height,
+    message.fps,
+    message.bitrate
+  );
+  let nextEncoder = null;
   try {
-    await assertEncoderSupport(nextConfig);
-    clearTimeout(timer);
-    timer = 0;
-    await encoder.flush();
-    encoder.close();
-    avcHeader = null;
-    encoder = createEncoder(nextConfig);
+    await assertEncoderSupport(config);
+    nextEncoder = createEncoder(config);
+    paused = true;
+    clearPacingTimer();
+    const previousEncoder = encoder;
+    await previousEncoder.flush();
+    encoder = nextEncoder;
+    nextEncoder = null;
+    previousEncoder.close();
 
     width = message.width;
     height = message.height;
     fps = message.fps;
-    bitrate = message.bitrate;
-    keyframeInterval = message.keyframeInterval;
+    bitrateLimit = message.bitrate;
+    quantizer = INITIAL_QUANTIZER;
+    keyframeInterval = fps * 2;
     framePeriodMs = 1000 / fps;
-    framePeriodUs = message.framePeriodUs;
+    framePeriodUs = Math.round(1000000 / fps);
     canvas.width = width;
     canvas.height = height;
-    nextEncodeAt = performance.now() + framePeriodMs;
-    lastKeyframeTimestampUs = nextTimestampUs - keyframeInterval * framePeriodUs;
+    avcHeader = null;
+    lastKeyframeTimestampUs = lastTimestampUs - keyframeInterval * framePeriodUs;
     forceNextKeyframe = true;
     postMessage({ type: "reconfigured" });
   } catch (error) {
-    startEncoderLoop();
-    postMessage({
-      type: "reconfigure-error",
-      message: error && error.message ? error.message : String(error)
-    });
+    if (nextEncoder) nextEncoder.close();
+    paused = false;
+    startCurrentOutput();
+    postMessage({ type: "reconfigure-error", message: errorText(error) });
   }
 }
 
 async function init(message) {
-  closeAll();
+  await closeAll();
+  failed = false;
   closed = false;
+  paused = false;
+  placeholder = true;
   width = message.width;
   height = message.height;
   fps = message.fps;
-  bitrate = message.bitrate;
-  keyframeInterval = message.keyframeInterval;
+  bitrateLimit = message.bitrate;
+  quantizer = INITIAL_QUANTIZER;
+  keyframeInterval = fps * 2;
   framePeriodMs = 1000 / Math.max(1, fps);
-  framePeriodUs = message.framePeriodUs;
-  nextEncodeAt = 0;
-  nextTimestampUs = 0;
+  framePeriodUs = Math.round(1000000 / Math.max(1, fps));
+  timelineStartedAt = performance.now() - Math.max(0, Number(message.timelineOffsetMs) || 0);
+  lastTimestampUs = -1;
   lastKeyframeTimestampUs = -keyframeInterval * framePeriodUs;
   submitted = 0;
   encoded = 0;
-  dropped = 0;
   sourceFrames = 0;
+  queueDrops = 0;
+  repeatedFrames = 0;
   encodedBytes = 0;
+  outputPath = "placeholder";
   lastStatsAt = performance.now();
+  lastSubmitted = 0;
   lastEncoded = 0;
   lastSourceFrames = 0;
   lastEncodedBytes = 0;
+  quantizerAdjustments = 0;
   avcHeader = null;
-  forceNextKeyframe = false;
-  placeholder = true;
+  forceNextKeyframe = true;
   placeholderImageUrl = message.placeholderUrl || "";
 
   if (!("VideoEncoder" in self) || !("VideoFrame" in self)) {
     throw new Error("Native H.264 WebCodecs video encoder is not available in worker.");
   }
   if (!("OffscreenCanvas" in self)) {
-    throw new Error("OffscreenCanvas is not available in worker.");
+    throw new Error("Worker video pipeline is not available in this browser.");
   }
-  const config = encoderConfig(width, height, fps, bitrate);
-  await assertEncoderSupport(config);
 
+  const config = encoderConfig(width, height, fps, bitrateLimit);
+  await assertEncoderSupport(config);
   canvas = new OffscreenCanvas(width, height);
   ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
   if (!ctx) throw new Error("OffscreenCanvas 2D context is not available.");
-
   encoder = createEncoder(config);
-
   await loadPlaceholderImage(placeholderImageUrl);
-  forceNextKeyframe = true;
   statsTimer = setInterval(postStats, 1000);
   postMessage({ type: "ready" });
 }
 
-function closeAll() {
+async function closeAll() {
   closed = true;
-  clearTimeout(timer);
+  paused = true;
+  clearPacingTimer();
   clearInterval(statsTimer);
-  timer = 0;
   statsTimer = 0;
+  await stopSource();
   closeLatestFrame();
   if (placeholderImage) {
-    try { placeholderImage.close(); } catch (_) {}
+    placeholderImage.close();
     placeholderImage = null;
   }
-  if (encoder) {
-    try { encoder.close(); } catch (_) {}
-    encoder = null;
+  const currentEncoder = encoder;
+  encoder = null;
+  if (currentEncoder) {
+    try { await currentEncoder.flush(); } catch (_) {}
+    try { currentEncoder.close(); } catch (_) {}
   }
+  canvas = null;
+  ctx = null;
 }
 
-self.onmessage = event => {
-  const message = event.data || {};
+async function handleMessage(message) {
   if (message.type === "init") {
-    init(message).catch(fail);
-  } else if (message.type === "frame" && message.frame && !closed) {
-    setLatestFrame(message.frame);
+    await init(message);
+  } else if (message.type === "source" && !closed) {
+    await setSource(message.readable);
   } else if (message.type === "placeholder" && !closed) {
-    usePlaceholder();
+    await usePlaceholder();
   } else if (message.type === "keyframe" && !closed) {
     forceNextKeyframe = true;
   } else if (message.type === "reconfigure" && !closed) {
-    reconfigure(message);
+    await reconfigure(message);
   } else if (message.type === "resume" && !closed) {
+    paused = false;
     forceNextKeyframe = true;
-    startEncoderLoop();
+    startCurrentOutput();
   } else if (message.type === "close") {
-    closeAll();
+    await closeAll();
+    postMessage({ type: "closed" });
   }
-};
+}
+
+self.onmessage = event => enqueue(() => handleMessage(event.data || {}));

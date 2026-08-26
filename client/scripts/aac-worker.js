@@ -6,10 +6,7 @@ let channels = 2;
 let bitrate = 320000;
 let expectedAacConfigHex = "1190";
 let nativeAacBitrates = [320000, 256000, 192000, 160000, 128000, 96000];
-let rtpTimestampBase = 0;
-
 let nativeEncoder = null;
-let nativeNextSample = 0;
 let nativeS16Scratch = null;
 
 let modulePromise = null;
@@ -17,7 +14,6 @@ let module = null;
 let ctx = 0;
 let frameSize = 0;
 let inputBytesPerFrame = 0;
-let nextTimestamp = 0;
 let initEncoderFn = null;
 let getEncoderFrameSizeFn = null;
 let getEncoderExtradataFn = null;
@@ -207,9 +203,7 @@ async function initNative() {
       const description = metadata && metadata.decoderConfig && metadata.decoderConfig.description;
       if (description) configHex = bytesToHex(new Uint8Array(description));
 
-      const rtpTimestamp = (
-        rtpTimestampBase + Math.round(chunk.timestamp * sampleRate / 1000000)
-      ) >>> 0;
+      const rtpTimestamp = Math.round(chunk.timestamp * sampleRate / 1000000) >>> 0;
       const packet = createMediaPacket(chunk.byteLength, rtpTimestamp);
       chunk.copyTo(packet.subarray(MEDIA_FRAME_HEADER_BYTES));
       try {
@@ -220,7 +214,12 @@ async function initNative() {
       }
 
       self.postMessage(
-        { type: "packet", packet: packet.buffer, bytes: chunk.byteLength },
+        {
+          type: "packet",
+          packet: packet.buffer,
+          bytes: chunk.byteLength,
+          queue: nativeEncoder ? nativeEncoder.encodeQueueSize : 0
+        },
         [packet.buffer]
       );
     },
@@ -232,7 +231,6 @@ async function initNative() {
   encoder.configure(config);
   mode = "native";
   nativeEncoder = encoder;
-  nativeNextSample = 0;
   self.postMessage({
     type: "ready",
     name: "Native WebCodecs AAC",
@@ -241,7 +239,7 @@ async function initNative() {
   });
 }
 
-function encodeNative(pcm) {
+function encodeNative(pcm, timestampSamples) {
   if (!nativeEncoder) throw new Error("Native AAC encoder is not initialized.");
   const frameCount = pcm.byteLength / Float32Array.BYTES_PER_ELEMENT / channels;
   const audioData = new AudioData({
@@ -249,10 +247,9 @@ function encodeNative(pcm) {
     sampleRate,
     numberOfFrames: frameCount,
     numberOfChannels: channels,
-    timestamp: Math.round(nativeNextSample * 1000000 / sampleRate),
+    timestamp: Math.round(timestampSamples * 1000000 / sampleRate),
     data: float32ToS16View(pcm)
   });
-  nativeNextSample += frameCount;
   nativeEncoder.encode(audioData);
   audioData.close();
 }
@@ -262,7 +259,6 @@ function closeNative() {
   try { nativeEncoder.close(); } catch (_) {}
   nativeEncoder = null;
   nativeS16Scratch = null;
-  nativeNextSample = 0;
 }
 
 async function ensureModule() {
@@ -289,7 +285,7 @@ function drainWasmPackets() {
     const pts = Number(getEncodedPtsFn(ctx));
     if (pts < 0) continue;
 
-    const packet = createMediaPacket(size, (rtpTimestampBase + pts) >>> 0);
+    const packet = createMediaPacket(size, pts >>> 0);
     packet.set(module.HEAPU8.subarray(ptr, ptr + size), MEDIA_FRAME_HEADER_BYTES);
     self.postMessage(
       { type: "packet", packet: packet.buffer, bytes: size },
@@ -305,7 +301,6 @@ async function initWasm(fallbackReason) {
 
   frameSize = getEncoderFrameSizeFn(ctx);
   inputBytesPerFrame = frameSize * channels * Float32Array.BYTES_PER_ELEMENT;
-  nextTimestamp = 0;
 
   const extradataPtr = getEncoderExtradataFn(ctx);
   const extradataSize = getEncoderExtradataSizeFn(ctx);
@@ -325,7 +320,7 @@ async function initWasm(fallbackReason) {
   });
 }
 
-function encodeWasm(pcm) {
+function encodeWasm(pcm, timestampSamples) {
   if (!ctx) throw new Error("WASM AAC encoder is not initialized.");
 
   const bytes = new Uint8Array(pcm);
@@ -333,15 +328,16 @@ function encodeWasm(pcm) {
     throw new Error("PCM buffer does not contain whole AAC frames.");
   }
 
+  let timestamp = timestampSamples;
   for (let offset = 0; offset < bytes.byteLength; offset += inputBytesPerFrame) {
     const inputPtr = getEncodeInputPtrFn(ctx, inputBytesPerFrame);
     if (inputPtr === 0) throw new Error("Failed to allocate AAC input buffer.");
 
     module.HEAPU8.set(bytes.subarray(offset, offset + inputBytesPerFrame), inputPtr);
-    const ret = sendFrameFn(ctx, BigInt(nextTimestamp));
+    const ret = sendFrameFn(ctx, BigInt(timestamp));
     if (ret < 0) throw new Error(`AAC encode failed with code ${ret}.`);
 
-    nextTimestamp += frameSize;
+    timestamp += frameSize;
     drainWasmPackets();
   }
 }
@@ -352,14 +348,12 @@ function closeWasm() {
   ctx = 0;
   frameSize = 0;
   inputBytesPerFrame = 0;
-  nextTimestamp = 0;
 }
 
 function close() {
   mode = "";
   closeNative();
   closeWasm();
-  rtpTimestampBase = 0;
 }
 
 async function flush() {
@@ -375,7 +369,6 @@ async function init(message) {
   bitrate = message.bitrate;
   expectedAacConfigHex = message.expectedAacConfigHex || expectedAacConfigHex;
   nativeAacBitrates = message.nativeAacBitrates || nativeAacBitrates;
-  rtpTimestampBase = Number(message.rtpTimestampBase) >>> 0;
 
   if (message.preferNative === false) {
     await initWasm("");
@@ -392,9 +385,12 @@ async function init(message) {
   }
 }
 
-function encode(pcm) {
-  if (mode === "native") encodeNative(pcm);
-  else if (mode === "wasm") encodeWasm(pcm);
+function encode(pcm, timestampSamples) {
+  if (!Number.isSafeInteger(timestampSamples) || timestampSamples < 0) {
+    throw new Error("AAC timestamp is invalid.");
+  }
+  if (mode === "native") encodeNative(pcm, timestampSamples);
+  else if (mode === "wasm") encodeWasm(pcm, timestampSamples);
   else throw new Error("AAC encoder is not initialized.");
 }
 
@@ -403,8 +399,13 @@ self.onmessage = event => {
   Promise.resolve()
     .then(async () => {
       if (message.type === "init") await init(message);
-      else if (message.type === "encode") encode(message.pcm);
-      else if (message.type === "timestamp") rtpTimestampBase = Number(message.value) >>> 0;
+      else if (message.type === "encode") {
+        encode(message.pcm, Number(message.timestampSamples));
+        self.postMessage({
+          type: "consumed",
+          queue: mode === "native" && nativeEncoder ? nativeEncoder.encodeQueueSize : 0
+        });
+      }
       else if (message.type === "flush") await flush();
       else if (message.type === "close") close();
     })

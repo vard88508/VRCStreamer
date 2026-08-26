@@ -32,6 +32,7 @@
   "sourceCardTabWindowDisplayVideoTitle": "タブ / ウィンドウ / ディスプレイ映像",
   "sourceCardTabWindowDisplayVideoAudioTitle": "タブ / ウィンドウ / ディスプレイ映像 + 音声",
   "firstSourceTabWindowDisplayVideo": "タブ / ウィンドウ / ディスプレイ映像",
+  "firstSourceVideoExperimentalBadge": "実験的!!!",
   "addSourceMicInputAudio": "マイク / 入力デバイス音声",
   "addSourceTabWindowSystemAudio": "タブ / ウィンドウ / システム音声",
   "addSourceTabWindowDisplayVideo": "タブ / ウィンドウ / ディスプレイ映像"

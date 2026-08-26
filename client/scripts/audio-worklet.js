@@ -77,6 +77,7 @@ class CaptureProcessor extends AudioWorkletProcessor {
     this.channels = config.channels || 2;
     this.pcm = new Float32Array(this.frames * this.channels);
     this.offset = 0;
+    this.timestamp = 0;
   }
 
   process(inputs, outputs) {
@@ -89,6 +90,7 @@ class CaptureProcessor extends AudioWorkletProcessor {
 
     let sourceOffset = 0;
     while (sourceOffset < frameCount) {
+      if (this.offset === 0) this.timestamp = currentFrame + sourceOffset;
       const take = Math.min(this.frames - this.offset, frameCount - sourceOffset);
       for (let i = 0; i < take; i++) {
         const destination = (this.offset + i) * this.channels;
@@ -108,7 +110,10 @@ class CaptureProcessor extends AudioWorkletProcessor {
 
       if (this.offset === this.frames) {
         const pcm = this.pcm;
-        this.port.postMessage(pcm.buffer, [pcm.buffer]);
+        this.port.postMessage(
+          { pcm: pcm.buffer, timestamp: this.timestamp },
+          [pcm.buffer]
+        );
         this.pcm = new Float32Array(this.frames * this.channels);
         this.offset = 0;
       }

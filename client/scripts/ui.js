@@ -870,6 +870,7 @@ function audioStatsSection(info) {
     lines.push(
       `Frame rate: ${info.encodedFps.toFixed(1)} / ${app.config.expectedEncodedFpsLabel} FPS`,
       `Encoder queue: ${info.queue} frames`,
+      `Dropped to stay live: ${info.dropped || 0} frames`,
       `Encoded frames: ${info.encodedFrames}`
     );
   }
@@ -878,17 +879,28 @@ function audioStatsSection(info) {
 }
 
 function videoStatsSection(video) {
-  const pipeline = video.mode === "processor" ? "MediaStreamTrackProcessor" : video.mode || "Worker";
+  const path = video.path === "direct"
+    ? "direct frames"
+    : video.path === "scaled"
+      ? "scaled canvas"
+      : "placeholder canvas";
+  const captureSize = video.trackWidth > 0 && video.trackHeight > 0
+    ? `${video.trackWidth}×${video.trackHeight}`
+    : "unknown";
   return statsSection("VIDEO", [
     "Codec: H.264",
+    `Rate control: adaptive quantizer (QP ${video.quantizer ?? "-"}, limit ${video.limitKbps?.toFixed(0) || "-"} kbps)`,
+    `Quantizer adjustments: ${video.quantizerAdjustments || 0}`,
     `Output: ${app.config.videoWidth}×${app.config.videoHeight} @ ${app.config.videoFps} FPS`,
-    `Capture pipeline: ${pipeline}`,
+    `Capture track: ${captureSize} @ ${videoFpsLabel(video.trackFps)} FPS (${video.trackResizeMode || "unknown"})`,
+    `Pipeline: dedicated worker, ${path}`,
     `Bitrate: ${video.kbps.toFixed(0)} kbps`,
-    `Frame rate: ${videoFpsLabel(video.fps)} / ${app.config.videoFps.toFixed(1)} FPS`,
-    `Captured frame rate: ${videoFpsLabel(video.captureFps)} FPS`,
-    `Track-reported frame rate: ${videoFpsLabel(video.trackFps)} FPS`,
+    `Captured: ${videoFpsLabel(video.sourceFps)} FPS`,
+    `Submitted: ${videoFpsLabel(video.submittedFps)} FPS`,
+    `Encoded: ${videoFpsLabel(video.fps)} / ${app.config.videoFps.toFixed(1)} FPS`,
     `Encoder queue: ${video.queue} frames`,
-    `Dropped frames: ${video.dropped}`
+    `Encoder queue drops: ${video.queueDrops || 0}`,
+    `Repeated during capture stalls: ${video.repeatedFrames || 0}`
   ]);
 }
 

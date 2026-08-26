@@ -21,13 +21,14 @@ use super::media::{
     AudioMessage, StreamerMediaFrame, VideoMessage, h264_sdp_fmtp, parse_streamer_media_frame,
 };
 use super::{
-    AAC_MAX_INGEST_BYTES_PER_SECOND, AppState, Channel, DEFAULT_TOKEN_BUCKET_BURST_SECS,
-    KEYFRAME_REQUEST_MESSAGE, STREAMER_CONTROL_MESSAGES_PER_SECOND,
-    STREAMER_LISTENER_UPDATE_INTERVAL, active_listeners, allow_http_request, cleanup_channel,
-    connection_limit_allows, force_resync_channel, get_or_create_channel, hash_code, limit_allows,
-    max_ws_message_bytes, origin_allowed, password_allowed, peer_id, public_rtsp_base,
-    streamer_hello_message, streamer_listeners_message, text_response, text_response_with_cors,
-    validate_code, wake_media_listeners, wake_video_listeners,
+    AAC_MAX_INGEST_BYTES_PER_SECOND, AAC_SAMPLE_RATE, AppState, Channel,
+    DEFAULT_TOKEN_BUCKET_BURST_SECS, H264_CLOCK_RATE, KEYFRAME_REQUEST_MESSAGE, MEDIA_CLOCK_RATE,
+    STREAMER_CONTROL_MESSAGES_PER_SECOND, STREAMER_LISTENER_UPDATE_INTERVAL, active_listeners,
+    allow_http_request, cleanup_channel, connection_limit_allows, force_resync_channel,
+    get_or_create_channel, hash_code, limit_allows, max_ws_message_bytes, origin_allowed,
+    password_allowed, peer_id, public_rtsp_base, streamer_hello_message,
+    streamer_listeners_message, text_response, text_response_with_cors, validate_code,
+    wake_media_listeners, wake_video_listeners,
 };
 
 pub(crate) enum StreamerTextCommand {
@@ -42,6 +43,35 @@ pub(crate) enum StreamerTextCommand {
 pub(crate) struct IngestQuery {
     code: String,
     password: Option<String>,
+}
+
+pub(crate) struct MediaTimestampNormalizer {
+    source_clock_rate: u32,
+    previous: Option<u32>,
+    wrap_offset: u64,
+}
+
+impl MediaTimestampNormalizer {
+    pub(crate) fn new(source_clock_rate: u32) -> Self {
+        Self {
+            source_clock_rate,
+            previous: None,
+            wrap_offset: 0,
+        }
+    }
+
+    pub(crate) fn normalize(&mut self, source_timestamp: u32) -> u64 {
+        if let Some(previous) = self.previous
+            && source_timestamp < previous
+            && previous - source_timestamp > u32::MAX / 2
+        {
+            self.wrap_offset = self.wrap_offset.saturating_add(1_u64 << 32);
+        }
+        self.previous = Some(source_timestamp);
+
+        let unwrapped = self.wrap_offset.saturating_add(source_timestamp as u64);
+        (unwrapped as u128 * MEDIA_CLOCK_RATE as u128 / self.source_clock_rate as u128) as u64
+    }
 }
 
 pub(crate) async fn ingest_ws(
@@ -142,6 +172,8 @@ async fn streamer_session(
     let mut audio_ingest = TokenBucket::new();
     let mut video_ingest = TokenBucket::new();
     let mut control_ingest = TokenBucket::new();
+    let mut audio_timestamps = MediaTimestampNormalizer::new(AAC_SAMPLE_RATE);
+    let mut video_timestamps = MediaTimestampNormalizer::new(H264_CLOCK_RATE);
     let mut video_quality = 0usize;
     let mut frames = 0usize;
     let mut video_frames = 0usize;
@@ -160,6 +192,7 @@ async fn streamer_session(
         finish_streamer(&state, &key, &channel, &peer, frames).await;
         return;
     }
+    force_resync_channel(&channel);
     wake_media_listeners(&channel);
 
     let mut idle_sleep = Box::pin(sleep_until(
@@ -267,7 +300,7 @@ async fn streamer_session(
                 match parse_streamer_media_frame(frame, &state.config) {
                     Ok(StreamerMediaFrame::Audio {
                         access_unit,
-                        rtp_timestamp,
+                        source_timestamp,
                     }) => {
                         let frame_len = access_unit.len();
                         if frames == 0 {
@@ -275,7 +308,7 @@ async fn streamer_session(
                         }
                         let _ = channel.audio_tx.send(AudioMessage::Frame {
                             access_unit,
-                            rtp_timestamp,
+                            media_timestamp: audio_timestamps.normalize(source_timestamp),
                         });
                         frames += 1;
                         bytes = bytes.saturating_add(frame_len);
@@ -286,7 +319,7 @@ async fn streamer_session(
                     Ok(StreamerMediaFrame::Video {
                         access_unit,
                         keyframe,
-                        rtp_timestamp,
+                        source_timestamp,
                     }) => {
                         if !channel.video_active.swap(true, Ordering::AcqRel) {
                             wake_video_listeners(&channel);
@@ -306,7 +339,7 @@ async fn streamer_session(
                         let _ = channel.video_tx.send(VideoMessage::Frame {
                             access_unit,
                             keyframe,
-                            rtp_timestamp,
+                            media_timestamp: video_timestamps.normalize(source_timestamp),
                         });
                         video_frames += 1;
                         video_bytes = video_bytes.saturating_add(frame_len);
@@ -456,6 +489,7 @@ async fn finish_streamer(
     channel.video_active.store(false, Ordering::Release);
     channel.keyframe_pending.store(false, Ordering::Release);
     channel.set_video_fmtp(None);
+    force_resync_channel(channel);
     wake_media_listeners(channel);
     state.active_streamers.fetch_sub(1, Ordering::AcqRel);
     cleanup_channel(state, key, channel).await;

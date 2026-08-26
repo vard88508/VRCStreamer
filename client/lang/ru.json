@@ -32,6 +32,7 @@
   "sourceCardTabWindowDisplayVideoTitle": "Видео вкладки / окна / экрана",
   "sourceCardTabWindowDisplayVideoAudioTitle": "Видео + аудио вкладки / окна / экрана",
   "firstSourceTabWindowDisplayVideo": "Видео вкладки / окна / экрана",
+  "firstSourceVideoExperimentalBadge": "ЭКСПЕРИМЕНТАЛЬНО!!!",
   "addSourceMicInputAudio": "Звук из микрофона / устройства ввода",
   "addSourceTabWindowSystemAudio": "Звук из вкладки / окна / системы",
   "addSourceTabWindowDisplayVideo": "Видео из вкладки / окна / экрана"
