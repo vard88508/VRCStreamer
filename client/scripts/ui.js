@@ -982,7 +982,8 @@ function updateActiveSourceLabels() {
 }
 
 function sourceGain(source) {
-  const value = Number(source.gainEl && source.gainEl.value);
+  if (!source || !source.gainEl) return 1;
+  const value = Number(source.gainEl.value);
   if (!Number.isFinite(value)) return 1;
   return Math.min(1.5, Math.max(0, value));
 }

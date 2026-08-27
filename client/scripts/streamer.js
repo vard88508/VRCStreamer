@@ -1,9 +1,9 @@
 export function createStreamer(app) {
   const config = app.config;
   const ui = app.ui;
-  const audioWorkletUrl = new URL("audio-worklet.js?v=2r66", import.meta.url);
-  const aacWorkerUrl = new URL("aac-worker.js?v=2r66", import.meta.url);
-  const videoWorkerUrl = new URL("video-worker.js?v=2r66", import.meta.url);
+  const audioWorkletUrl = new URL("audio-worklet.js", import.meta.url);
+  const aacWorkerUrl = new URL("aac-worker.js", import.meta.url);
+  const videoWorkerUrl = new URL("video-worker.js", import.meta.url);
   const videoPlaceholderUrl = new URL("static/live-placeholder-1080.webp", location.href).href;
   const maxAudioBufferedBlocks = 6;
   const audioSwapFlushTimeoutMs = 2000;
