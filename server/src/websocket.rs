@@ -309,6 +309,7 @@ async fn streamer_session(
                         let _ = channel.audio_tx.send(AudioMessage::Frame {
                             access_unit,
                             media_timestamp: audio_timestamps.normalize(source_timestamp),
+                            published_at: Instant::now(),
                         });
                         frames += 1;
                         bytes = bytes.saturating_add(frame_len);

@@ -8,8 +8,8 @@ use super::media::{
 use super::rtsp::{
     RtpClock, RtpMediaTimeline, RtpState, RtspSession, RtspTrack, VideoStreamState,
     build_rtcp_sender_report, channel_video_state, key_from_rtsp_uri, placeholder_access_unit,
-    read_rtsp_request, rtcp_requests_keyframe, rtsp_rtp_info, rtsp_sdp, rtsp_track_from_uri,
-    select_rtsp_interleaved_channel, should_advertise_video,
+    project_rtp_timestamp, read_rtsp_request, rtcp_requests_keyframe, rtsp_rtp_info, rtsp_sdp,
+    rtsp_track_from_uri, select_rtsp_interleaved_channel, should_advertise_video,
 };
 use super::websocket::{
     MediaTimestampNormalizer, StreamerTextCommand, is_websocket_disconnect_noise,
@@ -784,6 +784,18 @@ fn rtcp_sender_report_contains_counts_and_cname() {
     assert_eq!(&packet[28..32], &13u32.to_be_bytes());
     assert_eq!(&packet[32..36], &[0x81, 202, 0, 3]);
     assert!(packet.windows(4).any(|bytes| bytes == b"test"));
+}
+
+#[test]
+fn rtcp_rtp_timestamp_projects_from_latest_media_time() {
+    assert_eq!(
+        project_rtp_timestamp(90_000, Duration::from_millis(500), H264_CLOCK_RATE),
+        135_000
+    );
+    assert_eq!(
+        project_rtp_timestamp(u32::MAX - 9, Duration::from_secs(1), 10),
+        0
+    );
 }
 
 #[test]

@@ -24,6 +24,7 @@ pub(crate) enum AudioMessage {
     Frame {
         access_unit: Bytes,
         media_timestamp: u64,
+        published_at: Instant,
     },
 }
 

@@ -4,7 +4,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{Arc, Mutex as StdMutex, atomic::Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
@@ -518,7 +518,7 @@ async fn rtsp_audio_rtp_task(task: RtspAudioTask) {
     let clock = RtpClock::new(rtp.timestamp, AAC_SAMPLE_RATE, play_started_at);
     let mut next_send_at = TokioInstant::now();
     let mut sleep = Box::pin(sleep_until(next_send_at));
-    let mut rtcp_started = false;
+    let mut rtcp_media_time = None;
     let mut rtcp_sleep = Box::pin(sleep_until(TokioInstant::now() + RTCP_REPORT_INTERVAL));
     let mut packets = 0usize;
     let mut silence_packets = 0usize;
@@ -550,7 +550,11 @@ async fn rtsp_audio_rtp_task(task: RtspAudioTask) {
                         next_send_at = TokioInstant::now();
                         sleep.as_mut().reset(next_send_at);
                     }
-                    Ok(AudioMessage::Frame { access_unit, media_timestamp }) => {
+                    Ok(AudioMessage::Frame {
+                        access_unit,
+                        media_timestamp,
+                        published_at,
+                    }) => {
                         if !stream.streamer.load(Ordering::Acquire) {
                             continue;
                         }
@@ -560,12 +564,15 @@ async fn rtsp_audio_rtp_task(task: RtspAudioTask) {
                             media_timestamp,
                             &clock,
                         );
+                        let media_time = RtcpMediaTime::new(rtp.timestamp, published_at);
                         if let Err(error) = start_rtcp(
                             &mut sender,
                             &writer,
-                            &mut rtcp_started,
+                            rtcp_media_time,
+                            media_time,
                             &mut rtcp_sleep,
                             RTP_AUDIO_SSRC,
+                            AAC_SAMPLE_RATE,
                             &rtp,
                             &key,
                         )
@@ -578,6 +585,7 @@ async fn rtsp_audio_rtp_task(task: RtspAudioTask) {
                             warn!(%peer, %key, %error, "rtsp rtp writer failed");
                             break;
                         }
+                        rtcp_media_time = Some(media_time);
                         packets += 1;
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -589,12 +597,15 @@ async fn rtsp_audio_rtp_task(task: RtspAudioTask) {
                 }
             }
             _ = &mut sleep, if !stream.streamer.load(Ordering::Acquire) => {
+                let media_time = RtcpMediaTime::new(rtp.timestamp, next_send_at.into_std());
                 if let Err(error) = start_rtcp(
                     &mut sender,
                     &writer,
-                    &mut rtcp_started,
+                    rtcp_media_time,
+                    media_time,
                     &mut rtcp_sleep,
                     RTP_AUDIO_SSRC,
+                    AAC_SAMPLE_RATE,
                     &rtp,
                     &key,
                 )
@@ -607,6 +618,7 @@ async fn rtsp_audio_rtp_task(task: RtspAudioTask) {
                     warn!(%peer, %key, %error, "rtsp rtp writer failed");
                     break;
                 }
+                rtcp_media_time = Some(media_time);
 
                 packets += 1;
                 silence_packets += 1;
@@ -617,12 +629,13 @@ async fn rtsp_audio_rtp_task(task: RtspAudioTask) {
                 }
                 sleep.as_mut().reset(next_send_at);
             }
-            _ = &mut rtcp_sleep, if rtcp_started => {
+            _ = &mut rtcp_sleep, if rtcp_media_time.is_some() => {
                 if let Err(error) = sender
                     .send_sender_report(
                         &writer,
                         RTP_AUDIO_SSRC,
-                        clock.timestamp(),
+                        rtcp_media_time.expect("rtcp media time is initialized"),
+                        AAC_SAMPLE_RATE,
                         &rtp,
                         &key,
                     )
@@ -676,7 +689,7 @@ async fn rtsp_video_rtp_task(task: RtspVideoTask) {
     let mut packets = 0usize;
     let mut dropped = 0usize;
     let mut sender = RtpPacketWriter::new(channel, 4 + 12 + RTP_MAX_PAYLOAD_BYTES);
-    let mut rtcp_started = false;
+    let mut rtcp_media_time = None;
     let mut rtcp_sleep = Box::pin(sleep_until(TokioInstant::now() + RTCP_REPORT_INTERVAL));
 
     if channel_video_state(&stream) == VideoStreamState::Video {
@@ -704,12 +717,15 @@ async fn rtsp_video_rtp_task(task: RtspVideoTask) {
                 && let Some(frame) = placeholder_access_unit(&state.placeholders, current_state)
             {
                 rtp.timestamp = video_clock.timestamp();
+                let media_time = RtcpMediaTime::new(rtp.timestamp, StdInstant::now());
                 if let Err(error) = start_rtcp(
                     &mut sender,
                     &writer,
-                    &mut rtcp_started,
+                    rtcp_media_time,
+                    media_time,
                     &mut rtcp_sleep,
                     RTP_VIDEO_SSRC,
+                    H264_CLOCK_RATE,
                     &rtp,
                     &key,
                 )
@@ -722,6 +738,7 @@ async fn rtsp_video_rtp_task(task: RtspVideoTask) {
                     warn!(%peer, %key, %error, "rtsp video placeholder writer failed");
                     break;
                 }
+                rtcp_media_time = Some(media_time);
                 packets += 1;
             }
         }
@@ -770,12 +787,15 @@ async fn rtsp_video_rtp_task(task: RtspVideoTask) {
                         media_timestamp,
                         &video_clock,
                     );
+                    let media_time = RtcpMediaTime::new(rtp.timestamp, published_at);
                     if let Err(error) = start_rtcp(
                         &mut sender,
                         &writer,
-                        &mut rtcp_started,
+                        rtcp_media_time,
+                        media_time,
                         &mut rtcp_sleep,
                         RTP_VIDEO_SSRC,
+                        H264_CLOCK_RATE,
                         &rtp,
                         &key,
                     )
@@ -791,6 +811,7 @@ async fn rtsp_video_rtp_task(task: RtspVideoTask) {
                         warn!(%peer, %key, %error, "rtsp video rtp writer failed");
                         break;
                     }
+                    rtcp_media_time = Some(media_time);
                     packets += 1;
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -802,12 +823,13 @@ async fn rtsp_video_rtp_task(task: RtspVideoTask) {
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
-            _ = &mut rtcp_sleep, if rtcp_started => {
+            _ = &mut rtcp_sleep, if rtcp_media_time.is_some() => {
                 if let Err(error) = sender
                     .send_sender_report(
                         &writer,
                         RTP_VIDEO_SSRC,
-                        video_clock.timestamp(),
+                        rtcp_media_time.expect("rtcp media time is initialized"),
+                        H264_CLOCK_RATE,
                         &rtp,
                         &key,
                     )
@@ -1069,22 +1091,52 @@ struct RtpPacketWriter {
     packet: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
+struct RtcpMediaTime {
+    rtp_timestamp: u32,
+    published_at: StdInstant,
+}
+
+impl RtcpMediaTime {
+    fn new(rtp_timestamp: u32, published_at: StdInstant) -> Self {
+        Self {
+            rtp_timestamp,
+            published_at,
+        }
+    }
+
+    fn timestamp_at(self, now: StdInstant, clock_rate: u32) -> u32 {
+        project_rtp_timestamp(
+            self.rtp_timestamp,
+            now.saturating_duration_since(self.published_at),
+            clock_rate,
+        )
+    }
+}
+
+pub(crate) fn project_rtp_timestamp(timestamp: u32, elapsed: Duration, clock_rate: u32) -> u32 {
+    let whole_ticks = elapsed.as_secs().wrapping_mul(clock_rate as u64);
+    let fractional_ticks = elapsed.subsec_nanos() as u64 * clock_rate as u64 / 1_000_000_000;
+    timestamp.wrapping_add(whole_ticks.wrapping_add(fractional_ticks) as u32)
+}
+
 async fn start_rtcp(
     sender: &mut RtpPacketWriter,
     writer: &SharedRtspWriter,
-    started: &mut bool,
+    current_media_time: Option<RtcpMediaTime>,
+    media_time: RtcpMediaTime,
     timer: &mut Pin<Box<Sleep>>,
     ssrc: u32,
+    clock_rate: u32,
     rtp: &RtpState,
     cname: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if *started {
+    if current_media_time.is_some() {
         return Ok(());
     }
     sender
-        .send_sender_report(writer, ssrc, rtp.timestamp, rtp, cname)
+        .send_sender_report(writer, ssrc, media_time, clock_rate, rtp, cname)
         .await?;
-    *started = true;
     timer
         .as_mut()
         .reset(TokioInstant::now() + RTCP_REPORT_INTERVAL);
@@ -1226,11 +1278,14 @@ impl RtpPacketWriter {
         &mut self,
         writer: &SharedRtspWriter,
         ssrc: u32,
-        rtp_timestamp: u32,
+        media_time: RtcpMediaTime,
+        clock_rate: u32,
         rtp: &RtpState,
         cname: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let now = StdInstant::now();
         let ntp = ntp_timestamp(SystemTime::now());
+        let rtp_timestamp = media_time.timestamp_at(now, clock_rate);
         build_rtcp_sender_report(
             &mut self.packet,
             self.channel.saturating_add(1),
