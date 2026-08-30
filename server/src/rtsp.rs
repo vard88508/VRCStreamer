@@ -2,6 +2,7 @@ use std::{
     fmt::{self, Write as _},
     io::ErrorKind,
     net::{IpAddr, SocketAddr},
+    pin::Pin,
     sync::{Arc, Mutex as StdMutex, atomic::Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -12,7 +13,7 @@ use tokio::{
     net::{TcpListener, tcp::OwnedWriteHalf},
     sync::{Mutex, broadcast},
     task::JoinHandle,
-    time::{Instant as TokioInstant, sleep_until, timeout},
+    time::{Instant as TokioInstant, Sleep, sleep_until, timeout},
 };
 use tracing::{debug, info, trace, warn};
 
@@ -517,7 +518,8 @@ async fn rtsp_audio_rtp_task(task: RtspAudioTask) {
     let clock = RtpClock::new(rtp.timestamp, AAC_SAMPLE_RATE, play_started_at);
     let mut next_send_at = TokioInstant::now();
     let mut sleep = Box::pin(sleep_until(next_send_at));
-    let mut rtcp_sleep = Box::pin(sleep_until(TokioInstant::now()));
+    let mut rtcp_started = false;
+    let mut rtcp_sleep = Box::pin(sleep_until(TokioInstant::now() + RTCP_REPORT_INTERVAL));
     let mut packets = 0usize;
     let mut silence_packets = 0usize;
     let mut dropped = 0usize;
@@ -558,6 +560,20 @@ async fn rtsp_audio_rtp_task(task: RtspAudioTask) {
                             media_timestamp,
                             &clock,
                         );
+                        if let Err(error) = start_rtcp(
+                            &mut sender,
+                            &writer,
+                            &mut rtcp_started,
+                            &mut rtcp_sleep,
+                            RTP_AUDIO_SSRC,
+                            &rtp,
+                            &key,
+                        )
+                        .await
+                        {
+                            warn!(%peer, %key, %error, "rtsp audio rtcp writer failed");
+                            break;
+                        }
                         if let Err(error) = sender.send_aac(&writer, &access_unit, &mut rtp).await {
                             warn!(%peer, %key, %error, "rtsp rtp writer failed");
                             break;
@@ -573,6 +589,20 @@ async fn rtsp_audio_rtp_task(task: RtspAudioTask) {
                 }
             }
             _ = &mut sleep, if !stream.streamer.load(Ordering::Acquire) => {
+                if let Err(error) = start_rtcp(
+                    &mut sender,
+                    &writer,
+                    &mut rtcp_started,
+                    &mut rtcp_sleep,
+                    RTP_AUDIO_SSRC,
+                    &rtp,
+                    &key,
+                )
+                .await
+                {
+                    warn!(%peer, %key, %error, "rtsp audio rtcp writer failed");
+                    break;
+                }
                 if let Err(error) = sender.send_aac(&writer, AAC_SILENCE_ACCESS_UNIT, &mut rtp).await {
                     warn!(%peer, %key, %error, "rtsp rtp writer failed");
                     break;
@@ -587,7 +617,7 @@ async fn rtsp_audio_rtp_task(task: RtspAudioTask) {
                 }
                 sleep.as_mut().reset(next_send_at);
             }
-            _ = &mut rtcp_sleep => {
+            _ = &mut rtcp_sleep, if rtcp_started => {
                 if let Err(error) = sender
                     .send_sender_report(
                         &writer,
@@ -646,7 +676,8 @@ async fn rtsp_video_rtp_task(task: RtspVideoTask) {
     let mut packets = 0usize;
     let mut dropped = 0usize;
     let mut sender = RtpPacketWriter::new(channel, 4 + 12 + RTP_MAX_PAYLOAD_BYTES);
-    let mut rtcp_sleep = Box::pin(sleep_until(TokioInstant::now()));
+    let mut rtcp_started = false;
+    let mut rtcp_sleep = Box::pin(sleep_until(TokioInstant::now() + RTCP_REPORT_INTERVAL));
 
     if channel_video_state(&stream) == VideoStreamState::Video {
         request_video_keyframe(&stream);
@@ -682,6 +713,20 @@ async fn rtsp_video_rtp_task(task: RtspVideoTask) {
                 && let Some(frame) = placeholder_access_unit(&state.placeholders, current_state)
             {
                 rtp.timestamp = video_clock.timestamp();
+                if let Err(error) = start_rtcp(
+                    &mut sender,
+                    &writer,
+                    &mut rtcp_started,
+                    &mut rtcp_sleep,
+                    RTP_VIDEO_SSRC,
+                    &rtp,
+                    &key,
+                )
+                .await
+                {
+                    warn!(%peer, %key, %error, "rtsp video rtcp writer failed");
+                    break;
+                }
                 if let Err(error) = sender.send_h264_access_unit(&writer, frame, &mut rtp).await {
                     warn!(%peer, %key, %error, "rtsp video placeholder writer failed");
                     break;
@@ -724,6 +769,20 @@ async fn rtsp_video_rtp_task(task: RtspVideoTask) {
                         media_timestamp,
                         &video_clock,
                     );
+                    if let Err(error) = start_rtcp(
+                        &mut sender,
+                        &writer,
+                        &mut rtcp_started,
+                        &mut rtcp_sleep,
+                        RTP_VIDEO_SSRC,
+                        &rtp,
+                        &key,
+                    )
+                    .await
+                    {
+                        warn!(%peer, %key, %error, "rtsp video rtcp writer failed");
+                        break;
+                    }
                     if let Err(error) = sender
                         .send_h264_access_unit(&writer, &access_unit, &mut rtp)
                         .await
@@ -742,7 +801,7 @@ async fn rtsp_video_rtp_task(task: RtspVideoTask) {
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
-            _ = &mut rtcp_sleep => {
+            _ = &mut rtcp_sleep, if rtcp_started => {
                 if let Err(error) = sender
                     .send_sender_report(
                         &writer,
@@ -1007,6 +1066,28 @@ async fn write_rtsp_response(
 struct RtpPacketWriter {
     channel: u8,
     packet: Vec<u8>,
+}
+
+async fn start_rtcp(
+    sender: &mut RtpPacketWriter,
+    writer: &SharedRtspWriter,
+    started: &mut bool,
+    timer: &mut Pin<Box<Sleep>>,
+    ssrc: u32,
+    rtp: &RtpState,
+    cname: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if *started {
+        return Ok(());
+    }
+    sender
+        .send_sender_report(writer, ssrc, rtp.timestamp, rtp, cname)
+        .await?;
+    *started = true;
+    timer
+        .as_mut()
+        .reset(TokioInstant::now() + RTCP_REPORT_INTERVAL);
+    Ok(())
 }
 
 impl RtpPacketWriter {
