@@ -879,11 +879,7 @@ function audioStatsSection(info) {
 }
 
 function videoStatsSection(video) {
-  const path = video.path === "direct"
-    ? "direct frames"
-    : video.path === "scaled"
-      ? "scaled canvas"
-      : "placeholder canvas";
+  const path = video.path === "normalized" ? "normalized canvas" : "placeholder canvas";
   const captureSize = video.trackWidth > 0 && video.trackHeight > 0
     ? `${video.trackWidth}×${video.trackHeight}`
     : "unknown";
@@ -900,6 +896,7 @@ function videoStatsSection(video) {
     `Encoded: ${videoFpsLabel(video.fps)} / ${app.config.videoFps.toFixed(1)} FPS`,
     `Encoder queue: ${video.queue} frames`,
     `Encoder queue drops: ${video.queueDrops || 0}`,
+    `Capture buffer drops: ${video.sourceBufferDrops || 0}`,
     `Repeated during capture stalls: ${video.repeatedFrames || 0}`
   ]);
 }

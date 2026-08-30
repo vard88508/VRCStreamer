@@ -2,6 +2,7 @@ const VIDEO_FRAME_HEADER_BYTES = 5;
 const H264_CLOCK_RATE = 90000;
 const ANNEX_B_START_CODE = new Uint8Array([0, 0, 0, 1]);
 const MAX_ENCODER_QUEUE = 2;
+const SOURCE_BUFFER_FRAMES = 2;
 const BITRATE_HEADROOM = 0.9;
 const MIN_QUANTIZER = 20;
 const MAX_QUANTIZER = 51;
@@ -12,8 +13,11 @@ let canvas = null;
 let ctx = null;
 let sourceReader = null;
 let sourceGeneration = 0;
-let latestFrame = null;
+let sourceBuffer = [];
+let sourceBufferReadyAt = 0;
+let renderedSourceFrame = false;
 let pacingTimer = 0;
+let scheduledFrameIndex = 0;
 let statsTimer = 0;
 let closed = true;
 let failed = false;
@@ -26,15 +30,16 @@ let height = 720;
 let fps = 30;
 let bitrateLimit = 2000000;
 let quantizer = INITIAL_QUANTIZER;
-let keyframeInterval = 60;
-let framePeriodMs = 1000 / 30;
+let keyframeInterval = 30;
 let framePeriodUs = 33333;
 let timelineStartedAt = 0;
+let lastFrameIndex = -1;
 let lastTimestampUs = -1;
 let lastKeyframeTimestampUs = -2000000;
 let submitted = 0;
 let encoded = 0;
 let sourceFrames = 0;
+let sourceBufferDrops = 0;
 let queueDrops = 0;
 let repeatedFrames = 0;
 let encodedBytes = 0;
@@ -125,10 +130,6 @@ function frameHeight(frame) {
   return frame.displayHeight || frame.codedHeight || frame.height || height;
 }
 
-function frameMatchesOutput(frame) {
-  return frameWidth(frame) === width && frameHeight(frame) === height;
-}
-
 function drawFrame(frame) {
   const sourceWidth = frameWidth(frame);
   const sourceHeight = frameHeight(frame);
@@ -166,36 +167,35 @@ async function loadPlaceholderImage(url) {
   placeholderImage = image;
 }
 
-function mediaTimestampUs() {
-  const elapsed = Math.round((performance.now() - timelineStartedAt) * 1000);
-  lastTimestampUs = Math.max(lastTimestampUs + 1, elapsed);
-  return lastTimestampUs;
+function timelineElapsedMs() {
+  return Math.max(0, performance.now() - timelineStartedAt);
 }
 
-function createOutputFrame(source, timestamp) {
-  if (source && frameMatchesOutput(source)) {
-    outputPath = "direct";
-    return new VideoFrame(source, { timestamp, duration: framePeriodUs });
-  }
+function frameTimestampUs(frameIndex) {
+  return Math.round(frameIndex * 1000000 / fps);
+}
+
+function createOutputFrame(source, showPlaceholder, timestamp, duration) {
   if (source) {
     drawFrame(source);
-    outputPath = "scaled";
-  } else {
+    outputPath = "normalized";
+  } else if (showPlaceholder) {
     drawPlaceholder();
     outputPath = "placeholder";
+  } else {
+    outputPath = "normalized";
   }
-  return new VideoFrame(canvas, { timestamp, duration: framePeriodUs });
+  return new VideoFrame(canvas, { timestamp, duration });
 }
 
-function submitFrame(source, repeated = false) {
-  if (closed || paused || !encoder || encoder.state !== "configured") return;
+function submitFrame(source, showPlaceholder, timestamp, duration, repeated = false) {
+  if (closed || paused || !encoder || encoder.state !== "configured") return false;
   if (encoder.encodeQueueSize >= MAX_ENCODER_QUEUE) {
     queueDrops++;
-    return;
+    return false;
   }
 
-  const timestamp = mediaTimestampUs();
-  const frame = createOutputFrame(source, timestamp);
+  const frame = createOutputFrame(source, showPlaceholder, timestamp, duration);
   try {
     const keyFrame = forceNextKeyframe
       || timestamp - lastKeyframeTimestampUs >= keyframeInterval * framePeriodUs;
@@ -204,6 +204,7 @@ function submitFrame(source, repeated = false) {
     if (keyFrame) lastKeyframeTimestampUs = timestamp;
     if (repeated) repeatedFrames++;
     submitted++;
+    return true;
   } finally {
     frame.close();
   }
@@ -214,61 +215,66 @@ function clearPacingTimer() {
   pacingTimer = 0;
 }
 
-function runPlaceholder() {
+function scheduleNextFrame() {
+  if (closed || paused || pacingTimer) return;
+  const elapsedMs = timelineElapsedMs();
+  const elapsedFrame = Math.ceil(elapsedMs * fps / 1000);
+  scheduledFrameIndex = Math.max(elapsedFrame, lastFrameIndex + 1);
+  const delay = Math.max(0, scheduledFrameIndex * 1000 / fps - elapsedMs);
+  pacingTimer = setTimeout(runPacing, delay);
+}
+
+function runPacing() {
   pacingTimer = 0;
-  if (closed || paused || !placeholder) return;
+  if (closed || paused) return;
+  let frameIndex = Math.max(
+    scheduledFrameIndex,
+    Math.floor(timelineElapsedMs() * fps / 1000),
+    lastFrameIndex + 1
+  );
+  let timestamp = frameTimestampUs(frameIndex);
+  while (timestamp <= lastTimestampUs) {
+    frameIndex++;
+    timestamp = frameTimestampUs(frameIndex);
+  }
+  const duration = frameTimestampUs(frameIndex + 1) - timestamp;
+  lastFrameIndex = frameIndex;
+  lastTimestampUs = timestamp;
+  const sourceReady = !placeholder && (
+    renderedSourceFrame
+    || sourceBuffer.length >= SOURCE_BUFFER_FRAMES
+    || timelineElapsedMs() >= sourceBufferReadyAt
+  );
+  const source = sourceReady && sourceBuffer.length ? sourceBuffer.shift() : null;
+  const showPlaceholder = placeholder || !renderedSourceFrame && !source;
+  const repeated = !showPlaceholder && !source;
   try {
-    submitFrame(null);
+    if (submitFrame(source, showPlaceholder, timestamp, duration, repeated) && source) {
+      renderedSourceFrame = true;
+    }
   } catch (error) {
     void fail(error);
     return;
+  } finally {
+    if (source) source.close();
   }
-  pacingTimer = setTimeout(runPlaceholder, framePeriodMs);
-}
-
-function repeatStalledFrame() {
-  pacingTimer = 0;
-  if (closed || paused || placeholder || !latestFrame) return;
-  try {
-    submitFrame(latestFrame, true);
-  } catch (error) {
-    void fail(error);
-    return;
-  }
-  pacingTimer = setTimeout(repeatStalledFrame, framePeriodMs);
-}
-
-function scheduleStallFallback() {
-  clearPacingTimer();
-  if (!closed && !paused && !placeholder && latestFrame) {
-    pacingTimer = setTimeout(repeatStalledFrame, framePeriodMs * 1.5);
-  }
+  scheduleNextFrame();
 }
 
 function startCurrentOutput() {
-  clearPacingTimer();
   if (closed || paused) return;
-  if (placeholder || !latestFrame) {
-    placeholder = true;
-    runPlaceholder();
-  } else {
-    try {
-      submitFrame(latestFrame);
-    } catch (error) {
-      void fail(error);
-      return;
-    }
-    scheduleStallFallback();
-  }
+  if (!placeholder && !renderedSourceFrame && sourceBuffer.length === 0) return;
+  scheduleNextFrame();
 }
 
-function closeLatestFrame() {
-  if (latestFrame) latestFrame.close();
-  latestFrame = null;
+function clearSourceBuffer() {
+  for (const frame of sourceBuffer) frame.close();
+  sourceBuffer = [];
 }
 
 function enterPlaceholder(start = true) {
-  closeLatestFrame();
+  clearSourceBuffer();
+  renderedSourceFrame = false;
   placeholder = true;
   forceNextKeyframe = true;
   if (start) startCurrentOutput();
@@ -276,19 +282,18 @@ function enterPlaceholder(start = true) {
 
 function onSourceFrame(frame) {
   sourceFrames++;
-  const previous = latestFrame;
-  latestFrame = frame;
-  if (previous) previous.close();
-  placeholder = false;
-  clearPacingTimer();
-  if (closed || paused) return;
-  try {
-    submitFrame(frame);
-  } catch (error) {
-    void fail(error);
-    return;
+  if (sourceBuffer.length === SOURCE_BUFFER_FRAMES) {
+    sourceBuffer.shift().close();
+    sourceBufferDrops++;
   }
-  scheduleStallFallback();
+  sourceBuffer.push(frame);
+  if (placeholder) {
+    sourceBufferReadyAt = timelineElapsedMs() + 1000 / fps;
+    renderedSourceFrame = false;
+    forceNextKeyframe = true;
+  }
+  placeholder = false;
+  startCurrentOutput();
 }
 
 async function stopSource() {
@@ -360,6 +365,7 @@ function postStats() {
     type: "stats",
     stats: {
       queueDrops,
+      sourceBufferDrops,
       repeatedFrames,
       submittedFps: submittedDelta / elapsed,
       fps: encodedDelta / elapsed,
@@ -483,9 +489,9 @@ async function reconfigure(message) {
     fps = message.fps;
     bitrateLimit = message.bitrate;
     quantizer = INITIAL_QUANTIZER;
-    keyframeInterval = fps * 2;
-    framePeriodMs = 1000 / fps;
+    keyframeInterval = fps;
     framePeriodUs = Math.round(1000000 / fps);
+    lastFrameIndex = Math.floor(lastTimestampUs * fps / 1000000);
     canvas.width = width;
     canvas.height = height;
     avcHeader = null;
@@ -511,15 +517,20 @@ async function init(message) {
   fps = message.fps;
   bitrateLimit = message.bitrate;
   quantizer = INITIAL_QUANTIZER;
-  keyframeInterval = fps * 2;
-  framePeriodMs = 1000 / Math.max(1, fps);
+  keyframeInterval = fps;
   framePeriodUs = Math.round(1000000 / Math.max(1, fps));
   timelineStartedAt = performance.now() - Math.max(0, Number(message.timelineOffsetMs) || 0);
+  lastFrameIndex = -1;
   lastTimestampUs = -1;
+  sourceBuffer = [];
+  sourceBufferReadyAt = 0;
+  renderedSourceFrame = false;
+  scheduledFrameIndex = 0;
   lastKeyframeTimestampUs = -keyframeInterval * framePeriodUs;
   submitted = 0;
   encoded = 0;
   sourceFrames = 0;
+  sourceBufferDrops = 0;
   queueDrops = 0;
   repeatedFrames = 0;
   encodedBytes = 0;
@@ -544,7 +555,11 @@ async function init(message) {
   const config = encoderConfig(width, height, fps, bitrateLimit);
   await assertEncoderSupport(config);
   canvas = new OffscreenCanvas(width, height);
-  ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+  ctx = canvas.getContext("2d", {
+    alpha: false,
+    desynchronized: true,
+    colorSpace: "srgb"
+  });
   if (!ctx) throw new Error("OffscreenCanvas 2D context is not available.");
   encoder = createEncoder(config);
   await loadPlaceholderImage(placeholderImageUrl);
@@ -559,7 +574,7 @@ async function closeAll() {
   clearInterval(statsTimer);
   statsTimer = 0;
   await stopSource();
-  closeLatestFrame();
+  clearSourceBuffer();
   if (placeholderImage) {
     placeholderImage.close();
     placeholderImage = null;
