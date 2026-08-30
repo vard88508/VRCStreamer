@@ -437,6 +437,28 @@ fn passwords_are_optional_and_exact() {
 }
 
 #[test]
+fn websocket_origin_and_cors_share_one_policy() {
+    let mut config = test_config();
+    config.allowed_origins = vec!["https://client.example".to_owned()];
+    let mut headers = HeaderMap::new();
+
+    assert!(origin_allowed(&headers, &config));
+
+    headers.insert(ORIGIN, HeaderValue::from_static("https://client.example"));
+    assert!(origin_allowed(&headers, &config));
+    assert!(cors_origin(&headers, &config).is_some());
+
+    headers.insert(ORIGIN, HeaderValue::from_static("https://other.example"));
+    headers.insert(HOST, HeaderValue::from_static("server.example"));
+    assert!(!origin_allowed(&headers, &config));
+    assert!(cors_origin(&headers, &config).is_none());
+
+    headers.insert(ORIGIN, HeaderValue::from_static("https://server.example"));
+    assert!(origin_allowed(&headers, &config));
+    assert!(cors_origin(&headers, &config).is_some());
+}
+
+#[test]
 fn validator_accepts_raw_aac_access_unit() {
     assert!(validate_aac_access_unit(&[0x21, 0x10, 0x56, 0xe5]).is_ok());
 }

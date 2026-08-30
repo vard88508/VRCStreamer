@@ -52,6 +52,10 @@ function isDisplayMediaConstraintError(error) {
     || /not supported|constraint|parameter|operation/i.test(message);
 }
 
+function isMediaSelectionCancelled(error) {
+  return error?.name === "AbortError" || error?.name === "NotAllowedError";
+}
+
 async function getDisplayMediaCompat(primary, fallbacks = []) {
   try {
     return await navigator.mediaDevices.getDisplayMedia(primary);
@@ -160,11 +164,30 @@ function stopMediaStream(mediaStream) {
   if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
 }
 
+function closeWebSocket(ws, code, reason) {
+  if (!ws || (ws.readyState !== WebSocket.OPEN && ws.readyState !== WebSocket.CONNECTING)) return;
+  try {
+    ws.close(code, reason);
+  } catch (_) {
+    try { ws.close(); } catch (_) {}
+  }
+}
+
 function closeAudioContext(audioContext) {
   if (!audioContext || audioContext.state === "closed") return;
   try {
     void audioContext.close().catch(() => {});
   } catch (_) {}
+}
+
+function isSystemSource(kind) {
+  return kind === "screen" || kind === "video";
+}
+
+function rejectUnsupportedSource(kind) {
+  if (!isSystemSource(kind) || !ui.systemCaptureDisabled()) return false;
+  ui.showSystemSourceHint(kind);
+  return true;
 }
 
 async function createCaptureNode(audioContext, onBlock) {
@@ -799,9 +822,7 @@ function disposeVideoSource(source, stopStream = true, holdVideo = true) {
     if (holdVideo) showActiveVideoPlaceholder(source);
     else stopActiveVideo(source);
   }
-  try { source.node && source.node.disconnect(); } catch (_) {}
-  try { source.processor && source.processor.disconnect(); } catch (_) {}
-  try { source.processor && source.processor.port.close(); } catch (_) {}
+  disconnectSourceAudio(source);
   if (source.previewEl) {
     source.previewEl.pause();
     source.previewEl.srcObject = null;
@@ -820,11 +841,60 @@ function removeVideoSource(source) {
 
 function disposeAudioSource(source, stopStream = true) {
   if (!source) return;
-  try { source.node.disconnect(); } catch (_) {}
-  try { source.processor.disconnect(); } catch (_) {}
-  try { source.processor.port.close(); } catch (_) {}
+  disconnectSourceAudio(source);
   if (source.block) source.block.remove();
   if (stopStream) stopMediaStream(source.mediaStream);
+}
+
+function createSourceAudio(mediaStream) {
+  const audioContext = app.active.audioContext;
+  return {
+    node: audioContext.createMediaStreamSource(mediaStream),
+    processor: new AudioWorkletNode(audioContext, "source-processor", {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [2]
+    })
+  };
+}
+
+function disconnectSourceAudio(source) {
+  if (!source) return;
+  try { source.node && source.node.disconnect(); } catch (_) {}
+  try { source.processor && source.processor.disconnect(); } catch (_) {}
+  try { source.processor && source.processor.port.close(); } catch (_) {}
+}
+
+function initializeSourceAudio(source, settingsKind, settings) {
+  if (source.processor) {
+    source.processor.port.onmessage = event => {
+      const message = event.data;
+      if (message && message.type === "level") ui.updateSourceLevel(source, message.peak);
+    };
+    const initial = ui.normalizeRuntimeSourceSettings(
+      settingsKind,
+      settings || ui.loadSourceSettings(settingsKind)
+    );
+    source.gainEl.value = String(initial.gain);
+    source.muteEl.checked = Boolean(initial.mute);
+    if (source.monoEl) source.monoEl.checked = Boolean(initial.forceMono);
+  }
+  applyAudioSourceSettings(source);
+  ui.saveSourceSettings(source);
+}
+
+function connectSourceAudio(source) {
+  if (!source.processor) return;
+  source.node.connect(source.processor);
+  source.processor.connect(app.active.mixer);
+}
+
+function mountSourceBlock(source, previous, replacedSource = null) {
+  const previousBlock = previous?.block;
+  const fallbackBlock = replacedSource?.block;
+  if (previousBlock?.parentNode) previousBlock.replaceWith(source.block);
+  else if (fallbackBlock?.parentNode) fallbackBlock.replaceWith(source.block);
+  else ui.els.sourcesEl.appendChild(source.block);
 }
 
 function removeAudioSource(kind, source) {
@@ -843,12 +913,7 @@ function installAudioSource(kind, mediaStream, deviceId = kind === "mic" ? ui.el
   const replacedVideo = kind === "screen" ? app.active.sources.video : null;
   if (replacedVideo) app.active.sources.video = null;
 
-  const node = app.active.audioContext.createMediaStreamSource(mediaStream);
-  const processor = new AudioWorkletNode(app.active.audioContext, "source-processor", {
-    numberOfInputs: 1,
-    numberOfOutputs: 1,
-    outputChannelCount: [2]
-  });
+  const { node, processor } = createSourceAudio(mediaStream);
   const next = {
     kind,
     name: ui.sourceDisplayName(kind, mediaStream),
@@ -858,31 +923,13 @@ function installAudioSource(kind, mediaStream, deviceId = kind === "mic" ? ui.el
     processor
   };
   ui.createSourceBlock(next);
-  processor.port.onmessage = event => {
-    const message = event.data;
-    if (message && message.type === "level") ui.updateSourceLevel(next, message.peak);
-  };
-  const initialSettings = settings
-    ? ui.normalizeRuntimeSourceSettings(kind, settings)
-    : ui.normalizeRuntimeSourceSettings(kind, ui.loadSourceSettings(kind));
-  next.gainEl.value = String(initialSettings.gain);
-  next.muteEl.checked = Boolean(initialSettings.mute);
-  next.monoEl.checked = Boolean(initialSettings.forceMono);
-  applyAudioSourceSettings(next);
-  ui.saveSourceSettings(next);
+  initializeSourceAudio(next, kind, settings);
 
   const previous = app.active.sources[kind];
   app.active.sources[kind] = next;
 
-  node.connect(processor);
-  processor.connect(app.active.mixer);
-  if (previous && previous.block && previous.block.parentNode) {
-    previous.block.replaceWith(next.block);
-  } else if (replacedVideo && replacedVideo.block && replacedVideo.block.parentNode) {
-    replacedVideo.block.replaceWith(next.block);
-  } else {
-    ui.els.sourcesEl.appendChild(next.block);
-  }
+  connectSourceAudio(next);
+  mountSourceBlock(next, previous, replacedVideo);
   if (previous) disposeAudioSource(previous);
   if (replacedVideo) disposeVideoSource(replacedVideo);
 
@@ -925,6 +972,10 @@ async function requestVideoSource() {
   return mediaStream;
 }
 
+function requestSource(kind, deviceId) {
+  return kind === "video" ? requestVideoSource() : requestAudioSource(kind, deviceId);
+}
+
 async function installVideoSource(mediaStream, settings = null) {
   if (!app.active) {
     stopMediaStream(mediaStream);
@@ -946,44 +997,18 @@ async function installVideoSource(mediaStream, settings = null) {
     processor: null
   };
   if (hasAudio) {
-    next.node = app.active.audioContext.createMediaStreamSource(mediaStream);
-    next.processor = new AudioWorkletNode(app.active.audioContext, "source-processor", {
-      numberOfInputs: 1,
-      numberOfOutputs: 1,
-      outputChannelCount: [2]
-    });
+    Object.assign(next, createSourceAudio(mediaStream));
   }
   ui.createSourceBlock(next);
-  if (hasAudio) {
-    next.processor.port.onmessage = event => {
-      const message = event.data;
-      if (message && message.type === "level") ui.updateSourceLevel(next, message.peak);
-    };
-    const initialSettings = settings
-      ? ui.normalizeRuntimeSourceSettings("video", settings)
-      : ui.normalizeRuntimeSourceSettings("video", ui.loadSourceSettings("video"));
-    next.gainEl.value = String(initialSettings.gain);
-    next.muteEl.checked = Boolean(initialSettings.mute);
-  }
   ui.updateSourceVideoPreview(next);
-  applyAudioSourceSettings(next);
-  ui.saveSourceSettings(next);
+  initializeSourceAudio(next, "video", settings);
 
   const replacedScreen = app.active.sources.screen;
   if (replacedScreen) app.active.sources.screen = null;
   const previous = app.active.sources.video;
   app.active.sources.video = next;
-  if (hasAudio) {
-    next.node.connect(next.processor);
-    next.processor.connect(app.active.mixer);
-  }
-  if (previous && previous.block && previous.block.parentNode) {
-    previous.block.replaceWith(next.block);
-  } else if (replacedScreen && replacedScreen.block && replacedScreen.block.parentNode) {
-    replacedScreen.block.replaceWith(next.block);
-  } else {
-    ui.els.sourcesEl.appendChild(next.block);
-  }
+  connectSourceAudio(next);
+  mountSourceBlock(next, previous, replacedScreen);
   let videoStartSent = false;
   try {
     if (app.active.video) {
@@ -1016,18 +1041,13 @@ async function installVideoSource(mediaStream, settings = null) {
 
 async function addOrReplaceSource(kind, deviceId = null, settings = null, mediaStreamOverride = null) {
   if (!app.active || app.sourceRequestInFlight) return;
-  if ((kind === "screen" || kind === "video") && ui.systemCaptureDisabled()) {
-    ui.showSystemSourceHint(kind);
-    return;
-  }
+  if (rejectUnsupportedSource(kind)) return;
 
   let mediaStream = mediaStreamOverride;
   ui.setSourceRequestBusy(true);
   try {
     if (!mediaStream) {
-      mediaStream = kind === "video"
-        ? await requestVideoSource()
-        : await requestAudioSource(kind, deviceId);
+      mediaStream = await requestSource(kind, deviceId);
     }
     if (!app.active) {
       stopMediaStream(mediaStream);
@@ -1040,7 +1060,8 @@ async function addOrReplaceSource(kind, deviceId = null, settings = null, mediaS
     }
     mediaStream = null;
     ui.updateStreamStatus();
-  } catch {
+  } catch (error) {
+    if (!isMediaSelectionCancelled(error)) console.error("Source change failed:", error);
   } finally {
     stopMediaStream(mediaStream);
     ui.setSourceRequestBusy(false);
@@ -1048,10 +1069,7 @@ async function addOrReplaceSource(kind, deviceId = null, settings = null, mediaS
 }
 
 async function start(kind, deviceId = null, settings = null, mediaStreamOverride = null) {
-  if ((kind === "screen" || kind === "video") && ui.systemCaptureDisabled()) {
-    ui.showSystemSourceHint(kind);
-    return;
-  }
+  if (rejectUnsupportedSource(kind)) return;
   if (app.active) {
     await addOrReplaceSource(kind, deviceId, settings, mediaStreamOverride);
     return;
@@ -1076,9 +1094,7 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
   ui.setSourceRequestBusy(true);
   try {
     if (!mediaStream) {
-      mediaStream = kind === "video"
-        ? await requestVideoSource()
-        : await requestAudioSource(kind, deviceId);
+      mediaStream = await requestSource(kind, deviceId);
     }
 
     encoder = createAacEncoder(
@@ -1202,11 +1218,7 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
       cleanup();
     } else {
       if (encoder) encoder.close();
-      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-        try { ws.close(3000, "start failed"); } catch (_) {
-          try { ws.close(); } catch (_) {}
-        }
-      }
+      closeWebSocket(ws, 3000, "start failed");
       closeAudioContext(audioContext);
       ui.setStreamingControls(false);
     }
@@ -1293,9 +1305,7 @@ function cleanup({ stopStreams = true, updateControls = true } = {}) {
     try { current.wakeLock.release(); } catch (_) {}
   }
   setMediaSessionPlaying(false);
-  if (current.ws.readyState === WebSocket.OPEN || current.ws.readyState === WebSocket.CONNECTING) {
-    try { current.ws.close(1000, "stop"); } catch (_) {}
-  }
+  closeWebSocket(current.ws, 1000, "stop");
   closeAudioContext(current.audioContext);
 }
 

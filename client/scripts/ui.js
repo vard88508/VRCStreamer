@@ -51,6 +51,7 @@ const reportAbuseLinkEl = $("reportAbuseLink");
 const languageSelectEl = $("languageSelect");
 const languageSelectDisplayEl = $("languageSelectDisplay");
 const motdLinkPattern = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/gi;
+const patronTierKeys = ["Tier4", "Tier3", "Tier2", "Tier1"];
 
 let currentLanguage = "en";
 let languageOptions = { en: "English" };
@@ -297,11 +298,11 @@ function patronName(value) {
 
 function normalizePatronTiers(payload) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return [];
-  return app.config.patronTiers
-    .map(tier => {
-      const value = tierPayloadValue(payload, tier.key);
+  return patronTierKeys
+    .map(key => {
+      const value = tierPayloadValue(payload, key);
       return {
-        ...tier,
+        className: key.toLowerCase(),
         names: Array.isArray(value) ? value.map(patronName).filter(Boolean) : []
       };
     })

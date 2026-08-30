@@ -41,17 +41,10 @@ const config = {
   videoPlaceholderHoldMs: 15000,
   maxAudioWsBufferedBytes: 256 * 1024,
   maxVideoWsBufferedBytes: 1024 * 1024,
-  systemCaptureSupported,
-  patronTiers: [
-    { key: "Tier4", className: "tier4" },
-    { key: "Tier3", className: "tier3" },
-    { key: "Tier2", className: "tier2" },
-    { key: "Tier1", className: "tier1" }
-  ]
+  systemCaptureSupported
 };
 
-config.expectedEncodedFps = config.sampleRate / config.framesPerChunk;
-config.expectedEncodedFpsLabel = config.expectedEncodedFps.toFixed(1);
+config.expectedEncodedFpsLabel = (config.sampleRate / config.framesPerChunk).toFixed(1);
 
 const encoderModes = {
   native192: {
@@ -181,6 +174,10 @@ function writeJsonStorage(key, value) {
   writeStorage(key, JSON.stringify(value));
 }
 
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
 function resetStorageIfVersionChanged() {
   try {
     if (localStorage.getItem(storageKeys.version) === storageVersion) return;
@@ -242,7 +239,7 @@ function normalizeBase(value, defaultProtocol) {
 
 function normalizeServerEntry(entry) {
   if (typeof entry === "string") entry = { apiBase: entry };
-  if (!entry || typeof entry !== "object") return null;
+  if (!isRecord(entry)) return null;
   const apiBase = entry.apiBase || entry.api || entry.http || entry.host || "";
   const rtspBase = entry.rtspBase || entry.rtsp || entry.media || "";
   if (typeof apiBase !== "string" || typeof rtspBase !== "string") return null;
@@ -306,7 +303,7 @@ function serverKey(server) {
 }
 
 function normalizeServerMeta(meta) {
-  if (!meta || typeof meta !== "object") return null;
+  if (!isRecord(meta)) return null;
   return {
     name: String(meta.name || "").trim(),
     description: String(meta.description || "").trim(),
@@ -320,7 +317,7 @@ function normalizeServerMeta(meta) {
 function loadServerMetaCache() {
   serverMetaCache = Object.create(null);
   const saved = readJsonStorage(storageKeys.serverMeta, {});
-  if (!saved || typeof saved !== "object" || Array.isArray(saved)) return;
+  if (!isRecord(saved)) return;
   for (const [key, value] of Object.entries(saved)) {
     const meta = normalizeServerMeta(value);
     if (meta && (meta.name || meta.description || meta.rtspBase || meta.policiesLink || meta.reportAbuseLink || meta.video)) {
@@ -385,18 +382,18 @@ function rebuildServers() {
 }
 
 function normalizeRemoteData(payload) {
-  const data = payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {};
+  const data = isRecord(payload) ? payload : {};
   return {
-    motd: data.motd && typeof data.motd === "object" && !Array.isArray(data.motd) ? data.motd : null,
-    patrons: data.patrons && typeof data.patrons === "object" && !Array.isArray(data.patrons) ? data.patrons : null
+    motd: isRecord(data.motd) ? data.motd : null,
+    patrons: isRecord(data.patrons) ? data.patrons : null
   };
 }
 
 function normalizeConfig(payload) {
-  const data = payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {};
+  const data = isRecord(payload) ? payload : {};
   const remoteData = typeof data.remoteData === "string" ? data.remoteData.trim() : "";
   return {
-    langs: data.langs && typeof data.langs === "object" && !Array.isArray(data.langs) ? data.langs : { en: "English" },
+    langs: isRecord(data.langs) ? data.langs : { en: "English" },
     servers: Array.isArray(data.servers) ? data.servers : [],
     remoteData,
     ...normalizeRemoteData(data)
@@ -746,14 +743,12 @@ function applyVideoQuality(quality) {
 
 function savedVideoQuality() {
   const saved = readJsonStorage(storageKeys.videoQuality, {});
-  return saved && typeof saved === "object" && !Array.isArray(saved)
-    ? String(saved[currentServerKey()] || "")
-    : "";
+  return isRecord(saved) ? String(saved[currentServerKey()] || "") : "";
 }
 
 function saveVideoQuality(id) {
   const saved = readJsonStorage(storageKeys.videoQuality, {});
-  const byServer = saved && typeof saved === "object" && !Array.isArray(saved) ? saved : {};
+  const byServer = isRecord(saved) ? saved : {};
   const key = currentServerKey();
   if (id) byServer[key] = id;
   else delete byServer[key];

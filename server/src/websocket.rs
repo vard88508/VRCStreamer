@@ -74,6 +74,11 @@ impl MediaTimestampNormalizer {
     }
 }
 
+fn reset_video_configuration(channel: &Channel, configured: &mut bool) {
+    *configured = false;
+    channel.set_video_fmtp(None);
+}
+
 pub(crate) async fn ingest_ws(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
@@ -255,6 +260,19 @@ async fn streamer_session(
             }
         };
 
+        if matches!(
+            &message,
+            Message::Ping(_) | Message::Pong(_) | Message::Text(_)
+        ) && !control_ingest.allow(
+            1,
+            STREAMER_CONTROL_MESSAGES_PER_SECOND,
+            DEFAULT_TOKEN_BUCKET_BURST_SECS,
+        ) {
+            warn!(%peer, %key, "streamer exceeded control message rate");
+            let _ = socket.send(Message::Close(None)).await;
+            break;
+        }
+
         match message {
             Message::Binary(frame) => {
                 match frame.first().copied() {
@@ -377,42 +395,14 @@ async fn streamer_session(
                 }
             }
             Message::Ping(payload) => {
-                if !control_ingest.allow(
-                    1,
-                    STREAMER_CONTROL_MESSAGES_PER_SECOND,
-                    DEFAULT_TOKEN_BUCKET_BURST_SECS,
-                ) {
-                    warn!(%peer, %key, "streamer exceeded control message rate");
-                    let _ = socket.send(Message::Close(None)).await;
-                    break;
-                }
                 let _ = socket.send(Message::Pong(payload)).await;
             }
-            Message::Pong(_) => {
-                if !control_ingest.allow(
-                    1,
-                    STREAMER_CONTROL_MESSAGES_PER_SECOND,
-                    DEFAULT_TOKEN_BUCKET_BURST_SECS,
-                ) {
-                    warn!(%peer, %key, "streamer exceeded control message rate");
-                    let _ = socket.send(Message::Close(None)).await;
-                    break;
-                }
-            }
+            Message::Pong(_) => {}
             Message::Close(frame) => {
                 let _ = socket.send(Message::Close(frame)).await;
                 break;
             }
             Message::Text(text) => {
-                if !control_ingest.allow(
-                    1,
-                    STREAMER_CONTROL_MESSAGES_PER_SECOND,
-                    DEFAULT_TOKEN_BUCKET_BURST_SECS,
-                ) {
-                    warn!(%peer, %key, "streamer exceeded control message rate");
-                    let _ = socket.send(Message::Close(None)).await;
-                    break;
-                }
                 let command = streamer_text_command(text.as_str());
                 if !state.config.video_enabled
                     && matches!(
@@ -436,15 +426,13 @@ async fn streamer_session(
                         info!(%peer, %key, epoch, listeners, "streamer forced rtsp resync");
                     }
                     Some(StreamerTextCommand::VideoStart) => {
-                        video_configured = false;
-                        channel.set_video_fmtp(None);
+                        reset_video_configuration(&channel, &mut video_configured);
                         channel.video_active.store(true, Ordering::Release);
                         wake_video_listeners(&channel);
                         debug!(%peer, %key, "streamer started h264 video");
                     }
                     Some(StreamerTextCommand::VideoStop) => {
-                        video_configured = false;
-                        channel.set_video_fmtp(None);
+                        reset_video_configuration(&channel, &mut video_configured);
                         channel.video_active.store(false, Ordering::Release);
                         channel.keyframe_pending.store(false, Ordering::Release);
                         let epoch = force_resync_channel(&channel);
@@ -452,8 +440,7 @@ async fn streamer_session(
                         debug!(%peer, %key, epoch, "streamer stopped h264 video");
                     }
                     Some(StreamerTextCommand::VideoReset) => {
-                        video_configured = false;
-                        channel.set_video_fmtp(None);
+                        reset_video_configuration(&channel, &mut video_configured);
                         let epoch = force_resync_channel(&channel);
                         wake_video_listeners(&channel);
                         debug!(%peer, %key, epoch, "streamer reset h264 video configuration");

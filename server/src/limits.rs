@@ -1,4 +1,9 @@
-use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    net::IpAddr,
+    sync::Arc,
+    time::Instant,
+};
 
 use super::{AppState, Config};
 
@@ -36,6 +41,16 @@ impl IpLimitTable {
                 || entry.listeners != 0
                 || now.duration_since(entry.last_seen) < idle_timeout
         });
+    }
+
+    fn entry(&mut self, ip: IpAddr, now: Instant, config: &Config) -> Option<&mut IpLimitEntry> {
+        self.prune_if_due(now, config);
+        let can_insert = self.entries.len() < MAX_IP_LIMIT_ENTRIES;
+        match self.entries.entry(ip) {
+            Entry::Occupied(entry) => Some(entry.into_mut()),
+            Entry::Vacant(entry) if can_insert => Some(entry.insert(IpLimitEntry::new(now))),
+            Entry::Vacant(_) => None,
+        }
     }
 }
 
@@ -110,14 +125,9 @@ pub(crate) fn allow_http_request(state: &Arc<AppState>, ip: IpAddr) -> bool {
         .ip_limits
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    table.prune_if_due(now, &state.config);
-    let limits = &mut table.entries;
-
-    if !limits.contains_key(&ip) && limits.len() >= MAX_IP_LIMIT_ENTRIES {
+    let Some(entry) = table.entry(ip, now, &state.config) else {
         return false;
-    }
-
-    let entry = limits.entry(ip).or_insert_with(|| IpLimitEntry::new(now));
+    };
     if now.duration_since(entry.window_started) >= state.config.http_rate_limit_window {
         entry.window_started = now;
         entry.request_count = 0;
@@ -136,40 +146,54 @@ pub(crate) fn try_acquire_streamer_ip(
     state: &Arc<AppState>,
     ip: IpAddr,
 ) -> Result<Option<StreamerIpGuard>, &'static str> {
-    if state.config.max_streamers_per_ip == 0 {
-        return Ok(None);
-    }
-
-    let now = Instant::now();
-    let mut table = state
-        .ip_limits
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    table.prune_if_due(now, &state.config);
-    let limits = &mut table.entries;
-
-    if !limits.contains_key(&ip) && limits.len() >= MAX_IP_LIMIT_ENTRIES {
-        return Err("too many tracked IPs\n");
-    }
-
-    let entry = limits.entry(ip).or_insert_with(|| IpLimitEntry::new(now));
-    entry.last_seen = now;
-    if entry.streamers >= state.config.max_streamers_per_ip {
-        return Err("too many active streamers from this IP\n");
-    }
-
-    entry.streamers += 1;
-    Ok(Some(StreamerIpGuard {
-        state: state.clone(),
+    try_acquire_ip(
+        state,
         ip,
-    }))
+        IpConnectionKind::Streamer,
+        state.config.max_streamers_per_ip,
+        "too many tracked IPs\n",
+        "too many active streamers from this IP\n",
+    )
 }
 
 pub(crate) fn try_acquire_listener_ip(
     state: &Arc<AppState>,
     ip: IpAddr,
 ) -> Result<Option<ListenerIpGuard>, &'static str> {
-    if state.config.max_listeners_per_ip == 0 {
+    try_acquire_ip(
+        state,
+        ip,
+        IpConnectionKind::Listener,
+        state.config.max_listeners_per_ip,
+        "453 Not Enough Bandwidth",
+        "453 Not Enough Bandwidth",
+    )
+}
+
+#[derive(Clone, Copy)]
+enum IpConnectionKind {
+    Streamer,
+    Listener,
+}
+
+impl IpConnectionKind {
+    fn count_mut(self, entry: &mut IpLimitEntry) -> &mut usize {
+        match self {
+            Self::Streamer => &mut entry.streamers,
+            Self::Listener => &mut entry.listeners,
+        }
+    }
+}
+
+fn try_acquire_ip(
+    state: &Arc<AppState>,
+    ip: IpAddr,
+    kind: IpConnectionKind,
+    limit: usize,
+    table_full_error: &'static str,
+    limit_error: &'static str,
+) -> Result<Option<IpLimitGuard>, &'static str> {
+    if limit == 0 {
         return Ok(None);
     }
 
@@ -178,32 +202,30 @@ pub(crate) fn try_acquire_listener_ip(
         .ip_limits
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    table.prune_if_due(now, &state.config);
-    let limits = &mut table.entries;
-
-    if !limits.contains_key(&ip) && limits.len() >= MAX_IP_LIMIT_ENTRIES {
-        return Err("453 Not Enough Bandwidth");
-    }
-
-    let entry = limits.entry(ip).or_insert_with(|| IpLimitEntry::new(now));
+    let Some(entry) = table.entry(ip, now, &state.config) else {
+        return Err(table_full_error);
+    };
     entry.last_seen = now;
-    if entry.listeners >= state.config.max_listeners_per_ip {
-        return Err("453 Not Enough Bandwidth");
+    let count = kind.count_mut(entry);
+    if *count >= limit {
+        return Err(limit_error);
     }
+    *count += 1;
 
-    entry.listeners += 1;
-    Ok(Some(ListenerIpGuard {
+    Ok(Some(IpLimitGuard {
         state: state.clone(),
         ip,
+        kind,
     }))
 }
 
-pub(crate) struct StreamerIpGuard {
+pub(crate) struct IpLimitGuard {
     state: Arc<AppState>,
     ip: IpAddr,
+    kind: IpConnectionKind,
 }
 
-impl Drop for StreamerIpGuard {
+impl Drop for IpLimitGuard {
     fn drop(&mut self) {
         let mut table = self
             .state
@@ -211,27 +233,12 @@ impl Drop for StreamerIpGuard {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(entry) = table.entries.get_mut(&self.ip) {
-            entry.streamers = entry.streamers.saturating_sub(1);
+            let count = self.kind.count_mut(entry);
+            *count = count.saturating_sub(1);
             entry.last_seen = Instant::now();
         }
     }
 }
 
-pub(crate) struct ListenerIpGuard {
-    state: Arc<AppState>,
-    ip: IpAddr,
-}
-
-impl Drop for ListenerIpGuard {
-    fn drop(&mut self) {
-        let mut table = self
-            .state
-            .ip_limits
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(entry) = table.entries.get_mut(&self.ip) {
-            entry.listeners = entry.listeners.saturating_sub(1);
-            entry.last_seen = Instant::now();
-        }
-    }
-}
+pub(crate) type StreamerIpGuard = IpLimitGuard;
+pub(crate) type ListenerIpGuard = IpLimitGuard;

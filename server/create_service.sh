@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SERVICE_NAME="${SERVICE_NAME:-VRCStreamer}"
+SERVICE_NAME="VRCStreamer"
 SERVER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$SERVER_DIR/VRCStreamer"
 ENV_FILE="$SERVER_DIR/.env"

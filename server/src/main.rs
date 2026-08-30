@@ -823,27 +823,7 @@ fn hex_char(nibble: u8) -> char {
 }
 
 fn origin_allowed(headers: &HeaderMap, config: &Config) -> bool {
-    if config.allow_any_origin {
-        return true;
-    }
-
-    let Some(origin) = headers.get(ORIGIN).and_then(|value| value.to_str().ok()) else {
-        return true;
-    };
-
-    if config
-        .allowed_origins
-        .iter()
-        .any(|allowed| allowed.eq_ignore_ascii_case(origin))
-    {
-        return true;
-    }
-
-    let Some(host) = headers.get(HOST).and_then(|value| value.to_str().ok()) else {
-        return false;
-    };
-
-    origin_host(origin).is_some_and(|origin_host| origin_host.eq_ignore_ascii_case(host))
+    !headers.contains_key(ORIGIN) || cors_origin(headers, config).is_some()
 }
 
 fn apply_http_cors(response: &mut HeaderMap, request: &HeaderMap, config: &Config) {
