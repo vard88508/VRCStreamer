@@ -1,5 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
+use std::time::Instant;
 
 use super::{AAC_MAX_ACCESS_UNIT_BYTES, Config, H264_MAX_NAL_UNITS, MEDIA_FRAME_HEADER_BYTES};
 
@@ -33,6 +34,7 @@ pub(crate) enum VideoMessage {
         access_unit: Bytes,
         keyframe: bool,
         media_timestamp: u64,
+        published_at: Instant,
     },
 }
 

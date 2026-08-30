@@ -340,6 +340,7 @@ async fn streamer_session(
                             access_unit,
                             keyframe,
                             media_timestamp: video_timestamps.normalize(source_timestamp),
+                            published_at: Instant::now(),
                         });
                         video_frames += 1;
                         video_bytes = video_bytes.saturating_add(frame_len);

@@ -39,6 +39,7 @@ const RTCP_PLI: u8 = 1;
 const RTCP_FIR: u8 = 4;
 const NTP_UNIX_EPOCH_OFFSET: u64 = 2_208_988_800;
 const MAX_AUDIO_BACKLOG_FRAMES: usize = 12;
+const MAX_VIDEO_BACKLOG_AGE: Duration = Duration::from_secs(1);
 const MEDIA_TIMELINE_REANCHOR_TICKS: i64 = MEDIA_CLOCK_RATE as i64 * 60 * 30;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -736,8 +737,18 @@ async fn rtsp_video_rtp_task(task: RtspVideoTask) {
                     access_unit,
                     keyframe,
                     media_timestamp,
+                    published_at,
                 }) => {
                     if channel_video_state(&stream) != VideoStreamState::Video {
+                        continue;
+                    }
+                    let queued = rx.len();
+                    if queued > 0 && published_at.elapsed() > MAX_VIDEO_BACKLOG_AGE {
+                        rx = stream.video_tx.subscribe();
+                        seen_keyframe = false;
+                        request_video_keyframe(&stream);
+                        dropped = dropped.saturating_add(queued.saturating_add(1));
+                        debug!(%peer, %key, queued, "rtsp video backlog expired");
                         continue;
                     }
                     if last_state != Some(VideoStreamState::Video) {
