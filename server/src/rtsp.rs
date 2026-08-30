@@ -240,7 +240,7 @@ async fn handle_rtsp_request(
                 return Ok(false);
             }
 
-            let track = rtsp_track_from_uri(&request.uri);
+            let track = rtsp_track_from_uri(&request.uri, session.video_advertised);
             if track == RtspTrack::Video && !session.video_track_allowed() {
                 write_rtsp_response(writer, "404 Not Found", cseq, &[], None).await?;
                 return Ok(false);
@@ -1322,21 +1322,25 @@ pub(crate) fn rtsp_sdp(video_fmtp: Option<&str>) -> String {
          c=IN IP4 0.0.0.0\r\n\
          t=0 0\r\n\
          a=range:npt=now-\r\n\
-         a=control:*\r\n\
-         m=audio 0 RTP/AVP {RTP_AUDIO_PAYLOAD_TYPE}\r\n\
-         a=control:trackID=0\r\n\
-         a=rtpmap:{RTP_AUDIO_PAYLOAD_TYPE} mpeg4-generic/{AAC_SAMPLE_RATE}/{AAC_CHANNELS}\r\n\
-         a=fmtp:{RTP_AUDIO_PAYLOAD_TYPE} config={AAC_AUDIO_SPECIFIC_CONFIG}; indexdeltalength=3; indexlength=3; mode=AAC-hbr; profile-level-id=1; sizelength=13; streamtype=5\r\n"
+         a=control:*\r\n"
     );
     if let Some(video_fmtp) = video_fmtp {
         let _ = write!(
             sdp,
             "m=video 0 RTP/AVP {RTP_VIDEO_PAYLOAD_TYPE}\r\n\
-             a=control:trackID=1\r\n\
+             a=control:trackID=0\r\n\
              a=rtpmap:{RTP_VIDEO_PAYLOAD_TYPE} H264/{H264_CLOCK_RATE}\r\n\
              a=fmtp:{RTP_VIDEO_PAYLOAD_TYPE} {video_fmtp}\r\n"
         );
     }
+    let audio_track_id = usize::from(video_fmtp.is_some());
+    let _ = write!(
+        sdp,
+        "m=audio 0 RTP/AVP {RTP_AUDIO_PAYLOAD_TYPE}\r\n\
+         a=control:trackID={audio_track_id}\r\n\
+         a=rtpmap:{RTP_AUDIO_PAYLOAD_TYPE} mpeg4-generic/{AAC_SAMPLE_RATE}/{AAC_CHANNELS}\r\n\
+         a=fmtp:{RTP_AUDIO_PAYLOAD_TYPE} config={AAC_AUDIO_SPECIFIC_CONFIG}; indexdeltalength=3; indexlength=3; mode=AAC-hbr; profile-level-id=1; sizelength=13; streamtype=5\r\n"
+    );
     sdp
 }
 
@@ -1367,39 +1371,41 @@ pub(crate) fn key_from_rtsp_uri(uri: &str) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-fn rtsp_track_from_uri(uri: &str) -> RtspTrack {
-    if uri
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(uri)
-        .rsplit('/')
-        .next()
-        .is_some_and(|segment| segment.eq_ignore_ascii_case("trackID=1"))
+pub(crate) fn rtsp_track_from_uri(uri: &str, video_advertised: bool) -> RtspTrack {
+    if video_advertised
+        && uri
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(uri)
+            .rsplit('/')
+            .next()
+            .is_some_and(|segment| segment.eq_ignore_ascii_case("trackID=0"))
     {
         return RtspTrack::Video;
     }
     RtspTrack::Audio
 }
 
-fn rtsp_rtp_info(uri: &str, session: &RtspSession) -> String {
+pub(crate) fn rtsp_rtp_info(uri: &str, session: &RtspSession) -> String {
     let base = rtsp_content_base(uri);
     let base = base.trim_end_matches('/');
     let mut out = String::with_capacity(128);
-    if session.audio_setup {
+    if session.video_setup {
         let _ = write!(
             out,
             "url={base}/trackID=0;seq={};rtptime={}",
-            session.audio_rtp.sequence, session.audio_rtp.timestamp
+            session.video_rtp.sequence, session.video_rtp.timestamp
         );
     }
-    if session.video_setup {
+    if session.audio_setup {
         if !out.is_empty() {
             out.push(',');
         }
+        let track_id = usize::from(session.video_advertised);
         let _ = write!(
             out,
-            "url={base}/trackID=1;seq={};rtptime={}",
-            session.video_rtp.sequence, session.video_rtp.timestamp
+            "url={base}/trackID={track_id};seq={};rtptime={}",
+            session.audio_rtp.sequence, session.audio_rtp.timestamp
         );
     }
     out
@@ -1417,8 +1423,9 @@ pub(crate) fn select_rtsp_interleaved_channel(
     requested: Option<u8>,
 ) -> u8 {
     let preferred = requested.unwrap_or(match track {
+        RtspTrack::Audio if session.video_advertised => 2,
         RtspTrack::Audio => 0,
-        RtspTrack::Video => 2,
+        RtspTrack::Video => 0,
     });
     if rtsp_interleaved_channel_available(session, track, preferred) {
         return preferred;

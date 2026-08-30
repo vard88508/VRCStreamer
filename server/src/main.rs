@@ -43,8 +43,8 @@ use media::{AudioMessage, VideoMessage, h264_sdp_fmtp, validate_h264_access_unit
 use rtsp::rtsp_server;
 use websocket::ingest_ws;
 
-const RTP_AUDIO_PAYLOAD_TYPE: u8 = 96;
-const RTP_VIDEO_PAYLOAD_TYPE: u8 = 97;
+const RTP_VIDEO_PAYLOAD_TYPE: u8 = 96;
+const RTP_AUDIO_PAYLOAD_TYPE: u8 = 97;
 const RTP_AUDIO_SSRC: u32 = 0x5652_4341;
 const RTP_VIDEO_SSRC: u32 = 0x5652_4356;
 const AAC_SAMPLE_RATE: u32 = 48_000;
