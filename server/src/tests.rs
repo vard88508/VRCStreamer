@@ -65,6 +65,7 @@ fn test_state(config: Config) -> Arc<AppState> {
     Arc::new(AppState {
         config,
         channels: StdRwLock::new(HashMap::new()),
+        stream_blacklist: StdRwLock::new(HashSet::new()),
         ip_limits: StdMutex::new(IpLimitTable::new()),
         placeholders: Placeholders {
             offline_video: Bytes::new(),
@@ -83,6 +84,37 @@ fn test_state(config: Config) -> Arc<AppState> {
 #[test]
 fn hash_code_matches_sha256_128_bit_hex_prefix() {
     assert_eq!(hash_code("abc"), "ba7816bf8f01cfea414140de5dae2223");
+}
+
+#[test]
+fn stream_blacklist_parses_semicolons_whitespace_and_duplicates() {
+    let entries = parse_stream_blacklist(
+        "A85C0211C512828C4C52DC5716A79E3A;\n1dd5a1d78b07336b21496ccf7bf79b8a;\n\
+         a85c0211c512828c4c52dc5716a79e3a",
+    )
+    .unwrap();
+
+    assert_eq!(entries.len(), 2);
+    assert!(entries.contains("a85c0211c512828c4c52dc5716a79e3a"));
+    assert!(entries.contains("1dd5a1d78b07336b21496ccf7bf79b8a"));
+    assert!(parse_stream_blacklist("not-a-stream-id").is_err());
+}
+
+#[test]
+fn replacing_blacklist_notifies_active_streamers() {
+    let state = test_state(test_config());
+    let key = "a85c0211c512828c4c52dc5716a79e3a";
+    let (channel, ()) = reserve_channel(&state, key, |channel| {
+        channel.streamer.store(true, Ordering::Release);
+    });
+
+    let changed = replace_stream_blacklist(&state, HashSet::from([key.to_owned()]));
+    assert_eq!(changed, Some((1, 1)));
+    assert!(stream_is_blacklisted(&state, key));
+    assert!(replace_stream_blacklist(&state, HashSet::from([key.to_owned()])).is_none());
+
+    channel.streamer.store(false, Ordering::Release);
+    cleanup_channel(&state, key, &channel);
 }
 
 #[test]

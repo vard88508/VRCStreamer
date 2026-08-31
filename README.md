@@ -83,6 +83,16 @@ cd server
 
 If the systemd service is installed, `build.sh` automatically restarts it after a successful build.
 
+## Stream Blacklist
+
+To block publishing to specific stream URLs, create `blacklist.txt` next to the `VRCStreamer` executable. Add the 32-character stream IDs from the URLs, separated by semicolons or new lines:
+
+```text
+a85c0211c512828c4c52dc5716a79e3a;1dd5a1d78b07336b21496ccf7bf79b8a
+```
+
+The server reloads the file every minute. Newly blocked streamers are disconnected, and new publishing attempts for those IDs are rejected. Removing the file or leaving it empty clears the blacklist. Invalid updates are ignored so the previous valid list remains active.
+
 ## Environment
 
 The values below match `.env.example` and the server's built-in defaults.

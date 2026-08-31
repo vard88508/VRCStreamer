@@ -28,8 +28,8 @@ use super::{
     STREAMER_CONTROL_MESSAGES_PER_SECOND, STREAMER_LISTENER_UPDATE_INTERVAL, allow_http_request,
     cleanup_channel, force_resync_channel, hash_code, limit_allows, max_ws_message_bytes,
     origin_allowed, password_allowed, peer_id, public_rtsp_base, reserve_channel,
-    streamer_hello_message, streamer_listeners_message, text_response, text_response_with_cors,
-    validate_code, wake_media_listeners, wake_video_listeners,
+    stream_is_blacklisted, streamer_hello_message, streamer_listeners_message, text_response,
+    text_response_with_cors, validate_code, wake_media_listeners, wake_video_listeners,
 };
 
 pub(crate) enum StreamerTextCommand {
@@ -141,6 +141,17 @@ pub(crate) async fn ingest_ws(
         return text_response(StatusCode::BAD_REQUEST, reason);
     }
 
+    let key = hash_code(&query.code);
+    if stream_is_blacklisted(&state, &key) {
+        warn!(%peer, %key, "rejected blacklisted stream");
+        return text_response_with_cors(
+            StatusCode::FORBIDDEN,
+            "stream is blacklisted\n",
+            &headers,
+            &state.config,
+        );
+    }
+
     let ip_guard = match try_acquire_streamer_ip(&state, addr.ip()) {
         Ok(guard) => guard,
         Err(reason) => {
@@ -154,7 +165,6 @@ pub(crate) async fn ingest_ws(
         }
     };
 
-    let key = hash_code(&query.code);
     let (channel, reserved) = reserve_channel(&state, &key, |channel| {
         channel
             .streamer
@@ -200,6 +210,11 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
     let key = guard.key.as_str();
     let channel = guard.channel.as_ref();
     let peer = guard.peer.as_str();
+    if stream_is_blacklisted(state, key) {
+        warn!(%peer, %key, "disconnected blacklisted streamer during startup");
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    }
     channel.set_video_fmtp(None);
 
     let mut video_configured = false;
@@ -239,6 +254,14 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
 
     loop {
         let message = tokio::select! {
+            _ = channel.blacklist_notify.notified() => {
+                if stream_is_blacklisted(state, key) {
+                    warn!(%peer, %key, "disconnected blacklisted streamer");
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
+                continue;
+            }
             message = socket.recv() => {
                 idle_sleep.as_mut().reset(TokioInstant::now() + state.config.streamer_idle_timeout);
                 match message {

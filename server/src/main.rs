@@ -15,11 +15,13 @@ use bytes::Bytes;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     fmt::Write as _,
     fs,
+    io::ErrorKind,
     net::{IpAddr, SocketAddr},
+    path::{Path, PathBuf},
     process,
     sync::{
         Arc, Mutex as StdMutex, RwLock as StdRwLock,
@@ -77,6 +79,8 @@ const STREAM_ID_HEX_CHARS: usize = 32;
 const STREAM_ID_BYTES: usize = STREAM_ID_HEX_CHARS / 2;
 const STREAM_CODE_BYTES: usize = 32;
 const PLACEHOLDERS_PATH: &str = "placeholders";
+const STREAM_BLACKLIST_FILE: &str = "blacklist.txt";
+const STREAM_BLACKLIST_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
 const STREAMER_LISTENER_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 const STREAMER_CONTROL_MESSAGES_PER_SECOND: usize = 8;
 const RTCP_REPORT_INTERVAL: Duration = Duration::from_secs(5);
@@ -153,6 +157,7 @@ struct Config {
 struct AppState {
     config: Config,
     channels: StdRwLock<HashMap<String, Arc<Channel>>>,
+    stream_blacklist: StdRwLock<HashSet<String>>,
     ip_limits: StdMutex<IpLimitTable>,
     placeholders: Placeholders,
     active_connections: AtomicUsize,
@@ -172,6 +177,7 @@ struct Channel {
     keyframe_pending: AtomicBool,
     last_keyframe_request_ms: AtomicU64,
     keyframe_notify: Notify,
+    blacklist_notify: Notify,
     video_fmtp: StdRwLock<Option<Arc<str>>>,
 }
 
@@ -189,6 +195,7 @@ impl Channel {
             keyframe_pending: AtomicBool::new(false),
             last_keyframe_request_ms: AtomicU64::new(0),
             keyframe_notify: Notify::new(),
+            blacklist_notify: Notify::new(),
             video_fmtp: StdRwLock::new(None),
         }
     }
@@ -235,6 +242,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let bind_addr = config.bind_addr;
+    let blacklist_path = executable_neighbor(STREAM_BLACKLIST_FILE);
+    let stream_blacklist = match load_stream_blacklist(&blacklist_path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            warn!(path = %blacklist_path.display(), %error, "failed to load stream blacklist; starting with an empty list");
+            HashSet::new()
+        }
+    };
+    if !stream_blacklist.is_empty() {
+        info!(
+            path = %blacklist_path.display(),
+            entries = stream_blacklist.len(),
+            "stream blacklist loaded"
+        );
+    }
     let placeholders = match load_placeholders(&config) {
         Ok(placeholders) => placeholders,
         Err(error) => {
@@ -250,6 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AppState {
         config,
         channels: StdRwLock::new(HashMap::new()),
+        stream_blacklist: StdRwLock::new(stream_blacklist),
         ip_limits: StdMutex::new(IpLimitTable::new()),
         placeholders,
         active_connections: AtomicUsize::new(0),
@@ -259,6 +282,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_salt: make_log_salt(),
     });
     install_panic_hook(state.clone());
+    tokio::spawn(watch_stream_blacklist(state.clone(), blacklist_path));
 
     let app = Router::new()
         .route("/", get(root_redirect))
@@ -436,6 +460,102 @@ fn load_placeholders(config: &Config) -> Result<Placeholders, Box<dyn std::error
 fn load_placeholder(dir: &str, name: &str) -> Result<Bytes, Box<dyn std::error::Error>> {
     let bytes = fs::read(std::path::Path::new(dir).join(name))?;
     Ok(Bytes::from(bytes))
+}
+
+fn executable_neighbor(name: &str) -> PathBuf {
+    env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join(name)))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+fn load_stream_blacklist(path: &Path) -> Result<HashSet<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(contents) => parse_stream_blacklist(&contents),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(HashSet::new()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn parse_stream_blacklist(contents: &str) -> Result<HashSet<String>, String> {
+    let mut entries = HashSet::new();
+    for (index, entry) in contents
+        .split(|character: char| character == ';' || character.is_whitespace())
+        .filter(|entry| !entry.is_empty())
+        .enumerate()
+    {
+        let entry = entry.trim_start_matches('\u{feff}');
+        if !valid_hash(entry) {
+            return Err(format!(
+                "blacklist entry {} is not a 32-character hexadecimal stream ID",
+                index + 1
+            ));
+        }
+        entries.insert(entry.to_ascii_lowercase());
+    }
+    Ok(entries)
+}
+
+fn stream_is_blacklisted(state: &AppState, key: &str) -> bool {
+    state
+        .stream_blacklist
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(key)
+}
+
+fn replace_stream_blacklist(state: &AppState, entries: HashSet<String>) -> Option<(usize, usize)> {
+    let entry_count = entries.len();
+    {
+        let mut current = state
+            .stream_blacklist
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *current == entries {
+            return None;
+        }
+        *current = entries;
+    }
+
+    let kicked = notify_blacklisted_streamers(state);
+    Some((entry_count, kicked))
+}
+
+fn notify_blacklisted_streamers(state: &AppState) -> usize {
+    let blacklist = state
+        .stream_blacklist
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let channels = state
+        .channels
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut kicked = 0usize;
+    for key in blacklist.iter() {
+        if let Some(channel) = channels.get(key)
+            && channel.streamer.load(Ordering::Acquire)
+        {
+            channel.blacklist_notify.notify_one();
+            kicked = kicked.saturating_add(1);
+        }
+    }
+    kicked
+}
+
+async fn watch_stream_blacklist(state: Arc<AppState>, path: PathBuf) {
+    loop {
+        tokio::time::sleep(STREAM_BLACKLIST_RELOAD_INTERVAL).await;
+        match load_stream_blacklist(&path) {
+            Ok(entries) => {
+                if let Some((entries, kicked)) = replace_stream_blacklist(&state, entries) {
+                    info!(path = %path.display(), entries, kicked, "stream blacklist reloaded");
+                }
+            }
+            Err(error) => {
+                warn!(path = %path.display(), %error, "failed to reload stream blacklist; keeping the previous list");
+            }
+        }
+    }
 }
 
 async fn root_redirect(
