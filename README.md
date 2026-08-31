@@ -105,18 +105,18 @@ The values below match `.env.example` and the server's built-in defaults.
 | `VIDEO` | Enable H.264 video publishing; `false` restricts publishers to audio<br>Default value: `true` |
 | `AVAILABLE_VIDEO_QUALITY` | Video presets in `widthxheight*fps/bitrate-kbps` format; each preset's bitrate is also its sustained ingest limit<br>Default value: <code>1280x720&#42;30/2000,<br>1280x720&#42;60/4000,<br>1920x1080&#42;30/3000,<br>1920x1080&#42;60/6000</code> |
 | `MAX_H264_FRAME_BYTES` | Maximum size of one H.264 access unit. Values above `8388608` are rejected to bound single-message memory use<br>Default value: `524288` |
-| `VIDEO_INGEST_BURST_SECS` | Token-bucket capacity measured in seconds at the selected video bitrate. Higher values allow longer short-term bitrate spikes without changing the encoder target or allocating a media queue<br>Default value: `2` |
-| `MAX_CONNECTIONS` | Maximum active streamers and RTSP listeners combined. Set to `0` to disable this limit<br>Default value: `320` |
+| `VIDEO_INGEST_BURST_SECS` | Video byte/frame token-bucket capacity measured in seconds at the selected preset. Higher values allow longer short-term delivery spikes without changing the encoder target or allocating a media queue<br>Default value: `2` |
+| `MAX_CONNECTIONS` | Maximum concurrent streamer WebSockets and accepted RTSP connections, including pending RTSP handshakes. Set to `0` to disable this limit<br>Default value: `320` |
 | `MAX_STREAMERS` | Maximum active streamers. Set to `0` to disable this limit<br>Default value: `0` |
 | `MAX_STREAMERS_PER_IP` | Maximum active streamers from one IP address. Set to `0` to disable this limit<br>Default value: `3` |
 | `MAX_LISTENERS_TOTAL` | Maximum active RTSP listeners across all streams. Set to `0` to disable this limit<br>Default value: `0` |
 | `MAX_LISTENERS_PER_STREAM` | Maximum RTSP listeners on one stream URL. Set to `0` to disable this limit<br>Default value: `105` |
-| `MAX_LISTENERS_PER_IP` | Maximum active RTSP listeners from one IP address. Set to `0` to disable this limit<br>Default value: `6` |
+| `MAX_LISTENERS_PER_IP` | Maximum accepted RTSP connections from one IP address, including pending handshakes. Set to `0` to disable this limit<br>Default value: `6` |
 | `EGRESS_KBPS_PER_LISTENER` | Per-listener value used only to estimate outgoing bandwidth in server statistics<br>Default value: `384` |
 | `MAX_HTTP_REQUESTS_PER_IP` | Maximum `/healthz`, `/stats`, and `/ingest` handshake requests from one IP per rate-limit window. Set to `0` to disable this limit<br>Default value: `60` |
 | `HTTP_RATE_LIMIT_WINDOW_SECS` | HTTP rate-limit window in seconds<br>Default value: `60` |
 | `MAX_RTSP_REQUESTS_PER_CONNECTION` | Maximum RTSP commands on one TCP connection, including playback setup and keepalives. Set to `0` to disable this limit<br>Default value: `4096` |
-| `RTSP_HANDSHAKE_TIMEOUT_SECS` | Seconds allowed for a new RTSP connection to complete `SETUP`<br>Default value: `30` |
-| `CHANNEL_BUFFER` | Shared frame queue per stream; larger values tolerate more listener jitter but retain more media in memory<br>Default value: `128` |
+| `RTSP_HANDSHAKE_TIMEOUT_SECS` | Seconds allowed for a new RTSP connection to complete setup and start playback<br>Default value: `30` |
+| `CHANNEL_BUFFER` | Shared frame queue per stream, not per listener; larger values tolerate more listener jitter but retain more media in memory for every active stream<br>Default value: `128` |
 | `STREAMER_IDLE_TIMEOUT_SECS` | Disconnect a streamer after this many seconds without a WebSocket message<br>Default value: `120` |
 | `RUST_LOG` | Server log level, such as `error`, `warn`, `info`, `debug`, or `trace`; `trace` also logs RTSP request headers with sensitive values redacted<br>Default value: `warn` |

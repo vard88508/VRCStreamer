@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, hash_map::Entry},
     net::IpAddr,
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     time::Instant,
 };
 
@@ -87,11 +87,20 @@ impl TokenBucket {
         units_per_second: usize,
         burst_seconds: usize,
     ) -> bool {
+        self.allow_at(Instant::now(), units, units_per_second, burst_seconds)
+    }
+
+    pub(crate) fn allow_at(
+        &mut self,
+        now: Instant,
+        units: usize,
+        units_per_second: usize,
+        burst_seconds: usize,
+    ) -> bool {
         if units_per_second == 0 || burst_seconds == 0 {
             return false;
         }
 
-        let now = Instant::now();
         let capacity = units_per_second.saturating_mul(burst_seconds) as f64;
         if self.initialized {
             self.available = (self.available
@@ -140,6 +149,32 @@ pub(crate) fn allow_http_request(state: &Arc<AppState>, ip: IpAddr) -> bool {
 
     entry.request_count += 1;
     true
+}
+
+pub(crate) fn try_acquire_connection(
+    state: &Arc<AppState>,
+) -> Result<ConnectionGuard, &'static str> {
+    state
+        .active_connections
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (state.config.max_connections == 0 || current < state.config.max_connections)
+                .then_some(current.saturating_add(1))
+        })
+        .map_err(|_| "too many active connections")?;
+
+    Ok(ConnectionGuard {
+        state: state.clone(),
+    })
+}
+
+pub(crate) struct ConnectionGuard {
+    state: Arc<AppState>,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.state.active_connections.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 pub(crate) fn try_acquire_streamer_ip(

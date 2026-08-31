@@ -27,7 +27,10 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Mutex, Notify, broadcast};
+use tokio::{
+    net::TcpListener,
+    sync::{Notify, broadcast},
+};
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -55,6 +58,7 @@ const AAC_SILENCE_ACCESS_UNIT: &[u8] = &[0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c];
 const AAC_FRAME_DURATION: Duration =
     Duration::from_micros((AAC_SAMPLES_PER_FRAME as u64 * 1_000_000) / AAC_SAMPLE_RATE as u64);
 const AAC_MAX_BITRATE_KBPS: usize = 320;
+const AAC_MAX_FRAMES_PER_SECOND: usize = 64;
 const AAC_MAX_ACCESS_UNIT_BYTES: usize = 4 * 1024;
 const AAC_MAX_INGEST_BYTES_PER_SECOND: usize = AAC_MAX_BITRATE_KBPS * 1000 / 8 * 6 / 5;
 const MEDIA_FRAME_HEADER_BYTES: usize = 5;
@@ -95,6 +99,10 @@ struct VideoQuality {
 impl VideoQuality {
     fn video_bytes_per_second(self) -> usize {
         (self.bitrate_kbps as usize).saturating_mul(1000) / 8
+    }
+
+    fn max_ingest_frames_per_second(self) -> usize {
+        (self.fps as usize).saturating_mul(3).div_ceil(2)
     }
 
     fn write_json_string(self, out: &mut String) {
@@ -144,9 +152,10 @@ struct Config {
 
 struct AppState {
     config: Config,
-    channels: Mutex<HashMap<String, Arc<Channel>>>,
+    channels: StdRwLock<HashMap<String, Arc<Channel>>>,
     ip_limits: StdMutex<IpLimitTable>,
     placeholders: Placeholders,
+    active_connections: AtomicUsize,
     active_streamers: AtomicUsize,
     active_listeners: AtomicUsize,
     next_rtsp_session: AtomicUsize,
@@ -240,9 +249,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let state = Arc::new(AppState {
         config,
-        channels: Mutex::new(HashMap::new()),
+        channels: StdRwLock::new(HashMap::new()),
         ip_limits: StdMutex::new(IpLimitTable::new()),
         placeholders,
+        active_connections: AtomicUsize::new(0),
         active_streamers: AtomicUsize::new(0),
         active_listeners: AtomicUsize::new(0),
         next_rtsp_session: AtomicUsize::new(1),
@@ -257,7 +267,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/ingest", get(ingest_ws))
         .with_state(state.clone());
 
-    tokio::spawn(rtsp_server(state.clone(), state.config.rtsp_bind_addr));
+    let rtsp_listener = match TcpListener::bind(state.config.rtsp_bind_addr).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            log_fatal_error(&state, &error);
+            return Err(error.into());
+        }
+    };
+    let mut rtsp_task = tokio::spawn(rtsp_server(state.clone(), rtsp_listener));
 
     let handle = axum_server::Handle::new();
     tokio::spawn(shutdown_http_server(handle.clone()));
@@ -266,7 +283,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tls_key_path = state.config.tls_key_path.clone();
     let service = app.into_make_service_with_connect_info::<SocketAddr>();
 
-    let result = async {
+    let http_server = async {
         if let (Some(cert_path), Some(key_path)) = (tls_cert_path, tls_key_path) {
             let tls_config = RustlsConfig::from_pem_file(cert_path, key_path).await?;
             info!(port = bind_addr.port(), "listening on https");
@@ -283,8 +300,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Ok::<(), Box<dyn std::error::Error>>(())
-    }
-    .await;
+    };
+
+    let result = tokio::select! {
+        result = http_server => result,
+        result = &mut rtsp_task => match result {
+            Ok(()) => Err("rtsp server stopped unexpectedly".into()),
+            Err(error) => Err(error.into()),
+        },
+    };
+    rtsp_task.abort();
 
     if let Err(error) = result {
         log_fatal_error(&state, error.as_ref());
@@ -488,10 +513,7 @@ async fn stats(
         );
     }
 
-    let active_streams = {
-        let channels = state.channels.lock().await;
-        count_active_streams(&channels)
-    };
+    let active_connections = state.active_connections.load(Ordering::Acquire);
     let active_streamers = state.active_streamers.load(Ordering::Acquire);
     let active_listeners = state.active_listeners.load(Ordering::Acquire);
 
@@ -502,10 +524,10 @@ async fn stats(
         report_abuse_link: state.config.report_abuse_link.as_deref(),
         rtsp_base: public_rtsp_base(&state.config, &headers),
         video: state.config.video_enabled,
-        active_connections: active_streamers.saturating_add(active_listeners),
+        active_connections,
         active_streamers,
         active_listeners,
-        active_streams,
+        active_streams: active_streamers,
         estimated_egress_kbps: estimated_egress_kbps(&state.config),
     })
     .into_response();
@@ -574,20 +596,42 @@ fn wake_media_listeners(channel: &Channel) {
     wake_video_listeners(channel);
 }
 
-async fn get_or_create_channel(state: &Arc<AppState>, key: &str) -> Arc<Channel> {
-    let mut channels = state.channels.lock().await;
-    channels
+fn reserve_channel<T>(
+    state: &AppState,
+    key: &str,
+    reserve: impl FnOnce(&Channel) -> T,
+) -> (Arc<Channel>, T) {
+    // Keep the channel mapped until the caller's atomic reservation is complete.
+    let channels = state
+        .channels
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(channel) = channels.get(key) {
+        let result = reserve(channel);
+        return (channel.clone(), result);
+    }
+    drop(channels);
+
+    let mut channels = state
+        .channels
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let channel = channels
         .entry(key.to_owned())
-        .or_insert_with(|| Arc::new(Channel::new(state.config.channel_buffer)))
-        .clone()
+        .or_insert_with(|| Arc::new(Channel::new(state.config.channel_buffer)));
+    let result = reserve(channel);
+    (channel.clone(), result)
 }
 
-async fn cleanup_channel(state: &Arc<AppState>, key: &str, channel: &Arc<Channel>) {
+fn cleanup_channel(state: &AppState, key: &str, channel: &Arc<Channel>) {
     if channel.streamer.load(Ordering::Acquire) || channel.listeners.load(Ordering::Acquire) != 0 {
         return;
     }
 
-    let mut channels = state.channels.lock().await;
+    let mut channels = state
+        .channels
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(current) = channels.get(key)
         && Arc::ptr_eq(current, channel)
         && !current.streamer.load(Ordering::Acquire)
@@ -609,13 +653,13 @@ fn install_panic_hook(state: Arc<AppState>) {
             .location()
             .map(|location| format!("{}:{}", location.file(), location.line()))
             .unwrap_or_else(|| "unknown".to_owned());
-        let active_streams = active_streams(&state);
+        let active_streams = state.active_streamers.load(Ordering::Acquire);
         let active_listeners = state.active_listeners.load(Ordering::Acquire);
 
         error!(
             %message,
             %location,
-            ?active_streams,
+            active_streams,
             active_listeners,
             "server panicked"
         );
@@ -623,30 +667,15 @@ fn install_panic_hook(state: Arc<AppState>) {
 }
 
 fn log_fatal_error(state: &AppState, error: &dyn std::error::Error) {
-    let active_streams = active_streams(state);
+    let active_streams = state.active_streamers.load(Ordering::Acquire);
     let active_listeners = state.active_listeners.load(Ordering::Acquire);
 
     error!(
         %error,
-        ?active_streams,
+        active_streams,
         active_listeners,
         "server stopped after fatal error"
     );
-}
-
-fn active_streams(state: &AppState) -> Option<usize> {
-    state
-        .channels
-        .try_lock()
-        .ok()
-        .map(|channels| count_active_streams(&channels))
-}
-
-fn count_active_streams(channels: &HashMap<String, Arc<Channel>>) -> usize {
-    channels
-        .values()
-        .filter(|channel| channel.streamer.load(Ordering::Acquire))
-        .count()
 }
 
 fn validate_code(code: &str) -> Result<(), &'static str> {
@@ -676,21 +705,6 @@ fn max_ws_message_bytes(config: &Config) -> usize {
 
 fn limit_allows(limit: usize, current: usize) -> bool {
     limit == 0 || current < limit
-}
-
-fn connection_limit_allows(state: &AppState, streamers: usize, listeners: usize) -> bool {
-    limit_allows(
-        state.config.max_connections,
-        streamers.saturating_add(listeners),
-    )
-}
-
-fn active_streamers(state: &AppState) -> usize {
-    state.active_streamers.load(Ordering::Acquire)
-}
-
-fn active_listeners(state: &AppState) -> usize {
-    state.active_listeners.load(Ordering::Acquire)
 }
 
 fn estimated_egress_kbps(config: &Config) -> usize {
@@ -1102,10 +1116,15 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     let terminate = async {
-        let _ = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                let _ = signal.recv().await;
+            }
+            Err(error) => {
+                error!(%error, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(not(unix))]

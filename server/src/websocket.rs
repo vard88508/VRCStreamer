@@ -16,19 +16,20 @@ use serde::Deserialize;
 use tokio::time::{Instant as TokioInstant, sleep_until};
 use tracing::{debug, info, warn};
 
-use super::limits::{StreamerIpGuard, TokenBucket, try_acquire_streamer_ip};
+use super::limits::{
+    ConnectionGuard, StreamerIpGuard, TokenBucket, try_acquire_connection, try_acquire_streamer_ip,
+};
 use super::media::{
     AudioMessage, StreamerMediaFrame, VideoMessage, h264_sdp_fmtp, parse_streamer_media_frame,
 };
 use super::{
-    AAC_MAX_INGEST_BYTES_PER_SECOND, AAC_SAMPLE_RATE, AppState, Channel,
+    AAC_MAX_FRAMES_PER_SECOND, AAC_MAX_INGEST_BYTES_PER_SECOND, AAC_SAMPLE_RATE, AppState, Channel,
     DEFAULT_TOKEN_BUCKET_BURST_SECS, H264_CLOCK_RATE, KEYFRAME_REQUEST_MESSAGE, MEDIA_CLOCK_RATE,
-    STREAMER_CONTROL_MESSAGES_PER_SECOND, STREAMER_LISTENER_UPDATE_INTERVAL, active_listeners,
-    allow_http_request, cleanup_channel, connection_limit_allows, force_resync_channel,
-    get_or_create_channel, hash_code, limit_allows, max_ws_message_bytes, origin_allowed,
-    password_allowed, peer_id, public_rtsp_base, streamer_hello_message,
-    streamer_listeners_message, text_response, text_response_with_cors, validate_code,
-    wake_media_listeners, wake_video_listeners,
+    STREAMER_CONTROL_MESSAGES_PER_SECOND, STREAMER_LISTENER_UPDATE_INTERVAL, allow_http_request,
+    cleanup_channel, force_resync_channel, hash_code, limit_allows, max_ws_message_bytes,
+    origin_allowed, password_allowed, peer_id, public_rtsp_base, reserve_channel,
+    streamer_hello_message, streamer_listeners_message, text_response, text_response_with_cors,
+    validate_code, wake_media_listeners, wake_video_listeners,
 };
 
 pub(crate) enum StreamerTextCommand {
@@ -79,6 +80,30 @@ fn reset_video_configuration(channel: &Channel, configured: &mut bool) {
     channel.set_video_fmtp(None);
 }
 
+struct StreamerGuard {
+    state: Arc<AppState>,
+    key: String,
+    channel: Arc<Channel>,
+    peer: String,
+    _ip_guard: Option<StreamerIpGuard>,
+    _connection_guard: ConnectionGuard,
+}
+
+impl Drop for StreamerGuard {
+    fn drop(&mut self) {
+        self.channel.streamer.store(false, Ordering::Release);
+        self.channel.video_active.store(false, Ordering::Release);
+        self.channel
+            .keyframe_pending
+            .store(false, Ordering::Release);
+        self.channel.set_video_fmtp(None);
+        force_resync_channel(&self.channel);
+        wake_media_listeners(&self.channel);
+        self.state.active_streamers.fetch_sub(1, Ordering::AcqRel);
+        cleanup_channel(&self.state, &self.key, &self.channel);
+    }
+}
+
 pub(crate) async fn ingest_ws(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
@@ -122,14 +147,21 @@ pub(crate) async fn ingest_ws(
             return text_response(StatusCode::TOO_MANY_REQUESTS, reason);
         }
     };
+    let connection_guard = match try_acquire_connection(&state) {
+        Ok(guard) => guard,
+        Err(reason) => {
+            return text_response(StatusCode::TOO_MANY_REQUESTS, reason);
+        }
+    };
 
     let key = hash_code(&query.code);
-    let channel = get_or_create_channel(&state, &key).await;
-    if channel
-        .streamer
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
+    let (channel, reserved) = reserve_channel(&state, &key, |channel| {
+        channel
+            .streamer
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    });
+    if !reserved {
         return text_response(
             StatusCode::CONFLICT,
             "stream already has an active streamer\n",
@@ -138,44 +170,43 @@ pub(crate) async fn ingest_ws(
     if state
         .active_streamers
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            (limit_allows(state.config.max_streamers, current)
-                && connection_limit_allows(
-                    state.as_ref(),
-                    current,
-                    active_listeners(state.as_ref()),
-                ))
-            .then_some(current + 1)
+            limit_allows(state.config.max_streamers, current).then_some(current.saturating_add(1))
         })
         .is_err()
     {
         channel.streamer.store(false, Ordering::Release);
-        cleanup_channel(&state, &key, &channel).await;
+        cleanup_channel(&state, &key, &channel);
         return text_response(StatusCode::TOO_MANY_REQUESTS, "too many active streamers\n");
     }
 
-    info!(%peer, %key, "aac streamer connected");
+    info!(%peer, %key, "streamer connected");
     let rtsp_base = public_rtsp_base(&state.config, &headers);
-    ws.max_message_size(max_ws_message_bytes(&state.config))
-        .on_upgrade(move |socket| {
-            streamer_session(socket, state, key, channel, peer, ip_guard, rtsp_base)
-        })
+    let max_message_size = max_ws_message_bytes(&state.config);
+    let guard = StreamerGuard {
+        state,
+        key,
+        channel,
+        peer,
+        _ip_guard: ip_guard,
+        _connection_guard: connection_guard,
+    };
+    ws.max_message_size(max_message_size)
+        .on_upgrade(move |socket| streamer_session(socket, guard, rtsp_base))
         .into_response()
 }
 
-async fn streamer_session(
-    mut socket: WebSocket,
-    state: Arc<AppState>,
-    key: String,
-    channel: Arc<Channel>,
-    peer: String,
-    _ip_guard: Option<StreamerIpGuard>,
-    rtsp_base: String,
-) {
+async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base: String) {
+    let state = guard.state.as_ref();
+    let key = guard.key.as_str();
+    let channel = guard.channel.as_ref();
+    let peer = guard.peer.as_str();
     channel.set_video_fmtp(None);
 
     let mut video_configured = false;
     let mut audio_ingest = TokenBucket::new();
+    let mut audio_frames_ingest = TokenBucket::new();
     let mut video_ingest = TokenBucket::new();
+    let mut video_frames_ingest = TokenBucket::new();
     let mut control_ingest = TokenBucket::new();
     let mut audio_timestamps = MediaTimestampNormalizer::new(AAC_SAMPLE_RATE);
     let mut video_timestamps = MediaTimestampNormalizer::new(H264_CLOCK_RATE);
@@ -194,11 +225,10 @@ async fn streamer_session(
         .await
         .is_err()
     {
-        finish_streamer(&state, &key, &channel, &peer, frames).await;
         return;
     }
-    force_resync_channel(&channel);
-    wake_media_listeners(&channel);
+    force_resync_channel(channel);
+    wake_media_listeners(channel);
 
     let mut idle_sleep = Box::pin(sleep_until(
         TokioInstant::now() + state.config.streamer_idle_timeout,
@@ -275,9 +305,23 @@ async fn streamer_session(
 
         match message {
             Message::Binary(frame) => {
+                let received_at = Instant::now();
                 match frame.first().copied() {
                     Some(0x00)
-                        if !audio_ingest.allow(
+                        if !audio_frames_ingest.allow_at(
+                            received_at,
+                            1,
+                            AAC_MAX_FRAMES_PER_SECOND,
+                            DEFAULT_TOKEN_BUCKET_BURST_SECS,
+                        ) =>
+                    {
+                        warn!(%peer, %key, "streamer exceeded aac frame rate");
+                        let _ = socket.send(Message::Close(None)).await;
+                        break;
+                    }
+                    Some(0x00)
+                        if !audio_ingest.allow_at(
+                            received_at,
                             frame.len(),
                             AAC_MAX_INGEST_BYTES_PER_SECOND,
                             DEFAULT_TOKEN_BUCKET_BURST_SECS,
@@ -289,7 +333,22 @@ async fn streamer_session(
                     }
                     Some(0x01 | 0x02)
                         if state.config.video_enabled
-                            && !video_ingest.allow(
+                            && !video_frames_ingest.allow_at(
+                                received_at,
+                                1,
+                                state.config.video_qualities[video_quality]
+                                    .max_ingest_frames_per_second(),
+                                state.config.video_ingest_burst_secs,
+                            ) =>
+                    {
+                        warn!(%peer, %key, video_quality, "streamer exceeded selected video frame rate");
+                        let _ = socket.send(Message::Close(None)).await;
+                        break;
+                    }
+                    Some(0x01 | 0x02)
+                        if state.config.video_enabled
+                            && !video_ingest.allow_at(
+                                received_at,
                                 frame.len(),
                                 state.config.video_qualities[video_quality]
                                     .video_bytes_per_second(),
@@ -322,12 +381,12 @@ async fn streamer_session(
                     }) => {
                         let frame_len = access_unit.len();
                         if frames == 0 {
-                            wake_video_listeners(&channel);
+                            wake_video_listeners(channel);
                         }
                         let _ = channel.audio_tx.send(AudioMessage::Frame {
                             access_unit,
                             media_timestamp: audio_timestamps.normalize(source_timestamp),
-                            published_at: Instant::now(),
+                            published_at: received_at,
                         });
                         frames += 1;
                         bytes = bytes.saturating_add(frame_len);
@@ -338,10 +397,11 @@ async fn streamer_session(
                     Ok(StreamerMediaFrame::Video {
                         access_unit,
                         keyframe,
+                        single_nal,
                         source_timestamp,
                     }) => {
                         if !channel.video_active.swap(true, Ordering::AcqRel) {
-                            wake_video_listeners(&channel);
+                            wake_video_listeners(channel);
                         }
                         if keyframe && !video_configured {
                             match h264_sdp_fmtp(&access_unit) {
@@ -358,8 +418,9 @@ async fn streamer_session(
                         let _ = channel.video_tx.send(VideoMessage::Frame {
                             access_unit,
                             keyframe,
+                            single_nal,
                             media_timestamp: video_timestamps.normalize(source_timestamp),
-                            published_at: Instant::now(),
+                            published_at: received_at,
                         });
                         video_frames += 1;
                         video_bytes = video_bytes.saturating_add(frame_len);
@@ -375,9 +436,12 @@ async fn streamer_session(
                 }
 
                 if (frames + video_frames).is_multiple_of(250)
-                    || last_report.elapsed() >= Duration::from_secs(5)
+                    || received_at.saturating_duration_since(last_report) >= Duration::from_secs(5)
                 {
-                    let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
+                    let elapsed = received_at
+                        .saturating_duration_since(started_at)
+                        .as_secs_f64()
+                        .max(0.001);
                     info!(
                         %peer,
                         %key,
@@ -391,7 +455,7 @@ async fn streamer_session(
                         video_kbps = (video_bytes as f64 * 8.0 / 1000.0) / elapsed,
                         "streamer media rate"
                     );
-                    last_report = Instant::now();
+                    last_report = received_at;
                 }
             }
             Message::Ping(payload) => {
@@ -421,28 +485,28 @@ async fn streamer_session(
                 }
                 match command {
                     Some(StreamerTextCommand::ForceResync) => {
-                        let epoch = force_resync_channel(&channel);
+                        let epoch = force_resync_channel(channel);
                         let listeners = channel.listeners.load(Ordering::Acquire);
                         info!(%peer, %key, epoch, listeners, "streamer forced rtsp resync");
                     }
                     Some(StreamerTextCommand::VideoStart) => {
-                        reset_video_configuration(&channel, &mut video_configured);
+                        reset_video_configuration(channel, &mut video_configured);
                         channel.video_active.store(true, Ordering::Release);
-                        wake_video_listeners(&channel);
+                        wake_video_listeners(channel);
                         debug!(%peer, %key, "streamer started h264 video");
                     }
                     Some(StreamerTextCommand::VideoStop) => {
-                        reset_video_configuration(&channel, &mut video_configured);
+                        reset_video_configuration(channel, &mut video_configured);
                         channel.video_active.store(false, Ordering::Release);
                         channel.keyframe_pending.store(false, Ordering::Release);
-                        let epoch = force_resync_channel(&channel);
-                        wake_video_listeners(&channel);
+                        let epoch = force_resync_channel(channel);
+                        wake_video_listeners(channel);
                         debug!(%peer, %key, epoch, "streamer stopped h264 video");
                     }
                     Some(StreamerTextCommand::VideoReset) => {
-                        reset_video_configuration(&channel, &mut video_configured);
-                        let epoch = force_resync_channel(&channel);
-                        wake_video_listeners(&channel);
+                        reset_video_configuration(channel, &mut video_configured);
+                        let epoch = force_resync_channel(channel);
+                        wake_video_listeners(channel);
                         debug!(%peer, %key, epoch, "streamer reset h264 video configuration");
                     }
                     Some(StreamerTextCommand::VideoQuality(index)) => {
@@ -464,25 +528,7 @@ async fn streamer_session(
         }
     }
 
-    finish_streamer(&state, &key, &channel, &peer, frames).await;
-}
-
-async fn finish_streamer(
-    state: &Arc<AppState>,
-    key: &str,
-    channel: &Arc<Channel>,
-    peer: &str,
-    frames: usize,
-) {
-    channel.streamer.store(false, Ordering::Release);
-    channel.video_active.store(false, Ordering::Release);
-    channel.keyframe_pending.store(false, Ordering::Release);
-    channel.set_video_fmtp(None);
-    force_resync_channel(channel);
-    wake_media_listeners(channel);
-    state.active_streamers.fetch_sub(1, Ordering::AcqRel);
-    cleanup_channel(state, key, channel).await;
-    info!(%peer, %key, frames, "aac streamer disconnected");
+    info!(%peer, %key, audio_frames = frames, video_frames, "streamer disconnected");
 }
 
 pub(crate) fn streamer_text_command(text: &str) -> Option<StreamerTextCommand> {

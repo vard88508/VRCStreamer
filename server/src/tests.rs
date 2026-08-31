@@ -1,22 +1,27 @@
 use super::limits::{
-    TokenBucket, allow_http_request, try_acquire_listener_ip, try_acquire_streamer_ip,
+    TokenBucket, allow_http_request, try_acquire_connection, try_acquire_listener_ip,
+    try_acquire_streamer_ip,
 };
 use super::media::{
     StreamerMediaFrame, VideoMessage, h264_sdp_fmtp, parse_streamer_media_frame,
     validate_aac_access_unit, validate_h264_access_unit,
 };
 use super::rtsp::{
-    RtpClock, RtpMediaTimeline, RtpState, RtspSession, RtspTrack, VideoStreamState,
-    build_rtcp_sender_report, channel_video_state, key_from_rtsp_uri, placeholder_access_unit,
-    project_rtp_timestamp, read_rtsp_request, rtcp_requests_keyframe, rtsp_rtp_info, rtsp_sdp,
-    rtsp_track_from_uri, select_rtsp_interleaved_channel, should_advertise_video,
+    RtpClock, RtpMediaTimeline, RtpPacketWriter, RtpState, RtspSession, RtspTrack,
+    VideoStreamState, build_rtcp_sender_report, channel_video_state, key_from_rtsp_uri,
+    placeholder_access_unit, project_rtp_timestamp, read_rtsp_request, rtcp_requests_keyframe,
+    rtsp_rtp_info, rtsp_sdp, rtsp_track_from_uri, select_rtsp_interleaved_channel,
+    should_advertise_video,
 };
 use super::websocket::{
     MediaTimestampNormalizer, StreamerTextCommand, is_websocket_disconnect_noise,
     streamer_text_command,
 };
 use super::*;
-use tokio::{io::BufReader, time::Instant as TokioInstant};
+use tokio::{
+    io::{AsyncReadExt, BufReader},
+    time::Instant as TokioInstant,
+};
 
 const TEST_VIDEO_FMTP: &str =
     "packetization-mode=1; profile-level-id=42e01f; sprop-parameter-sets=Z0LgHw==,aM48gA==";
@@ -59,7 +64,7 @@ fn test_config() -> Config {
 fn test_state(config: Config) -> Arc<AppState> {
     Arc::new(AppState {
         config,
-        channels: Mutex::new(HashMap::new()),
+        channels: StdRwLock::new(HashMap::new()),
         ip_limits: StdMutex::new(IpLimitTable::new()),
         placeholders: Placeholders {
             offline_video: Bytes::new(),
@@ -67,6 +72,7 @@ fn test_state(config: Config) -> Arc<AppState> {
             offline_fmtp: Arc::from(TEST_VIDEO_FMTP),
             audio_only_fmtp: Arc::from(TEST_VIDEO_FMTP),
         },
+        active_connections: AtomicUsize::new(0),
         active_streamers: AtomicUsize::new(0),
         active_listeners: AtomicUsize::new(0),
         next_rtsp_session: AtomicUsize::new(1),
@@ -253,6 +259,7 @@ fn video_quality_rate_matches_selected_bitrate() {
         bitrate_kbps: 2000,
     };
     assert_eq!(quality.video_bytes_per_second(), 250_000);
+    assert_eq!(quality.max_ingest_frames_per_second(), 45);
 }
 
 #[test]
@@ -372,28 +379,53 @@ fn zero_limit_means_disabled() {
 }
 
 #[test]
-fn max_connections_counts_streamers_and_listeners() {
+fn connection_limit_is_atomic_and_releases() {
     let mut config = test_config();
-    config.max_connections = 3;
+    config.max_connections = 2;
     let state = test_state(config);
 
-    assert!(connection_limit_allows(&state, 1, 1));
-    assert!(!connection_limit_allows(&state, 1, 2));
+    let first = try_acquire_connection(&state).unwrap();
+    let second = try_acquire_connection(&state).unwrap();
+    assert_eq!(state.active_connections.load(Ordering::Acquire), 2);
+    assert!(try_acquire_connection(&state).is_err());
+
+    drop(first);
+    assert!(try_acquire_connection(&state).is_ok());
+    drop(second);
 }
 
 #[test]
-fn active_stream_count_ignores_offline_listener_channels() {
-    let mut channels = HashMap::new();
-    let offline = Arc::new(Channel::new(8));
-    offline.listeners.store(1, Ordering::Release);
-    channels.insert("offline".to_owned(), offline);
+fn channel_reservation_cannot_race_cleanup() {
+    let state = test_state(test_config());
+    let (channel, ()) = reserve_channel(&state, "stream", |_| ());
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
 
-    let live = Arc::new(Channel::new(8));
-    live.streamer.store(true, Ordering::Release);
-    live.listeners.store(1, Ordering::Release);
-    channels.insert("live".to_owned(), live);
+    let reserve_state = state.clone();
+    let reserve = std::thread::spawn(move || {
+        reserve_channel(&reserve_state, "stream", |channel| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            channel.listeners.fetch_add(1, Ordering::AcqRel);
+        })
+        .0
+    });
 
-    assert_eq!(count_active_streams(&channels), 1);
+    entered_rx.recv().unwrap();
+    let cleanup_state = state.clone();
+    let cleanup_channel_ref = channel.clone();
+    let cleanup = std::thread::spawn(move || {
+        cleanup_channel(&cleanup_state, "stream", &cleanup_channel_ref);
+    });
+    release_tx.send(()).unwrap();
+
+    let reserved = reserve.join().unwrap();
+    cleanup.join().unwrap();
+    let channels = state
+        .channels
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(Arc::ptr_eq(channels.get("stream").unwrap(), &reserved));
 }
 
 #[test]
@@ -556,6 +588,7 @@ fn streamer_preserves_video_source_timestamp() {
     let StreamerMediaFrame::Video {
         access_unit,
         keyframe,
+        single_nal,
         source_timestamp,
     } = parse_streamer_media_frame(frame, &test_config()).unwrap()
     else {
@@ -563,8 +596,35 @@ fn streamer_preserves_video_source_timestamp() {
     };
 
     assert!(keyframe);
+    assert!(!single_nal);
     assert_eq!(source_timestamp, 0x1234_5678);
     assert_eq!(access_unit[4] & 0x1f, 7);
+}
+
+#[test]
+fn streamer_marks_single_nal_video_frames() {
+    let frame = Bytes::from_static(&[0x02, 0, 0, 0, 1, 0, 0, 0, 1, 0x41, 0x9a]);
+
+    let StreamerMediaFrame::Video { single_nal, .. } =
+        parse_streamer_media_frame(frame, &test_config()).unwrap()
+    else {
+        panic!("expected video frame");
+    };
+
+    assert!(single_nal);
+}
+
+#[test]
+fn streamer_does_not_fast_path_a_trailing_h264_start_code() {
+    let frame = Bytes::from_static(&[0x02, 0, 0, 0, 1, 0, 0, 0, 1, 0x41, 0x9a, 0, 0, 0, 1]);
+
+    let StreamerMediaFrame::Video { single_nal, .. } =
+        parse_streamer_media_frame(frame, &test_config()).unwrap()
+    else {
+        panic!("expected video frame");
+    };
+
+    assert!(!single_nal);
 }
 
 #[test]
@@ -702,6 +762,12 @@ fn rtsp_interleaved_channels_do_not_overlap_between_tracks() {
         select_rtsp_interleaved_channel(&session, RtspTrack::Audio, Some(2)),
         0
     );
+
+    let empty = RtspSession::default();
+    assert_eq!(
+        select_rtsp_interleaved_channel(&empty, RtspTrack::Video, Some(u8::MAX)),
+        0
+    );
 }
 
 #[test]
@@ -758,6 +824,64 @@ fn aac_rtp_timestamp_delta_is_one_access_unit() {
     assert_eq!(rtp.sequence, 1);
     assert_eq!(rtp.packet_count, 1);
     assert_eq!(rtp.octet_count, 123);
+}
+
+#[tokio::test]
+async fn batched_h264_keeps_rtp_packet_boundaries() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (client, accepted) =
+        tokio::join!(tokio::net::TcpStream::connect(address), listener.accept());
+    let mut client = client.unwrap();
+    let (server, _) = accepted.unwrap();
+    let (read_half, write_half) = server.into_split();
+    drop(read_half);
+    let writer = Arc::new(tokio::sync::Mutex::new(write_half));
+
+    let mut access_unit = vec![0, 0, 0, 1, 0x65];
+    access_unit.resize(4 + 1 + RTP_MAX_PAYLOAD_BYTES * 3, 0x55);
+    let nal_payload_bytes = access_unit.len() - 5;
+    let expected_packets = nal_payload_bytes.div_ceil(RTP_MAX_PAYLOAD_BYTES - 2);
+    let mut rtp = RtpState {
+        sequence: 10,
+        timestamp: 90_000,
+        ..RtpState::default()
+    };
+    let mut sender = RtpPacketWriter::new(2, 4 + 12 + RTP_MAX_PAYLOAD_BYTES);
+    sender
+        .send_h264_access_unit(&writer, &access_unit, true, true, &mut rtp)
+        .await
+        .unwrap();
+    drop(sender);
+    drop(writer);
+
+    let mut bytes = Vec::new();
+    client.read_to_end(&mut bytes).await.unwrap();
+    let mut offset = 0usize;
+    let mut packets = 0usize;
+    while offset < bytes.len() {
+        assert_eq!(bytes[offset], b'$');
+        assert_eq!(bytes[offset + 1], 2);
+        let packet_len = u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]) as usize;
+        let packet = &bytes[offset + 4..offset + 4 + packet_len];
+        assert_eq!(packet[0], 0x80);
+        assert_eq!(packet[1] & 0x7f, RTP_VIDEO_PAYLOAD_TYPE);
+        assert_eq!(
+            u16::from_be_bytes([packet[2], packet[3]]),
+            10 + packets as u16
+        );
+        assert_eq!(
+            u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]),
+            90_000
+        );
+        packets += 1;
+        assert_eq!(packet[1] & 0x80 != 0, packets == expected_packets);
+        offset += 4 + packet_len;
+    }
+
+    assert_eq!(packets, expected_packets);
+    assert_eq!(rtp.packet_count as usize, expected_packets);
+    assert_eq!(rtp.sequence, 10 + expected_packets as u16);
 }
 
 #[test]

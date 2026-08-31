@@ -14,6 +14,7 @@ pub(crate) enum StreamerMediaFrame {
     Video {
         access_unit: Bytes,
         keyframe: bool,
+        single_nal: bool,
         source_timestamp: u32,
     },
 }
@@ -34,6 +35,7 @@ pub(crate) enum VideoMessage {
     Frame {
         access_unit: Bytes,
         keyframe: bool,
+        single_nal: bool,
         media_timestamp: u64,
         published_at: Instant,
     },
@@ -86,10 +88,12 @@ pub(crate) fn parse_streamer_media_frame(
             let keyframe = kind == 0x01;
             let source_timestamp = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
             let access_unit = frame.slice(MEDIA_FRAME_HEADER_BYTES..);
-            validate_h264_access_unit(&access_unit, keyframe, config.max_h264_frame_bytes)?;
+            let single_nal =
+                inspect_h264_access_unit(&access_unit, keyframe, config.max_h264_frame_bytes)?;
             Ok(StreamerMediaFrame::Video {
                 access_unit,
                 keyframe,
+                single_nal,
                 source_timestamp,
             })
         }
@@ -102,6 +106,14 @@ pub(crate) fn validate_h264_access_unit(
     keyframe: bool,
     max_bytes: usize,
 ) -> Result<(), &'static str> {
+    inspect_h264_access_unit(access_unit, keyframe, max_bytes).map(drop)
+}
+
+fn inspect_h264_access_unit(
+    access_unit: &[u8],
+    keyframe: bool,
+    max_bytes: usize,
+) -> Result<bool, &'static str> {
     if access_unit.len() < 5 {
         return Err("h264 access unit is too small");
     }
@@ -114,7 +126,7 @@ pub(crate) fn validate_h264_access_unit(
 
     let mut saw_slice = false;
     let mut saw_idr = false;
-    for_each_h264_nal(access_unit, |nal| {
+    let (nal_count, has_multiple_start_codes) = for_each_h264_nal(access_unit, |nal| {
         if nal[0] & 0x80 != 0 {
             return Err("h264 forbidden zero bit is set");
         }
@@ -136,7 +148,7 @@ pub(crate) fn validate_h264_access_unit(
     if keyframe && !saw_idr {
         return Err("h264 keyframe has no idr slice");
     }
-    Ok(())
+    Ok(nal_count == 1 && !has_multiple_start_codes)
 }
 
 pub(crate) fn h264_sdp_fmtp(access_unit: &[u8]) -> Result<String, &'static str> {
@@ -144,7 +156,7 @@ pub(crate) fn h264_sdp_fmtp(access_unit: &[u8]) -> Result<String, &'static str> 
     let mut sps = None;
     let mut pps = None;
 
-    for_each_h264_nal(access_unit, |nal| {
+    let _ = for_each_h264_nal(access_unit, |nal| {
         match nal[0] & 0x1f {
             7 if sps.is_none() => {
                 if nal.len() < 4 {
@@ -175,12 +187,13 @@ pub(crate) fn h264_sdp_fmtp(access_unit: &[u8]) -> Result<String, &'static str> 
     ))
 }
 
-fn for_each_h264_nal<F>(access_unit: &[u8], mut f: F) -> Result<(), &'static str>
+fn for_each_h264_nal<F>(access_unit: &[u8], mut f: F) -> Result<(usize, bool), &'static str>
 where
     F: FnMut(&[u8]) -> Result<(), &'static str>,
 {
     let mut nal_start = start_h264_payload(access_unit)?;
     let mut count = 0usize;
+    let mut has_multiple_start_codes = false;
 
     loop {
         let next = find_h264_start_code(access_unit, nal_start);
@@ -196,13 +209,14 @@ where
         let Some((start, len)) = next else {
             break;
         };
+        has_multiple_start_codes = true;
         nal_start = start + len;
     }
 
     if count == 0 {
         return Err("h264 access unit has no nal units");
     }
-    Ok(())
+    Ok((count, has_multiple_start_codes))
 }
 
 pub(crate) fn start_h264_payload(access_unit: &[u8]) -> Result<usize, &'static str> {
