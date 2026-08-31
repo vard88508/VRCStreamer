@@ -242,7 +242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let bind_addr = config.bind_addr;
-    let blacklist_path = executable_neighbor(STREAM_BLACKLIST_FILE);
+    let blacklist_path = PathBuf::from(STREAM_BLACKLIST_FILE);
     let stream_blacklist = match load_stream_blacklist(&blacklist_path) {
         Ok(entries) => entries,
         Err(error) => {
@@ -460,13 +460,6 @@ fn load_placeholders(config: &Config) -> Result<Placeholders, Box<dyn std::error
 fn load_placeholder(dir: &str, name: &str) -> Result<Bytes, Box<dyn std::error::Error>> {
     let bytes = fs::read(std::path::Path::new(dir).join(name))?;
     Ok(Bytes::from(bytes))
-}
-
-fn executable_neighbor(name: &str) -> PathBuf {
-    env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join(name)))
-        .unwrap_or_else(|| PathBuf::from(name))
 }
 
 fn load_stream_blacklist(path: &Path) -> Result<HashSet<String>, String> {
