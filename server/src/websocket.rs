@@ -251,15 +251,20 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
     let mut listener_sleep = Box::pin(sleep_until(
         TokioInstant::now() + STREAMER_LISTENER_UPDATE_INTERVAL,
     ));
+    let blacklist_notification = channel.blacklist_notify.notified();
+    tokio::pin!(blacklist_notification);
 
     loop {
         let message = tokio::select! {
-            _ = channel.blacklist_notify.notified() => {
+            _ = &mut blacklist_notification => {
                 if stream_is_blacklisted(state, key) {
                     warn!(%peer, %key, "disconnected blacklisted streamer");
                     let _ = socket.send(Message::Close(None)).await;
                     break;
                 }
+                blacklist_notification
+                    .as_mut()
+                    .set(channel.blacklist_notify.notified());
                 continue;
             }
             message = socket.recv() => {
