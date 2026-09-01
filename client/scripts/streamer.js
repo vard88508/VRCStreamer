@@ -484,6 +484,8 @@ async function completeAudioEncoderSwap(session, swap) {
     swap.buffers.length = 0;
     swap.resolve(swap.info);
   } catch (error) {
+    if (session.audioEncoderSwap === swap) session.audioEncoderSwap = null;
+    swap.buffers.length = 0;
     swap.encoder.close();
     swap.reject(error);
     if (app.active === session) failActive(error);
@@ -780,7 +782,7 @@ async function constrainVideoTrack(track, width, height, fps) {
   }
 }
 
-async function createVideoStreamer(source, ws, onError) {
+async function createVideoStreamer(source, ws, transport, onError) {
   if (!window.Worker) throw new Error("Video workers are not available.");
   if (!("MediaStreamTrackProcessor" in window)) {
     throw new Error("MediaStreamTrackProcessor is not available.");
@@ -788,7 +790,7 @@ async function createVideoStreamer(source, ws, onError) {
   if (!source || !source.mediaStream.getVideoTracks()[0]) {
     throw new Error("Selected source has no video track.");
   }
-  const worker = createVideoWorker(ws, app.active.transport, onError);
+  const worker = createVideoWorker(ws, transport, onError);
   let closed = false;
   let processorTrack = null;
   let api = null;
@@ -1100,10 +1102,15 @@ async function installVideoSource(mediaStream, settings = null) {
     } else {
       sendStreamerCommand("video_start");
       videoStartSent = true;
-      app.active.video = await createVideoStreamer(next, app.active.ws, error => {
-        if (!app.active) return;
-        removeVideoSource(next);
-      });
+      app.active.video = await createVideoStreamer(
+        next,
+        app.active.ws,
+        app.active.transport,
+        error => {
+          if (!app.active) return;
+          removeVideoSource(next);
+        }
+      );
     }
   } catch (error) {
     if (videoStartSent) sendStreamerCommand("video_stop");
@@ -1259,6 +1266,19 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
       if (app.active === session) failActive(error);
     });
     app.active = session;
+    ws.onclose = event => {
+      if (app.active && app.active.ws === ws) {
+        const detail = event.reason
+          ? `${event.code}: ${event.reason}`
+          : String(event.code || "unknown");
+        failActive(new Error(`Streamer connection closed (${detail}).`));
+      }
+    };
+    ws.onerror = () => {
+      if (app.active && app.active.ws === ws) {
+        failActive(new Error("Streamer WebSocket connection failed."));
+      }
+    };
 
     mixer.connect(captureNode);
     captureNode.connect(monitor);
@@ -1275,18 +1295,6 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
 
     ui.setStreamingControls(true);
 
-    ws.onclose = event => {
-      if (app.active && app.active.ws === ws) {
-        const detail = event.reason ? `${event.code}: ${event.reason}` : String(event.code || "unknown");
-        failActive(new Error(`Streamer connection closed (${detail}).`));
-      }
-    };
-    ws.onerror = () => {
-      if (app.active && app.active.ws === ws) {
-        failActive(new Error("Streamer WebSocket connection failed."));
-      }
-    };
-
     ui.updateStreamStatus(encoderInfo);
     app.active.statsTimer = setInterval(() => {
       const current = app.active;
@@ -1294,6 +1302,7 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
       ui.updateStreamStatus(current.encoder.stats());
     }, 1000);
   } catch (error) {
+    const failureAlreadyHandled = Boolean(session && app.active !== session);
     console.error("Stream start failed:", error);
     if (app.active && app.active.ws === ws) {
       cleanup();
@@ -1304,7 +1313,9 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
       ui.setStreamingControls(false);
     }
     stopMediaStream(mediaStream);
-    alert(`Stream start failed:\n\n${error?.message || error}`);
+    if (!failureAlreadyHandled) {
+      alert(`Stream start failed:\n\n${error?.message || error}`);
+    }
   } finally {
     ui.setSourceRequestBusy(false);
   }

@@ -121,13 +121,17 @@ impl VideoQuality {
     }
 
     fn write_json_string(self, out: &mut String) {
-        out.push('"');
-        let _ = write!(
-            out,
+        let _ = write!(out, "\"{self}\"");
+    }
+}
+
+impl std::fmt::Display for VideoQuality {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
             "{}x{}*{}/{}",
             self.width, self.height, self.fps, self.bitrate_kbps
-        );
-        out.push('"');
+        )
     }
 }
 
@@ -136,10 +140,7 @@ impl Serialize for VideoQuality {
     where
         S: Serializer,
     {
-        serializer.collect_str(&format_args!(
-            "{}x{}*{}/{}",
-            self.width, self.height, self.fps, self.bitrate_kbps
-        ))
+        serializer.collect_str(self)
     }
 }
 
