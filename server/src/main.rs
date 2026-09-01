@@ -44,7 +44,9 @@ mod tests;
 mod websocket;
 
 use limits::{IpLimitTable, allow_http_request};
-use media::{AudioMessage, VideoMessage, h264_sdp_fmtp, validate_h264_access_unit};
+use media::{
+    AudioMessage, VideoFrame, VideoGopCache, VideoMessage, h264_sdp_fmtp, validate_h264_access_unit,
+};
 use rtsp::rtsp_server;
 use websocket::ingest_ws;
 
@@ -75,6 +77,7 @@ const RTSP_MAX_HEADER_BYTES: usize = 16 * 1024;
 const RTSP_MAX_HEADERS: usize = 64;
 const RTSP_MAX_BODY_BYTES: usize = 4096;
 const RTSP_DISCARD_BUFFER_BYTES: usize = 1024;
+const RTSP_MAX_INTERLEAVED_BYTES: usize = 4096;
 const STREAM_ID_HEX_CHARS: usize = 32;
 const STREAM_ID_BYTES: usize = STREAM_ID_HEX_CHARS / 2;
 const STREAM_CODE_BYTES: usize = 32;
@@ -84,8 +87,8 @@ const STREAM_BLACKLIST_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
 const STREAMER_LISTENER_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 const STREAMER_CONTROL_MESSAGES_PER_SECOND: usize = 8;
 const RTCP_REPORT_INTERVAL: Duration = Duration::from_secs(5);
-const KEYFRAME_REQUEST_MIN_INTERVAL_MS: u64 = 500;
-const KEYFRAME_REQUEST_MESSAGE: &str = "{\"type\":\"keyframe\"}";
+const VIDEO_GOP_CACHE_MAX_DURATION: Duration = Duration::from_millis(1500);
+const VIDEO_GOP_CACHE_MAX_STALENESS: Duration = Duration::from_millis(500);
 const DEFAULT_VIDEO_QUALITIES: &str =
     "1280x720*30/2000,1280x720*60/4000,1920x1080*30/3000,1920x1080*60/6000";
 const MAX_VIDEO_QUALITIES: usize = 32;
@@ -106,6 +109,14 @@ impl VideoQuality {
     }
 
     fn max_ingest_frames_per_second(self) -> usize {
+        (self.fps as usize).saturating_mul(3).div_ceil(2)
+    }
+
+    fn gop_cache_max_bytes(self) -> usize {
+        self.video_bytes_per_second().saturating_mul(3) / 2
+    }
+
+    fn gop_cache_max_frames(self) -> usize {
         (self.fps as usize).saturating_mul(3).div_ceil(2)
     }
 
@@ -174,11 +185,10 @@ struct Channel {
     video_active: AtomicBool,
     listeners: AtomicUsize,
     resync_epoch: AtomicUsize,
-    keyframe_pending: AtomicBool,
-    last_keyframe_request_ms: AtomicU64,
-    keyframe_notify: Notify,
     blacklist_notify: Notify,
     video_fmtp: StdRwLock<Option<Arc<str>>>,
+    video_gop: StdMutex<VideoGopCache>,
+    next_video_serial: AtomicU64,
 }
 
 impl Channel {
@@ -192,11 +202,10 @@ impl Channel {
             video_active: AtomicBool::new(false),
             listeners: AtomicUsize::new(0),
             resync_epoch: AtomicUsize::new(0),
-            keyframe_pending: AtomicBool::new(false),
-            last_keyframe_request_ms: AtomicU64::new(0),
-            keyframe_notify: Notify::new(),
             blacklist_notify: Notify::new(),
             video_fmtp: StdRwLock::new(None),
+            video_gop: StdMutex::new(VideoGopCache::default()),
+            next_video_serial: AtomicU64::new(1),
         }
     }
 
@@ -212,6 +221,36 @@ impl Channel {
             .video_fmtp
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = value;
+    }
+
+    fn next_video_serial(&self) -> u64 {
+        self.next_video_serial.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn cache_video_frame(&self, frame: &VideoFrame, quality: VideoQuality) {
+        self.video_gop
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(
+                frame,
+                quality.gop_cache_max_bytes(),
+                quality.gop_cache_max_frames(),
+                VIDEO_GOP_CACHE_MAX_DURATION,
+            );
+    }
+
+    fn video_gop_snapshot(&self) -> Vec<VideoFrame> {
+        self.video_gop
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .snapshot(VIDEO_GOP_CACHE_MAX_STALENESS)
+    }
+
+    fn clear_video_gop(&self) {
+        self.video_gop
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 }
 
@@ -655,45 +694,6 @@ fn force_resync_channel(channel: &Channel) -> usize {
         .resync_epoch
         .fetch_add(1, Ordering::AcqRel)
         .wrapping_add(1)
-}
-
-fn request_video_keyframe(channel: &Channel) -> bool {
-    if !channel.streamer.load(Ordering::Acquire)
-        || !channel.video_active.load(Ordering::Acquire)
-        || channel.keyframe_pending.load(Ordering::Acquire)
-    {
-        return false;
-    }
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default();
-    let mut previous = channel.last_keyframe_request_ms.load(Ordering::Acquire);
-    loop {
-        if now.saturating_sub(previous) < KEYFRAME_REQUEST_MIN_INTERVAL_MS {
-            return false;
-        }
-        match channel.last_keyframe_request_ms.compare_exchange_weak(
-            previous,
-            now,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => break,
-            Err(current) => previous = current,
-        }
-    }
-
-    if channel
-        .keyframe_pending
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return false;
-    }
-    channel.keyframe_notify.notify_one();
-    true
 }
 
 fn wake_audio_listeners(channel: &Channel) {

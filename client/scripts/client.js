@@ -846,7 +846,7 @@ function listenerCountFromMessage(message) {
   return Number.isInteger(value) && value >= 0 ? value : null;
 }
 
-function handleStreamerMessage(event, key, setStreamListeners, requestKeyframe, receiveHello) {
+function handleStreamerMessage(event, key, setStreamListeners, receiveHello) {
   if (typeof event.data !== "string") return;
   let message = null;
   try {
@@ -864,8 +864,6 @@ function handleStreamerMessage(event, key, setStreamListeners, requestKeyframe, 
   } else if (message.type === "listeners") {
     const listeners = listenerCountFromMessage(message);
     if (listeners !== null) setStreamListeners(listeners);
-  } else if (message.type === "keyframe") {
-    requestKeyframe();
   }
 }
 

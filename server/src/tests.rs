@@ -3,15 +3,14 @@ use super::limits::{
     try_acquire_streamer_ip,
 };
 use super::media::{
-    StreamerMediaFrame, VideoMessage, h264_sdp_fmtp, parse_streamer_media_frame,
-    validate_aac_access_unit, validate_h264_access_unit,
+    StreamerMediaFrame, VideoFrame, VideoGopCache, VideoMessage, h264_sdp_fmtp,
+    parse_streamer_media_frame, validate_aac_access_unit, validate_h264_access_unit,
 };
 use super::rtsp::{
     RtpClock, RtpMediaTimeline, RtpPacketWriter, RtpState, RtspSession, RtspTrack,
     VideoStreamState, build_rtcp_sender_report, channel_video_state, key_from_rtsp_uri,
-    placeholder_access_unit, project_rtp_timestamp, read_rtsp_request, rtcp_requests_keyframe,
-    rtsp_rtp_info, rtsp_sdp, rtsp_track_from_uri, select_rtsp_interleaved_channel,
-    should_advertise_video,
+    placeholder_access_unit, project_rtp_timestamp, read_rtsp_request, rtsp_rtp_info, rtsp_sdp,
+    rtsp_track_from_uri, select_rtsp_interleaved_channel, should_advertise_video,
 };
 use super::websocket::{
     MediaTimestampNormalizer, StreamerTextCommand, is_websocket_disconnect_noise,
@@ -162,6 +161,34 @@ fn rtsp_parser_accepts_bounded_request_line() {
 }
 
 #[test]
+fn rtsp_parser_ignores_interleaved_client_data() {
+    run_async_test(async {
+        let input = b"$\x01\x00\x04testOPTIONS rtspt://127.0.0.1/abc RTSP/1.0\r\nCSeq: 2\r\n\r\n";
+        let mut reader = BufReader::new(&input[..]);
+        let request = read_rtsp_request(&mut reader).await.unwrap().unwrap();
+
+        assert_eq!(request.method, "OPTIONS");
+        assert_eq!(request.header("cseq"), Some("2"));
+    });
+}
+
+#[test]
+fn rtsp_parser_rejects_oversized_interleaved_client_data() {
+    run_async_test(async {
+        let length = (RTSP_MAX_INTERLEAVED_BYTES + 1) as u16;
+        let mut input = vec![b'$', 1];
+        input.extend_from_slice(&length.to_be_bytes());
+        let mut reader = BufReader::new(input.as_slice());
+        let error = match read_rtsp_request(&mut reader).await {
+            Ok(_) => panic!("oversized interleaved packet was accepted"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("interleaved packet too large"));
+    });
+}
+
+#[test]
 fn rtsp_request_detects_androidx_media3_user_agent_prefix() {
     run_async_test(async {
         let input = b"OPTIONS rtspt://127.0.0.1/abc RTSP/1.0\r\n\
@@ -304,14 +331,72 @@ fn force_resync_channel_advances_epoch() {
 }
 
 #[test]
-fn video_keyframe_requests_are_coalesced() {
-    let channel = Channel::new(8);
-    channel.streamer.store(true, Ordering::Release);
-    channel.video_active.store(true, Ordering::Release);
+fn video_gop_cache_starts_at_and_replaces_keyframe() {
+    let mut cache = VideoGopCache::default();
+    let p_frame = test_video_frame(1, false, 4, Duration::ZERO);
+    cache.push(&p_frame, 32, 4, Duration::from_secs(2));
+    assert!(cache.snapshot(Duration::from_secs(1)).is_empty());
 
-    assert!(request_video_keyframe(&channel));
-    assert!(channel.keyframe_pending.load(Ordering::Acquire));
-    assert!(!request_video_keyframe(&channel));
+    let keyframe = test_video_frame(2, true, 8, Duration::ZERO);
+    let p_frame = test_video_frame(3, false, 4, Duration::ZERO);
+    cache.push(&keyframe, 32, 4, Duration::from_secs(2));
+    cache.push(&p_frame, 32, 4, Duration::from_secs(2));
+    assert_eq!(
+        cache
+            .snapshot(Duration::from_secs(1))
+            .iter()
+            .map(|frame| frame.serial)
+            .collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+
+    let next_keyframe = test_video_frame(4, true, 6, Duration::ZERO);
+    cache.push(&next_keyframe, 32, 4, Duration::from_secs(2));
+    assert_eq!(
+        cache
+            .snapshot(Duration::from_secs(1))
+            .iter()
+            .map(|frame| frame.serial)
+            .collect::<Vec<_>>(),
+        vec![4]
+    );
+}
+
+#[test]
+fn video_gop_cache_discards_oversized_or_stale_gop() {
+    let mut cache = VideoGopCache::default();
+    let keyframe = test_video_frame(1, true, 8, Duration::ZERO);
+    let p_frame = test_video_frame(2, false, 5, Duration::ZERO);
+    cache.push(&keyframe, 12, 4, Duration::from_secs(2));
+    cache.push(&p_frame, 12, 4, Duration::from_secs(2));
+    assert!(cache.snapshot(Duration::from_secs(1)).is_empty());
+
+    let stale_keyframe = test_video_frame(3, true, 4, Duration::from_secs(2));
+    cache.push(&stale_keyframe, 12, 4, Duration::from_secs(3));
+    assert!(cache.snapshot(Duration::from_secs(1)).is_empty());
+
+    let keyframe = test_video_frame(4, true, 4, Duration::from_secs(2));
+    let recent_p_frame = test_video_frame(5, false, 4, Duration::ZERO);
+    cache.push(&keyframe, 12, 4, Duration::from_secs(1));
+    cache.push(&recent_p_frame, 12, 4, Duration::from_secs(1));
+    assert!(cache.snapshot(Duration::from_secs(1)).is_empty());
+
+    let keyframe = test_video_frame(6, true, 4, Duration::ZERO);
+    let p_frame = test_video_frame(7, false, 4, Duration::ZERO);
+    cache.push(&keyframe, 12, 1, Duration::from_secs(1));
+    cache.push(&p_frame, 12, 1, Duration::from_secs(1));
+    assert!(cache.snapshot(Duration::from_secs(1)).is_empty());
+}
+
+fn test_video_frame(serial: u64, keyframe: bool, bytes: usize, age: Duration) -> VideoFrame {
+    VideoFrame {
+        access_unit: Bytes::from(vec![serial as u8; bytes]),
+        keyframe,
+        single_nal: true,
+        media_timestamp: serial,
+        published_at: std::time::Instant::now() - age,
+        serial,
+    }
 }
 
 #[test]
@@ -914,23 +999,6 @@ async fn batched_h264_keeps_rtp_packet_boundaries() {
     assert_eq!(packets, expected_packets);
     assert_eq!(rtp.packet_count as usize, expected_packets);
     assert_eq!(rtp.sequence, 10 + expected_packets as u16);
-}
-
-#[test]
-fn rtcp_feedback_detects_pli_and_fir() {
-    let pli = [0x81, 206, 0, 2, 0, 0, 0, 1, 0x56, 0x52, 0x43, 0x56];
-    let fir = [
-        0x84, 206, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0, 0x56, 0x52, 0x43, 0x56, 1, 0, 0, 0,
-    ];
-    let receiver_report = [0x80, 201, 0, 1, 0, 0, 0, 1];
-    let mut compound = receiver_report.to_vec();
-    compound.extend_from_slice(&pli);
-
-    assert!(rtcp_requests_keyframe(&pli));
-    assert!(rtcp_requests_keyframe(&fir));
-    assert!(rtcp_requests_keyframe(&compound));
-    assert!(!rtcp_requests_keyframe(&receiver_report));
-    assert!(!rtcp_requests_keyframe(&[0x81, 206, 0, 10]));
 }
 
 #[test]

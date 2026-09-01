@@ -621,9 +621,6 @@ function createVideoWorker(ws, onError) {
     placeholder() {
       if (!closed) worker.postMessage({ type: "placeholder" });
     },
-    forceKeyframe() {
-      if (!closed) worker.postMessage({ type: "keyframe" });
-    },
     reconfigure(options) {
       if (closed) return Promise.reject(new Error("Video worker is closed."));
       if (pendingReconfigure) return Promise.reject(new Error("Video reconfigure is already running."));
@@ -753,9 +750,6 @@ async function createVideoStreamer(source, ws, onError) {
         stopVideoTrack();
         api.source = null;
         worker.placeholder();
-      },
-      forceKeyframe() {
-        worker.forceKeyframe();
       },
       async reconfigure(options) {
         if (processorTrack) {
@@ -1087,7 +1081,6 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
   let encoder = null;
   let session = null;
   let pendingStreamListeners = 0;
-  let pendingVideoKeyframe = false;
   let resolveHello = null;
   let helloReceived = false;
   const helloReady = new Promise(resolve => { resolveHello = resolve; });
@@ -1123,11 +1116,6 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
           app.active.streamListeners = listeners;
           ui.updateStreamStatus();
         }
-      },
-      () => {
-        const video = app.active && app.active.ws === ws ? app.active.video : null;
-        if (video) video.forceKeyframe();
-        else pendingVideoKeyframe = true;
       },
       (message, quality) => {
         if (helloReceived) return;
@@ -1186,10 +1174,6 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
 
     if (kind === "video") {
       await installVideoSource(mediaStream, settings);
-      if (pendingVideoKeyframe && app.active.video) {
-        app.active.video.forceKeyframe();
-        pendingVideoKeyframe = false;
-      }
     } else {
       installAudioSource(kind, mediaStream, deviceId ?? undefined, settings);
     }

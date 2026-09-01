@@ -596,8 +596,6 @@ async function handleMessage(message) {
     await setSource(message.readable);
   } else if (message.type === "placeholder" && !closed) {
     await usePlaceholder();
-  } else if (message.type === "keyframe" && !closed) {
-    forceNextKeyframe = true;
   } else if (message.type === "reconfigure" && !closed) {
     await reconfigure(message);
   } else if (message.type === "resume" && !closed) {
