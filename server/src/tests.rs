@@ -10,7 +10,7 @@ use super::rtsp::{
     RtpClock, RtpMediaTimeline, RtpPacketWriter, RtpState, RtspSession, RtspTrack,
     VideoStreamState, build_rtcp_sender_report, channel_video_state, key_from_rtsp_uri,
     placeholder_access_unit, project_rtp_timestamp, read_rtsp_request, rtsp_rtp_info, rtsp_sdp,
-    rtsp_track_from_uri, select_rtsp_interleaved_channel,
+    rtsp_track_from_uri, select_rtsp_interleaved_channel, should_advertise_video,
 };
 use super::websocket::{
     MediaTimestampNormalizer, StreamerTextCommand, is_websocket_disconnect_noise,
@@ -869,11 +869,15 @@ fn rtsp_interleaved_channels_do_not_overlap_between_tracks() {
 #[test]
 fn rtsp_live_tracks_match_advertised_order() {
     assert!(matches!(
-        rtsp_track_from_uri("rtsp://example.com/stream/trackID=0"),
+        rtsp_track_from_uri("rtsp://example.com/stream/trackID=0", true),
         RtspTrack::Video
     ));
     assert!(matches!(
-        rtsp_track_from_uri("rtsp://example.com/stream/trackID=1"),
+        rtsp_track_from_uri("rtsp://example.com/stream/trackID=1", true),
+        RtspTrack::Audio
+    ));
+    assert!(matches!(
+        rtsp_track_from_uri("rtsp://example.com/stream/trackID=0", false),
         RtspTrack::Audio
     ));
 
@@ -904,6 +908,25 @@ fn rtsp_live_tracks_match_advertised_order() {
     assert_eq!(
         select_rtsp_interleaved_channel(&session, RtspTrack::Audio, None),
         2
+    );
+
+    let audio_only = RtspSession {
+        video_omitted: true,
+        audio_setup: true,
+        audio_rtp: RtpState {
+            sequence: 30,
+            timestamp: 40,
+            ..RtpState::default()
+        },
+        ..RtspSession::default()
+    };
+    assert_eq!(
+        rtsp_rtp_info("rtsp://example.com/stream", &audio_only),
+        "url=rtsp://example.com/stream/trackID=0;seq=30;rtptime=40"
+    );
+    assert_eq!(
+        select_rtsp_interleaved_channel(&audio_only, RtspTrack::Audio, None),
+        0
     );
 }
 
@@ -1020,7 +1043,7 @@ fn rtcp_rtp_timestamp_projects_from_latest_media_time() {
 
 #[test]
 fn rtsp_sdp_describes_live_aggregate_session() {
-    let sdp = rtsp_sdp(TEST_VIDEO_FMTP);
+    let sdp = rtsp_sdp(Some(TEST_VIDEO_FMTP));
 
     assert!(sdp.contains("a=range:npt=now-\r\n"));
     assert!(sdp.contains("a=control:*\r\n"));
@@ -1036,12 +1059,32 @@ fn rtsp_sdp_describes_live_aggregate_session() {
 }
 
 #[test]
+fn rtsp_sdp_can_describe_audio_only_session() {
+    let sdp = rtsp_sdp(None);
+
+    assert!(sdp.contains("m=audio 0 RTP/AVP 97\r\n"));
+    assert!(sdp.contains("a=control:trackID=0\r\n"));
+    assert!(!sdp.contains("m=video"));
+    assert!(!sdp.contains("trackID=1"));
+    assert!(!sdp.contains("H264"));
+}
+
+#[test]
+fn androidx_media3_only_gets_video_track_for_active_video() {
+    assert!(!should_advertise_video(true, VideoStreamState::Offline));
+    assert!(!should_advertise_video(true, VideoStreamState::AudioOnly));
+    assert!(should_advertise_video(true, VideoStreamState::Video));
+    assert!(should_advertise_video(false, VideoStreamState::Offline));
+    assert!(should_advertise_video(false, VideoStreamState::AudioOnly));
+}
+
+#[test]
 fn streamer_video_flag_is_independent_from_rtsp_placeholder_track() {
     let mut config = test_config();
     config.video_enabled = false;
 
     assert!(streamer_hello_message(&config, 0, "rtspt://example.com").contains("\"video\":false"));
-    assert!(rtsp_sdp(TEST_VIDEO_FMTP).contains("m=video 0 RTP/AVP 96\r\n"));
+    assert!(rtsp_sdp(Some(TEST_VIDEO_FMTP)).contains("m=video 0 RTP/AVP 96\r\n"));
 }
 
 #[test]
@@ -1058,7 +1101,7 @@ fn active_video_never_selects_a_placeholder() {
 }
 
 #[tokio::test]
-async fn only_androidx_media3_user_agents_disable_placeholders() {
+async fn detects_androidx_media3_user_agent_prefix() {
     let mut android = BufReader::new(
         b"OPTIONS * RTSP/1.0\r\nUser-Agent: AndroidXMedia3/1.8.0\r\n\r\n".as_slice(),
     );

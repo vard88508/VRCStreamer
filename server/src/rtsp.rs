@@ -174,9 +174,9 @@ async fn handle_rtsp_request(
         headers = ?RtspHeadersForLog(&request.headers),
         "rtsp request headers"
     );
-    if !session.suppress_placeholders && request.is_androidx_media3() {
-        session.suppress_placeholders = true;
-        debug!(%peer, "rtsp placeholders disabled for AndroidX Media3");
+    if !session.androidx_media3 && request.is_androidx_media3() {
+        session.androidx_media3 = true;
+        debug!(%peer, "rtsp AndroidX Media3 compatibility enabled");
     }
     match request.method.as_str() {
         "OPTIONS" => {
@@ -204,8 +204,9 @@ async fn handle_rtsp_request(
 
             session.key = Some(key.to_owned());
             let content_base = rtsp_content_base(&request.uri);
-            let video_fmtp = rtsp_video_fmtp(state, key);
-            let sdp = rtsp_sdp(video_fmtp.as_ref());
+            let (video_state, video_fmtp) = rtsp_video_description(state, key);
+            session.video_omitted = !should_advertise_video(session.androidx_media3, video_state);
+            let sdp = rtsp_sdp(session.video_advertised().then_some(video_fmtp.as_ref()));
             write_rtsp_response(
                 writer,
                 "200 OK",
@@ -237,13 +238,15 @@ async fn handle_rtsp_request(
                 return Ok(false);
             }
 
-            let track = rtsp_track_from_uri(&request.uri);
+            let track = rtsp_track_from_uri(&request.uri, session.video_advertised());
 
             if session.guard.is_none() {
                 match subscribe_listener(state, &key) {
                     Ok(subscription) => {
                         session.audio_rx = Some(subscription.audio_rx);
-                        session.video_rx = Some(subscription.video_rx);
+                        if session.video_advertised() {
+                            session.video_rx = Some(subscription.video_rx);
+                        }
                         session.guard = Some(subscription.guard);
                     }
                     Err(status) => {
@@ -384,7 +387,7 @@ async fn handle_rtsp_request(
                         peer: peer.to_owned(),
                         audio,
                         video,
-                        suppress_placeholders: session.suppress_placeholders,
+                        suppress_placeholders: session.androidx_media3,
                     })));
             }
         }
@@ -1567,8 +1570,8 @@ pub(crate) fn build_rtcp_sender_report(
     packet[2..4].copy_from_slice(&interleaved_len.to_be_bytes());
 }
 
-pub(crate) fn rtsp_sdp(video_fmtp: &str) -> String {
-    let mut sdp = String::with_capacity(512 + video_fmtp.len());
+pub(crate) fn rtsp_sdp(video_fmtp: Option<&str>) -> String {
+    let mut sdp = String::with_capacity(512 + video_fmtp.map_or(0, str::len));
     let _ = write!(
         sdp,
         "v=0\r\n\
@@ -1579,17 +1582,20 @@ pub(crate) fn rtsp_sdp(video_fmtp: &str) -> String {
          a=range:npt=now-\r\n\
          a=control:*\r\n"
     );
-    let _ = write!(
-        sdp,
-        "m=video 0 RTP/AVP {RTP_VIDEO_PAYLOAD_TYPE}\r\n\
-         a=control:trackID=0\r\n\
-         a=rtpmap:{RTP_VIDEO_PAYLOAD_TYPE} H264/{H264_CLOCK_RATE}\r\n\
-         a=fmtp:{RTP_VIDEO_PAYLOAD_TYPE} {video_fmtp}\r\n"
-    );
+    if let Some(video_fmtp) = video_fmtp {
+        let _ = write!(
+            sdp,
+            "m=video 0 RTP/AVP {RTP_VIDEO_PAYLOAD_TYPE}\r\n\
+             a=control:trackID=0\r\n\
+             a=rtpmap:{RTP_VIDEO_PAYLOAD_TYPE} H264/{H264_CLOCK_RATE}\r\n\
+             a=fmtp:{RTP_VIDEO_PAYLOAD_TYPE} {video_fmtp}\r\n"
+        );
+    }
+    let audio_track_id = usize::from(video_fmtp.is_some());
     let _ = write!(
         sdp,
         "m=audio 0 RTP/AVP {RTP_AUDIO_PAYLOAD_TYPE}\r\n\
-         a=control:trackID=1\r\n\
+         a=control:trackID={audio_track_id}\r\n\
          a=rtpmap:{RTP_AUDIO_PAYLOAD_TYPE} mpeg4-generic/{AAC_SAMPLE_RATE}/{AAC_CHANNELS}\r\n\
          a=fmtp:{RTP_AUDIO_PAYLOAD_TYPE} config={AAC_AUDIO_SPECIFIC_CONFIG}; indexdeltalength=3; indexlength=3; mode=AAC-hbr; profile-level-id=1; sizelength=13; streamtype=5\r\n"
     );
@@ -1623,14 +1629,15 @@ pub(crate) fn key_from_rtsp_uri(uri: &str) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-pub(crate) fn rtsp_track_from_uri(uri: &str) -> RtspTrack {
-    if uri
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(uri)
-        .rsplit('/')
-        .next()
-        .is_some_and(|segment| segment.eq_ignore_ascii_case("trackID=0"))
+pub(crate) fn rtsp_track_from_uri(uri: &str, video_advertised: bool) -> RtspTrack {
+    if video_advertised
+        && uri
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(uri)
+            .rsplit('/')
+            .next()
+            .is_some_and(|segment| segment.eq_ignore_ascii_case("trackID=0"))
     {
         return RtspTrack::Video;
     }
@@ -1652,9 +1659,10 @@ pub(crate) fn rtsp_rtp_info(uri: &str, session: &RtspSession) -> String {
         if !out.is_empty() {
             out.push(',');
         }
+        let track_id = usize::from(session.video_advertised());
         let _ = write!(
             out,
-            "url={base}/trackID=1;seq={};rtptime={}",
+            "url={base}/trackID={track_id};seq={};rtptime={}",
             session.audio_rtp.sequence, session.audio_rtp.timestamp
         );
     }
@@ -1673,7 +1681,8 @@ pub(crate) fn select_rtsp_interleaved_channel(
     requested: Option<u8>,
 ) -> u8 {
     let preferred = requested.unwrap_or(match track {
-        RtspTrack::Audio => 2,
+        RtspTrack::Audio if session.video_advertised() => 2,
+        RtspTrack::Audio => 0,
         RtspTrack::Video => 0,
     });
     if rtsp_interleaved_channel_available(session, track, preferred) {
@@ -1722,7 +1731,7 @@ pub(crate) fn channel_video_state(channel: &Channel) -> VideoStreamState {
     }
 }
 
-fn rtsp_video_fmtp(state: &AppState, key: &str) -> Arc<str> {
+fn rtsp_video_description(state: &AppState, key: &str) -> (VideoStreamState, Arc<str>) {
     let channel = state
         .channels
         .read()
@@ -1730,16 +1739,25 @@ fn rtsp_video_fmtp(state: &AppState, key: &str) -> Arc<str> {
         .get(key)
         .cloned();
     let Some(channel) = channel else {
-        return state.placeholders.offline_fmtp.clone();
+        return (
+            VideoStreamState::Offline,
+            state.placeholders.offline_fmtp.clone(),
+        );
     };
 
-    match channel_video_state(&channel) {
+    let video_state = channel_video_state(&channel);
+    let fmtp = match video_state {
         VideoStreamState::Video => channel
             .video_fmtp()
             .unwrap_or_else(|| state.placeholders.audio_only_fmtp.clone()),
         VideoStreamState::AudioOnly => state.placeholders.audio_only_fmtp.clone(),
         VideoStreamState::Offline => state.placeholders.offline_fmtp.clone(),
-    }
+    };
+    (video_state, fmtp)
+}
+
+pub(crate) fn should_advertise_video(androidx_media3: bool, state: VideoStreamState) -> bool {
+    !androidx_media3 || state == VideoStreamState::Video
 }
 
 pub(crate) fn placeholder_access_unit(
@@ -1772,10 +1790,15 @@ pub(crate) struct RtspSession {
     pub(crate) video_channel: u8,
     pub(crate) audio_rtp: RtpState,
     pub(crate) video_rtp: RtpState,
-    pub(crate) suppress_placeholders: bool,
+    pub(crate) androidx_media3: bool,
+    pub(crate) video_omitted: bool,
 }
 
 impl RtspSession {
+    fn video_advertised(&self) -> bool {
+        !self.video_omitted
+    }
+
     fn stop(&mut self) {
         self.media_rtp_task.stop();
     }
