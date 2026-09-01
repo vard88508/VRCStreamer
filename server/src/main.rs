@@ -12,7 +12,7 @@ use axum::{
 };
 use axum_server::tls_rustls::RustlsConfig;
 use bytes::Bytes;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
@@ -128,6 +128,18 @@ impl VideoQuality {
             self.width, self.height, self.fps, self.bitrate_kbps
         );
         out.push('"');
+    }
+}
+
+impl Serialize for VideoQuality {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(&format_args!(
+            "{}x{}*{}/{}",
+            self.width, self.height, self.fps, self.bitrate_kbps
+        ))
     }
 }
 
@@ -644,6 +656,7 @@ struct StatsResponse<'a> {
     report_abuse_link: Option<&'a str>,
     rtsp_base: String,
     video: bool,
+    video_qualities: &'a [VideoQuality],
     active_connections: usize,
     active_streamers: usize,
     active_listeners: usize,
@@ -668,6 +681,11 @@ async fn stats(
     let active_connections = state.active_connections.load(Ordering::Acquire);
     let active_streamers = state.active_streamers.load(Ordering::Acquire);
     let active_listeners = state.active_listeners.load(Ordering::Acquire);
+    let video_qualities = if state.config.video_enabled {
+        state.config.video_qualities.as_slice()
+    } else {
+        &[]
+    };
 
     let mut response = axum::Json(StatsResponse {
         name: &state.config.server_name,
@@ -676,6 +694,7 @@ async fn stats(
         report_abuse_link: state.config.report_abuse_link.as_deref(),
         rtsp_base: public_rtsp_base(&state.config, &headers),
         video: state.config.video_enabled,
+        video_qualities,
         active_connections,
         active_streamers,
         active_listeners,

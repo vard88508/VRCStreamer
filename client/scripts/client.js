@@ -768,14 +768,22 @@ function setVideoQualities(values, enabled) {
   if (enabled && next.length === 0) {
     next.push(normalizeVideoQuality("1280x720*30/2000", 0));
   }
-  videoQualities = next;
-
   const saved = savedVideoQuality();
   const selected = next.find(quality => quality.id === saved) || next[0] || null;
-  applyVideoQuality(selected);
-  if (selected) saveVideoQuality(selected.id);
-  else saveVideoQuality("");
-  ui.setVideoQualities(next, selected && selected.id);
+  const unchanged = next.length === videoQualities.length
+    && next.every((quality, index) => quality.id === videoQualities[index].id);
+  const selectedId = selected?.id || "";
+  videoQualities = next;
+  if (selected && (selected.width !== config.videoWidth
+      || selected.height !== config.videoHeight
+      || selected.fps !== config.videoFps
+      || selected.bitrate !== config.videoBitrate)) {
+    applyVideoQuality(selected);
+  }
+  if (saved !== selectedId) saveVideoQuality(selectedId);
+  if (!unchanged || ui.els.videoQualityEl.value !== selectedId) {
+    ui.setVideoQualities(next, selectedId);
+  }
   return selected;
 }
 
@@ -833,6 +841,9 @@ async function refreshStats() {
     const stats = await response.json();
     if (key !== currentServerKey()) return false;
     applyServerInfo(stats, key);
+    if (Array.isArray(stats.video_qualities)) {
+      setVideoQualities(stats.video_qualities, Boolean(stats.video));
+    }
     setServerStatus("online", Number(stats.active_streams) || 0, Number(stats.active_listeners) || 0);
     return true;
   } catch (_) {
