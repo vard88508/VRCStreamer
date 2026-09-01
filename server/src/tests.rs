@@ -1056,3 +1056,17 @@ fn active_video_never_selects_a_placeholder() {
     assert!(placeholder_access_unit(&placeholders, VideoStreamState::AudioOnly).is_some());
     assert!(placeholder_access_unit(&placeholders, VideoStreamState::Video).is_none());
 }
+
+#[tokio::test]
+async fn only_androidx_media3_user_agents_disable_placeholders() {
+    let mut android = BufReader::new(
+        b"OPTIONS * RTSP/1.0\r\nUser-Agent: AndroidXMedia3/1.8.0\r\n\r\n".as_slice(),
+    );
+    let request = read_rtsp_request(&mut android).await.unwrap().unwrap();
+    assert!(request.is_androidx_media3());
+
+    let mut other =
+        BufReader::new(b"OPTIONS * RTSP/1.0\r\nUser-Agent: ExoPlayerLib/2.19.1\r\n\r\n".as_slice());
+    let request = read_rtsp_request(&mut other).await.unwrap().unwrap();
+    assert!(!request.is_androidx_media3());
+}

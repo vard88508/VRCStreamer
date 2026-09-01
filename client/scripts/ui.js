@@ -898,6 +898,7 @@ function videoStatsSection(video) {
     `Encoder queue: ${video.queue} frames`,
     `Encoder queue drops: ${video.queueDrops || 0}`,
     `Capture buffer drops: ${video.sourceBufferDrops || 0}`,
+    `Network backpressure: ${video.networkPaused ? "paused" : "ready"} (${video.networkDrops || 0} frames dropped)`,
     `Repeated during capture stalls: ${video.repeatedFrames || 0}`
   ]);
 }

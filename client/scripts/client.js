@@ -39,8 +39,9 @@ const config = {
   videoFps: 30,
   videoBitrate: 2000000,
   videoPlaceholderHoldMs: 15000,
-  maxAudioWsBufferedBytes: 256 * 1024,
-  maxVideoWsBufferedBytes: 1024 * 1024,
+  wsPauseBufferedBytes: 1024 * 1024,
+  wsResumeBufferedBytes: 256 * 1024,
+  wsStallTimeoutMs: 5000,
   systemCaptureSupported
 };
 

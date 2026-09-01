@@ -174,6 +174,10 @@ async fn handle_rtsp_request(
         headers = ?RtspHeadersForLog(&request.headers),
         "rtsp request headers"
     );
+    if !session.suppress_placeholders && request.is_androidx_media3() {
+        session.suppress_placeholders = true;
+        debug!(%peer, "rtsp placeholders disabled for AndroidX Media3");
+    }
     match request.method.as_str() {
         "OPTIONS" => {
             write_rtsp_response(
@@ -380,6 +384,7 @@ async fn handle_rtsp_request(
                         peer: peer.to_owned(),
                         audio,
                         video,
+                        suppress_placeholders: session.suppress_placeholders,
                     })));
             }
         }
@@ -483,6 +488,7 @@ struct RtspMediaTask {
     peer: String,
     audio: Option<RtspAudioTrackStart>,
     video: Option<RtspVideoTrackStart>,
+    suppress_placeholders: bool,
 }
 
 struct RtpTaskContext<'a> {
@@ -737,6 +743,7 @@ impl VideoRtpTrack {
         placeholders: &Placeholders,
         stream: &Channel,
         key: &str,
+        suppress_placeholders: bool,
     ) -> RtspResult<()> {
         let current_state = channel_video_state(stream);
         if self.last_state == Some(current_state) {
@@ -746,6 +753,9 @@ impl VideoRtpTrack {
         self.last_state = Some(current_state);
         if current_state != VideoStreamState::Video {
             self.sender.shrink_to_packet_buffer();
+        }
+        if suppress_placeholders {
+            return Ok(());
         }
         let Some(frame) = placeholder_access_unit(placeholders, current_state) else {
             return Ok(());
@@ -877,6 +887,7 @@ async fn rtsp_media_rtp_task(task: RtspMediaTask) {
         peer,
         audio,
         video,
+        suppress_placeholders,
     } = task;
     let play_started_at = TokioInstant::now();
     let mut timeline = RtpMediaTimeline::default();
@@ -918,7 +929,13 @@ async fn rtsp_media_rtp_task(task: RtspMediaTask) {
         }
         if let Some(track) = video.as_mut()
             && let Err(error) = track
-                .sync_state(&writer, &state.placeholders, &stream, &key)
+                .sync_state(
+                    &writer,
+                    &state.placeholders,
+                    &stream,
+                    &key,
+                    suppress_placeholders,
+                )
                 .await
         {
             warn!(%peer, %key, %error, "rtsp video placeholder writer failed");
@@ -1755,6 +1772,7 @@ pub(crate) struct RtspSession {
     pub(crate) video_channel: u8,
     pub(crate) audio_rtp: RtpState,
     pub(crate) video_rtp: RtpState,
+    pub(crate) suppress_placeholders: bool,
 }
 
 impl RtspSession {
@@ -1903,6 +1921,11 @@ impl RtspRequest {
             .iter()
             .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
+    }
+
+    pub(crate) fn is_androidx_media3(&self) -> bool {
+        self.header("user-agent")
+            .is_some_and(|value| value.starts_with("AndroidXMedia3"))
     }
 }
 

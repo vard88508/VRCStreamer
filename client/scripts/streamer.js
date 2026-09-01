@@ -173,6 +173,69 @@ function closeWebSocket(ws, code, reason) {
   }
 }
 
+function createPublisherTransport(ws, onFailure) {
+  let congestedAt = 0;
+  let failed = false;
+  let videoControl = null;
+  let videoPaused = false;
+
+  const pauseVideo = () => {
+    if (!videoControl || videoPaused) return;
+    videoPaused = true;
+    videoControl.pause();
+  };
+
+  const resumeVideo = () => {
+    if (!videoControl || !videoPaused) return;
+    videoPaused = false;
+    videoControl.resume();
+  };
+
+  const abort = error => {
+    if (failed) return;
+    failed = true;
+    onFailure(error);
+  };
+
+  return {
+    poll() {
+      if (failed) return false;
+      const now = performance.now();
+      const queued = ws.bufferedAmount;
+      if (queued > config.wsPauseBufferedBytes) {
+        if (!congestedAt) congestedAt = now;
+        pauseVideo();
+      } else if (congestedAt && queued <= config.wsResumeBufferedBytes) {
+        congestedAt = 0;
+        resumeVideo();
+      }
+      if (congestedAt && now - congestedAt >= config.wsStallTimeoutMs) {
+        abort(new Error(`Network upload stalled with ${Math.ceil(queued / 1024)} KB queued.`));
+      }
+      return !failed;
+    },
+    abort,
+    attachVideo(control) {
+      videoControl = control;
+      videoPaused = false;
+      if (congestedAt) pauseVideo();
+    },
+    detachVideo(control) {
+      if (videoControl !== control) return;
+      videoControl = null;
+      videoPaused = false;
+    },
+    close() {
+      failed = true;
+      videoControl = null;
+      videoPaused = false;
+    },
+    get videoPaused() {
+      return videoPaused;
+    }
+  };
+}
+
 function closeAudioContext(audioContext) {
   if (!audioContext || audioContext.state === "closed") return;
   try {
@@ -362,22 +425,23 @@ function sendAudioPacket(session, encoder, packet) {
       || session.ws.readyState !== WebSocket.OPEN) {
     return;
   }
-  if (session.ws.bufferedAmount > config.maxAudioWsBufferedBytes) {
-    failActive();
-    return;
+  if (!session.transport.poll()) return;
+  try {
+    session.ws.send(packet);
+  } catch (error) {
+    session.transport.abort(error);
   }
-  session.ws.send(packet);
 }
 
-function handleAacEncoderError(session, encoder) {
+function handleAacEncoderError(session, encoder, error) {
   if (!session || app.active !== session) return;
   if (session.encoder === encoder) {
-    failActive();
+    failActive(error);
     return;
   }
   const swap = session.audioEncoderSwap;
   if (!swap || swap.encoder !== encoder) return;
-  failActive();
+  failActive(error);
 }
 
 function encodeAudioBlock(session, buffer, timestampSamples) {
@@ -422,7 +486,7 @@ async function completeAudioEncoderSwap(session, swap) {
   } catch (error) {
     swap.encoder.close();
     swap.reject(error);
-    if (app.active === session) failActive();
+    if (app.active === session) failActive(error);
   }
 }
 
@@ -440,7 +504,7 @@ async function replaceAudioEncoder() {
   nextEncoder = createAacEncoder(
     mode,
     packet => sendAudioPacket(session, nextEncoder, packet),
-    () => handleAacEncoderError(session, nextEncoder)
+    error => handleAacEncoderError(session, nextEncoder, error)
   );
   session.preparingAudioEncoder = nextEncoder;
 
@@ -473,7 +537,7 @@ async function replaceAudioEncoder() {
   });
 }
 
-function createVideoWorker(ws, onError) {
+function createVideoWorker(ws, transport, onError) {
   const worker = new Worker(videoWorkerUrl);
   let closed = false;
   let readySettled = false;
@@ -482,6 +546,8 @@ function createVideoWorker(ws, onError) {
   let closePromise = null;
   let closeResolve = null;
   let terminateTimer = 0;
+  let transportAttached = false;
+  let networkDrops = 0;
   let latestStats = {
     queueDrops: 0,
     repeatedFrames: 0,
@@ -500,6 +566,15 @@ function createVideoWorker(ws, onError) {
     rejectReady = reject;
   });
 
+  const transportControl = {
+    pause() {
+      if (!closed) worker.postMessage({ type: "transport-pause" });
+    },
+    resume() {
+      if (!closed) worker.postMessage({ type: "transport-resume" });
+    }
+  };
+
   const rejectPending = error => {
     if (pendingSource) {
       clearTimeout(pendingSource.timer);
@@ -516,6 +591,10 @@ function createVideoWorker(ws, onError) {
   const terminate = () => {
     clearTimeout(terminateTimer);
     terminateTimer = 0;
+    if (transportAttached) {
+      transport.detachVideo(transportControl);
+      transportAttached = false;
+    }
     worker.terminate();
     if (closeResolve) {
       closeResolve();
@@ -540,6 +619,8 @@ function createVideoWorker(ws, onError) {
     const message = event.data || {};
     if (message.type === "ready") {
       if (!readySettled) {
+        transport.attachVideo(transportControl);
+        transportAttached = true;
         readySettled = true;
         resolveReady();
       }
@@ -549,11 +630,16 @@ function createVideoWorker(ws, onError) {
       pendingSource = null;
     } else if (message.type === "packet") {
       if (closed || !app.active || app.active.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
-      if (ws.bufferedAmount > config.maxVideoWsBufferedBytes) {
-        fail(new Error("Network video queue is too slow; stopped video."));
+      if (!transport.poll()) return;
+      if (transport.videoPaused) {
+        networkDrops++;
         return;
       }
-      ws.send(message.packet);
+      try {
+        ws.send(message.packet);
+      } catch (error) {
+        transport.abort(error);
+      }
     } else if (message.type === "stats") {
       latestStats = message.stats || latestStats;
     } else if (message.type === "reconfigured" && pendingReconfigure) {
@@ -659,7 +745,11 @@ function createVideoWorker(ws, onError) {
       return closePromise;
     },
     stats() {
-      return latestStats;
+      return {
+        ...latestStats,
+        networkDrops,
+        networkPaused: transport.videoPaused
+      };
     }
   };
 }
@@ -698,7 +788,7 @@ async function createVideoStreamer(source, ws, onError) {
   if (!source || !source.mediaStream.getVideoTracks()[0]) {
     throw new Error("Selected source has no video track.");
   }
-  const worker = createVideoWorker(ws, onError);
+  const worker = createVideoWorker(ws, app.active.transport, onError);
   let closed = false;
   let processorTrack = null;
   let api = null;
@@ -1093,7 +1183,7 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
     encoder = createAacEncoder(
       app.selectedEncoderMode(),
       packet => sendAudioPacket(session, encoder, packet),
-      () => handleAacEncoderError(session, encoder)
+      error => handleAacEncoderError(session, encoder, error)
     );
     let encoderReadyError = null;
     const encoderReady = encoder.ready.catch(error => {
@@ -1160,10 +1250,14 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
       captureNode,
       monitor,
       wakeLock,
+      transport: null,
       statsTimer: null,
       sources: { mic: null, screen: null, video: null },
       streamListeners: pendingStreamListeners
     };
+    session.transport = createPublisherTransport(ws, error => {
+      if (app.active === session) failActive(error);
+    });
     app.active = session;
 
     mixer.connect(captureNode);
@@ -1181,13 +1275,16 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
 
     ui.setStreamingControls(true);
 
-    ws.onclose = () => {
+    ws.onclose = event => {
       if (app.active && app.active.ws === ws) {
-        cleanup();
+        const detail = event.reason ? `${event.code}: ${event.reason}` : String(event.code || "unknown");
+        failActive(new Error(`Streamer connection closed (${detail}).`));
       }
     };
     ws.onerror = () => {
-      if (app.active && app.active.ws === ws) failActive();
+      if (app.active && app.active.ws === ws) {
+        failActive(new Error("Streamer WebSocket connection failed."));
+      }
     };
 
     ui.updateStreamStatus(encoderInfo);
@@ -1213,8 +1310,12 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
   }
 }
 
-function failActive() {
+function failActive(error = new Error("Stream stopped unexpectedly.")) {
+  if (!app.active) return;
+  const message = error?.message || String(error);
+  console.error("Stream stopped:", error);
   cleanup();
+  alert(`Stream stopped:\n\n${message}`);
 }
 
 function stop() {
@@ -1277,6 +1378,7 @@ function cleanup({ stopStreams = true, updateControls = true } = {}) {
     swap.encoder.close();
     swap.reject(new Error("AAC encoder swap cancelled."));
   }
+  current.transport.close();
   try { current.captureNode.disconnect(); } catch (_) {}
   try { current.mixer.disconnect(); } catch (_) {}
   try { current.monitor.disconnect(); } catch (_) {}

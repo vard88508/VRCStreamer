@@ -22,6 +22,7 @@ let statsTimer = 0;
 let closed = true;
 let failed = false;
 let paused = false;
+let networkPaused = false;
 let placeholder = false;
 let placeholderImage = null;
 let placeholderImageUrl = "";
@@ -189,7 +190,7 @@ function createOutputFrame(source, showPlaceholder, timestamp, duration) {
 }
 
 function submitFrame(source, showPlaceholder, timestamp, duration, repeated = false) {
-  if (closed || paused || !encoder || encoder.state !== "configured") return false;
+  if (closed || paused || networkPaused || !encoder || encoder.state !== "configured") return false;
   if (encoder.encodeQueueSize >= MAX_ENCODER_QUEUE) {
     queueDrops++;
     return false;
@@ -216,7 +217,7 @@ function clearPacingTimer() {
 }
 
 function scheduleNextFrame() {
-  if (closed || paused || pacingTimer) return;
+  if (closed || paused || networkPaused || pacingTimer) return;
   const elapsedMs = timelineElapsedMs();
   const elapsedFrame = Math.ceil(elapsedMs * fps / 1000);
   scheduledFrameIndex = Math.max(elapsedFrame, lastFrameIndex + 1);
@@ -226,7 +227,7 @@ function scheduleNextFrame() {
 
 function runPacing() {
   pacingTimer = 0;
-  if (closed || paused) return;
+  if (closed || paused || networkPaused) return;
   let frameIndex = Math.max(
     scheduledFrameIndex,
     Math.floor(timelineElapsedMs() * fps / 1000),
@@ -262,7 +263,7 @@ function runPacing() {
 }
 
 function startCurrentOutput() {
-  if (closed || paused) return;
+  if (closed || paused || networkPaused) return;
   if (!placeholder && !renderedSourceFrame && sourceBuffer.length === 0) return;
   scheduleNextFrame();
 }
@@ -360,7 +361,9 @@ function postStats() {
   lastEncoded = encoded;
   lastSourceFrames = sourceFrames;
   lastEncodedBytes = encodedBytes;
-  if (!closed && !paused && !placeholder && encodedDelta > 0) adaptQuantizer(actualBitrate);
+  if (!closed && !paused && !networkPaused && !placeholder && encodedDelta > 0) {
+    adaptQuantizer(actualBitrate);
+  }
   postMessage({
     type: "stats",
     stats: {
@@ -511,6 +514,7 @@ async function init(message) {
   failed = false;
   closed = false;
   paused = false;
+  networkPaused = false;
   placeholder = true;
   width = message.width;
   height = message.height;
@@ -570,6 +574,7 @@ async function init(message) {
 async function closeAll() {
   closed = true;
   paused = true;
+  networkPaused = false;
   clearPacingTimer();
   clearInterval(statsTimer);
   statsTimer = 0;
@@ -600,6 +605,13 @@ async function handleMessage(message) {
     await reconfigure(message);
   } else if (message.type === "resume" && !closed) {
     paused = false;
+    forceNextKeyframe = true;
+    startCurrentOutput();
+  } else if (message.type === "transport-pause" && !closed) {
+    networkPaused = true;
+    clearPacingTimer();
+  } else if (message.type === "transport-resume" && !closed) {
+    networkPaused = false;
     forceNextKeyframe = true;
     startCurrentOutput();
   } else if (message.type === "close") {

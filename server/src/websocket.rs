@@ -7,7 +7,7 @@ use std::{
 use axum::{
     extract::{
         ConnectInfo, Query, State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code},
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -51,6 +51,15 @@ pub(crate) struct MediaTimestampNormalizer {
     source_clock_rate: u32,
     previous: Option<u32>,
     wrap_offset: u64,
+}
+
+async fn close_for_policy(socket: &mut WebSocket, reason: &'static str) {
+    let _ = socket
+        .send(Message::Close(Some(CloseFrame {
+            code: close_code::POLICY,
+            reason: reason.into(),
+        })))
+        .await;
 }
 
 impl MediaTimestampNormalizer {
@@ -212,7 +221,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
     let peer = guard.peer.as_str();
     if stream_is_blacklisted(state, key) {
         warn!(%peer, %key, "disconnected blacklisted streamer during startup");
-        let _ = socket.send(Message::Close(None)).await;
+        close_for_policy(&mut socket, "stream is blacklisted").await;
         return;
     }
     channel.set_video_fmtp(None);
@@ -260,7 +269,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
             _ = &mut blacklist_notification => {
                 if stream_is_blacklisted(state, key) {
                     warn!(%peer, %key, "disconnected blacklisted streamer");
-                    let _ = socket.send(Message::Close(None)).await;
+                    close_for_policy(&mut socket, "stream is blacklisted").await;
                     break;
                 }
                 blacklist_notification
@@ -285,7 +294,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
             }
             _ = &mut idle_sleep => {
                 warn!(%peer, %key, "streamer idle timeout");
-                let _ = socket.send(Message::Close(None)).await;
+                close_for_policy(&mut socket, "streamer idle timeout").await;
                 break;
             }
             _ = &mut listener_sleep => {
@@ -316,7 +325,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
             DEFAULT_TOKEN_BUCKET_BURST_SECS,
         ) {
             warn!(%peer, %key, "streamer exceeded control message rate");
-            let _ = socket.send(Message::Close(None)).await;
+            close_for_policy(&mut socket, "control message rate exceeded").await;
             break;
         }
 
@@ -333,7 +342,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                         ) =>
                     {
                         warn!(%peer, %key, "streamer exceeded aac frame rate");
-                        let _ = socket.send(Message::Close(None)).await;
+                        close_for_policy(&mut socket, "AAC frame rate exceeded").await;
                         break;
                     }
                     Some(0x00)
@@ -345,7 +354,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                         ) =>
                     {
                         warn!(%peer, %key, "streamer exceeded aac ingest rate");
-                        let _ = socket.send(Message::Close(None)).await;
+                        close_for_policy(&mut socket, "AAC ingest rate exceeded").await;
                         break;
                     }
                     Some(0x01 | 0x02)
@@ -359,7 +368,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                             ) =>
                     {
                         warn!(%peer, %key, video_quality, "streamer exceeded selected video frame rate");
-                        let _ = socket.send(Message::Close(None)).await;
+                        close_for_policy(&mut socket, "video frame rate exceeded").await;
                         break;
                     }
                     Some(0x01 | 0x02)
@@ -386,7 +395,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                             burst_secs = state.config.video_ingest_burst_secs,
                             "streamer exceeded selected video ingest rate"
                         );
-                        let _ = socket.send(Message::Close(None)).await;
+                        close_for_policy(&mut socket, "video ingest rate exceeded").await;
                         break;
                     }
                     _ => {}
@@ -452,7 +461,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                     }
                     Err(reason) => {
                         warn!(%peer, %key, %reason, "streamer sent invalid media frame");
-                        let _ = socket.send(Message::Close(None)).await;
+                        close_for_policy(&mut socket, "invalid media frame").await;
                         break;
                     }
                 }
@@ -485,6 +494,11 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
             }
             Message::Pong(_) => {}
             Message::Close(frame) => {
+                if let Some(frame) = &frame {
+                    debug!(%peer, %key, code = frame.code, reason = %frame.reason, "streamer requested websocket close");
+                } else {
+                    debug!(%peer, %key, "streamer requested websocket close");
+                }
                 let _ = socket.send(Message::Close(frame)).await;
                 break;
             }
@@ -502,7 +516,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                     )
                 {
                     warn!(%peer, %key, "streamer sent video command while video is disabled");
-                    let _ = socket.send(Message::Close(None)).await;
+                    close_for_policy(&mut socket, "video is disabled").await;
                     break;
                 }
                 match command {
@@ -534,7 +548,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                     Some(StreamerTextCommand::VideoQuality(index)) => {
                         if index >= state.config.video_qualities.len() {
                             warn!(%peer, %key, index, "streamer selected invalid video quality");
-                            let _ = socket.send(Message::Close(None)).await;
+                            close_for_policy(&mut socket, "invalid video quality").await;
                             break;
                         }
                         video_quality = index;
@@ -543,7 +557,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                     }
                     None => {
                         warn!(%peer, %key, "streamer sent text message");
-                        let _ = socket.send(Message::Close(None)).await;
+                        close_for_policy(&mut socket, "invalid control message").await;
                         break;
                     }
                 }
