@@ -24,6 +24,7 @@ use super::media::{
     parse_streamer_media_frame,
 };
 use super::{
+    AAC_ABUSE_BURST_SECS, AAC_ABUSE_MAX_FRAMES_PER_SECOND, AAC_ABUSE_MAX_INGEST_BYTES_PER_SECOND,
     AAC_INGEST_BURST_SECS, AAC_MAX_FRAMES_PER_SECOND, AAC_MAX_INGEST_BYTES_PER_SECOND,
     AAC_SAMPLE_RATE, AppState, Channel, DEFAULT_TOKEN_BUCKET_BURST_SECS, H264_CLOCK_RATE,
     MEDIA_CLOCK_RATE, STREAMER_CONTROL_MESSAGES_PER_SECOND, STREAMER_LISTENER_UPDATE_INTERVAL,
@@ -231,6 +232,8 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
     let mut video_configured = false;
     let mut audio_ingest = TokenBucket::new();
     let mut audio_frames_ingest = TokenBucket::new();
+    let mut audio_abuse_ingest = TokenBucket::new();
+    let mut audio_abuse_frames_ingest = TokenBucket::new();
     let mut video_ingest = TokenBucket::new();
     let mut video_frames_ingest = TokenBucket::new();
     let mut control_ingest = TokenBucket::new();
@@ -240,6 +243,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
     let mut frames = 0usize;
     let mut video_frames = 0usize;
     let mut bytes = 0usize;
+    let mut audio_rate_drops = 0usize;
     let mut video_bytes = 0usize;
     let started_at = Instant::now();
     let mut last_report = Instant::now();
@@ -334,29 +338,54 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
             Message::Binary(frame) => {
                 let received_at = Instant::now();
                 match frame.first().copied() {
-                    Some(0x00)
-                        if !audio_frames_ingest.allow_at(
+                    Some(0x00) => {
+                        let within_abuse_frame_rate = audio_abuse_frames_ingest.allow_at(
+                            received_at,
+                            1,
+                            AAC_ABUSE_MAX_FRAMES_PER_SECOND,
+                            AAC_ABUSE_BURST_SECS,
+                        );
+                        let within_abuse_byte_rate = audio_abuse_ingest.allow_at(
+                            received_at,
+                            frame.len(),
+                            AAC_ABUSE_MAX_INGEST_BYTES_PER_SECOND,
+                            AAC_ABUSE_BURST_SECS,
+                        );
+                        if !within_abuse_frame_rate || !within_abuse_byte_rate {
+                            warn!(
+                                %peer,
+                                %key,
+                                frame_bytes = frame.len(),
+                                "streamer exceeded hard aac ingest limit"
+                            );
+                            close_for_policy(&mut socket, "AAC abuse rate exceeded").await;
+                            break;
+                        }
+
+                        let within_frame_rate = audio_frames_ingest.allow_at(
                             received_at,
                             1,
                             AAC_MAX_FRAMES_PER_SECOND,
                             AAC_INGEST_BURST_SECS,
-                        ) =>
-                    {
-                        warn!(%peer, %key, "streamer exceeded aac frame rate");
-                        close_for_policy(&mut socket, "AAC frame rate exceeded").await;
-                        break;
-                    }
-                    Some(0x00)
-                        if !audio_ingest.allow_at(
+                        );
+                        let within_byte_rate = audio_ingest.allow_at(
                             received_at,
                             frame.len(),
                             AAC_MAX_INGEST_BYTES_PER_SECOND,
                             AAC_INGEST_BURST_SECS,
-                        ) =>
-                    {
-                        warn!(%peer, %key, "streamer exceeded aac ingest rate");
-                        close_for_policy(&mut socket, "AAC ingest rate exceeded").await;
-                        break;
+                        );
+                        if !within_frame_rate || !within_byte_rate {
+                            audio_rate_drops = audio_rate_drops.saturating_add(1);
+                            if audio_rate_drops == 1 {
+                                warn!(
+                                    %peer,
+                                    %key,
+                                    frame_bytes = frame.len(),
+                                    "dropping excess aac frames to keep streamer connected"
+                                );
+                            }
+                            continue;
+                        }
                     }
                     Some(0x01 | 0x02)
                         if state.config.video_enabled
@@ -481,6 +510,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                         audio_bytes = bytes,
                         audio_fps = frames as f64 / elapsed,
                         audio_kbps = (bytes as f64 * 8.0 / 1000.0) / elapsed,
+                        audio_rate_drops,
                         video_frames,
                         video_bytes,
                         video_fps = video_frames as f64 / elapsed,
@@ -566,7 +596,14 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
         }
     }
 
-    info!(%peer, %key, audio_frames = frames, video_frames, "streamer disconnected");
+    info!(
+        %peer,
+        %key,
+        audio_frames = frames,
+        audio_rate_drops,
+        video_frames,
+        "streamer disconnected"
+    );
 }
 
 pub(crate) fn streamer_text_command(text: &str) -> Option<StreamerTextCommand> {

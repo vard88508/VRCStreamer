@@ -7,6 +7,8 @@ export function createStreamer(app) {
   const videoPlaceholderUrl = new URL("static/live-placeholder-1080.webp", location.href).href;
   const maxAudioBufferedBlocks = 6;
   const maxAudioPacketAgeSamples = config.sampleRate / 2;
+  const maxAudioSendBytesPerSecond = 48000;
+  const maxAudioSendBurstBytes = maxAudioSendBytesPerSecond;
   const audioSwapFlushTimeoutMs = 2000;
 
 async function requestScreenWakeLock() {
@@ -233,6 +235,9 @@ function createPublisherTransport(ws, onFailure) {
     },
     get videoPaused() {
       return videoPaused;
+    },
+    get congested() {
+      return congestedAt !== 0;
     }
   };
 }
@@ -428,6 +433,19 @@ function audioTimestampIsStale(session, sourceTimestamp) {
   return age < 0x80000000 && age > maxAudioPacketAgeSamples;
 }
 
+function consumeAudioSendBudget(session, bytes) {
+  const now = performance.now();
+  const elapsed = Math.max(0, now - session.audioSendBudgetAt);
+  session.audioSendBudget = Math.min(
+    maxAudioSendBurstBytes,
+    session.audioSendBudget + elapsed * maxAudioSendBytesPerSecond / 1000
+  );
+  session.audioSendBudgetAt = now;
+  if (bytes > session.audioSendBudget) return false;
+  session.audioSendBudget -= bytes;
+  return true;
+}
+
 function sendAudioPacket(session, encoder, packet, sourceTimestamp) {
   if (!session
       || app.active !== session
@@ -440,6 +458,11 @@ function sendAudioPacket(session, encoder, packet, sourceTimestamp) {
     return;
   }
   if (!session.transport.poll()) return;
+  if (session.transport.congested
+      || !consumeAudioSendBudget(session, packet.byteLength)) {
+    encoder.recordDrop();
+    return;
+  }
   try {
     session.ws.send(packet);
   } catch (error) {
@@ -1270,6 +1293,8 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
       timelineStartedAt: 0,
       preparingAudioEncoder: null,
       audioEncoderSwap: null,
+      audioSendBudget: maxAudioSendBurstBytes,
+      audioSendBudgetAt: performance.now(),
       video: null,
       mixer,
       captureNode,
