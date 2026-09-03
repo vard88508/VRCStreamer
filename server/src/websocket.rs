@@ -24,13 +24,14 @@ use super::media::{
     parse_streamer_media_frame,
 };
 use super::{
-    AAC_MAX_FRAMES_PER_SECOND, AAC_MAX_INGEST_BYTES_PER_SECOND, AAC_SAMPLE_RATE, AppState, Channel,
-    DEFAULT_TOKEN_BUCKET_BURST_SECS, H264_CLOCK_RATE, MEDIA_CLOCK_RATE,
-    STREAMER_CONTROL_MESSAGES_PER_SECOND, STREAMER_LISTENER_UPDATE_INTERVAL, allow_http_request,
-    cleanup_channel, force_resync_channel, hash_code, limit_allows, max_ws_message_bytes,
-    origin_allowed, password_allowed, peer_id, public_rtsp_base, reserve_channel,
-    stream_is_blacklisted, streamer_hello_message, streamer_listeners_message, text_response,
-    text_response_with_cors, validate_code, wake_media_listeners, wake_video_listeners,
+    AAC_INGEST_BURST_SECS, AAC_MAX_FRAMES_PER_SECOND, AAC_MAX_INGEST_BYTES_PER_SECOND,
+    AAC_SAMPLE_RATE, AppState, Channel, DEFAULT_TOKEN_BUCKET_BURST_SECS, H264_CLOCK_RATE,
+    MEDIA_CLOCK_RATE, STREAMER_CONTROL_MESSAGES_PER_SECOND, STREAMER_LISTENER_UPDATE_INTERVAL,
+    allow_http_request, cleanup_channel, force_resync_channel, hash_code, limit_allows,
+    max_ws_message_bytes, origin_allowed, password_allowed, peer_id, public_rtsp_base,
+    reserve_channel, stream_is_blacklisted, streamer_hello_message, streamer_listeners_message,
+    text_response, text_response_with_cors, validate_code, wake_media_listeners,
+    wake_video_listeners,
 };
 
 pub(crate) enum StreamerTextCommand {
@@ -338,7 +339,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                             received_at,
                             1,
                             AAC_MAX_FRAMES_PER_SECOND,
-                            DEFAULT_TOKEN_BUCKET_BURST_SECS,
+                            AAC_INGEST_BURST_SECS,
                         ) =>
                     {
                         warn!(%peer, %key, "streamer exceeded aac frame rate");
@@ -350,7 +351,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                             received_at,
                             frame.len(),
                             AAC_MAX_INGEST_BYTES_PER_SECOND,
-                            DEFAULT_TOKEN_BUCKET_BURST_SECS,
+                            AAC_INGEST_BURST_SECS,
                         ) =>
                     {
                         warn!(%peer, %key, "streamer exceeded aac ingest rate");

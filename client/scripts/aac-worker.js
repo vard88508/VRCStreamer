@@ -218,6 +218,7 @@ async function initNative() {
           type: "packet",
           packet: packet.buffer,
           bytes: chunk.byteLength,
+          timestamp: rtpTimestamp,
           queue: nativeEncoder ? nativeEncoder.encodeQueueSize : 0
         },
         [packet.buffer]
@@ -287,10 +288,12 @@ function drainWasmPackets() {
 
     const packet = createMediaPacket(size, pts >>> 0);
     packet.set(module.HEAPU8.subarray(ptr, ptr + size), MEDIA_FRAME_HEADER_BYTES);
-    self.postMessage(
-      { type: "packet", packet: packet.buffer, bytes: size },
-      [packet.buffer]
-    );
+    self.postMessage({
+      type: "packet",
+      packet: packet.buffer,
+      bytes: size,
+      timestamp: pts >>> 0
+    }, [packet.buffer]);
   }
 }
 

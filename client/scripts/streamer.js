@@ -6,6 +6,7 @@ export function createStreamer(app) {
   const videoWorkerUrl = new URL("video-worker.js", import.meta.url);
   const videoPlaceholderUrl = new URL("static/live-placeholder-1080.webp", location.href).href;
   const maxAudioBufferedBlocks = 6;
+  const maxAudioPacketAgeSamples = config.sampleRate / 2;
   const audioSwapFlushTimeoutMs = 2000;
 
 async function requestScreenWakeLock() {
@@ -320,7 +321,7 @@ function createAacEncoder(encoderMode, onPacket, onError) {
         encodedFrames++;
         encodedBytes += message.bytes;
         codecQueue = Number(message.queue) || 0;
-        onPacket(message.packet);
+        onPacket(message.packet, message.timestamp);
       } else if (message.type === "consumed") {
         pendingBlocks = Math.max(0, pendingBlocks - 1);
         codecQueue = Number(message.queue) || 0;
@@ -418,11 +419,24 @@ function createAacEncoder(encoderMode, onPacket, onError) {
   };
 }
 
-function sendAudioPacket(session, encoder, packet) {
+function audioTimestampIsStale(session, sourceTimestamp) {
+  if (!Number.isInteger(sourceTimestamp)) return false;
+  const currentTimestamp = Math.round(
+    session.audioContext.currentTime * config.sampleRate
+  ) >>> 0;
+  const age = (currentTimestamp - (sourceTimestamp >>> 0)) >>> 0;
+  return age < 0x80000000 && age > maxAudioPacketAgeSamples;
+}
+
+function sendAudioPacket(session, encoder, packet, sourceTimestamp) {
   if (!session
       || app.active !== session
       || session.encoder !== encoder
       || session.ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  if (audioTimestampIsStale(session, sourceTimestamp)) {
+    encoder.recordDrop();
     return;
   }
   if (!session.transport.poll()) return;
@@ -447,6 +461,10 @@ function handleAacEncoderError(session, encoder, error) {
 function encodeAudioBlock(session, buffer, timestampSamples) {
   if (!session || app.active !== session) return;
   if (!Number.isSafeInteger(timestampSamples) || timestampSamples < 0) return;
+  if (audioTimestampIsStale(session, timestampSamples)) {
+    (session.audioEncoderSwap?.encoder || session.encoder).recordDrop();
+    return;
+  }
 
   const swap = session.audioEncoderSwap;
   if (swap) {
@@ -505,7 +523,7 @@ async function replaceAudioEncoder() {
   const mode = app.selectedEncoderMode();
   nextEncoder = createAacEncoder(
     mode,
-    packet => sendAudioPacket(session, nextEncoder, packet),
+    (packet, timestamp) => sendAudioPacket(session, nextEncoder, packet, timestamp),
     error => handleAacEncoderError(session, nextEncoder, error)
   );
   session.preparingAudioEncoder = nextEncoder;
@@ -1189,7 +1207,7 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
 
     encoder = createAacEncoder(
       app.selectedEncoderMode(),
-      packet => sendAudioPacket(session, encoder, packet),
+      (packet, timestamp) => sendAudioPacket(session, encoder, packet, timestamp),
       error => handleAacEncoderError(session, encoder, error)
     );
     let encoderReadyError = null;
