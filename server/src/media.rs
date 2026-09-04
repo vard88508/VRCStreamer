@@ -202,7 +202,7 @@ fn inspect_h264_access_unit(
                 saw_slice = true;
                 saw_idr = true;
             }
-            6..=9 => {}
+            6..=12 => {}
             _ => return Err("unsupported h264 nal unit"),
         }
         Ok(())

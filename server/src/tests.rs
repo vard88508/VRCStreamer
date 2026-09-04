@@ -664,6 +664,27 @@ fn validator_accepts_annex_b_h264_keyframe() {
 }
 
 #[test]
+fn validator_accepts_standard_non_vcl_h264_nal_units() {
+    for nal_type in 10..=12 {
+        let access_unit = [0, 0, 0, 1, 0x65, 0x88, 0x84, 0, 0, 0, 1, nal_type, 0x80];
+        assert!(
+            validate_h264_access_unit(&access_unit, true, H264_DEFAULT_MAX_ACCESS_UNIT_BYTES)
+                .is_ok(),
+            "NAL type {nal_type} should be accepted",
+        );
+    }
+}
+
+#[test]
+fn validator_still_rejects_h264_extension_nal_units() {
+    let access_unit = [0, 0, 0, 1, 0x65, 0x88, 0x84, 0, 0, 0, 1, 0x0d, 0x80];
+    assert_eq!(
+        validate_h264_access_unit(&access_unit, true, H264_DEFAULT_MAX_ACCESS_UNIT_BYTES),
+        Err("unsupported h264 nal unit")
+    );
+}
+
+#[test]
 fn h264_sdp_uses_in_band_sps_and_pps() {
     let access_unit = [
         0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x1f, 0, 0, 0, 1, 0x68, 0xce, 0x3c, 0x80, 0, 0, 1, 0x65,
