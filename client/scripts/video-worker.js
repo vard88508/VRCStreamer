@@ -3,8 +3,8 @@ const H264_CLOCK_RATE = 90000;
 const ANNEX_B_START_CODE = new Uint8Array([0, 0, 0, 1]);
 const MAX_ENCODER_QUEUE = 2;
 const SOURCE_BUFFER_FRAMES = 2;
-const BITRATE_HEADROOM = 0.9;
-const MIN_QUANTIZER = 20;
+const BITRATE_HEADROOM = 0.85;
+const MIN_QUANTIZER = 28;
 const MAX_QUANTIZER = 51;
 const INITIAL_QUANTIZER = 51;
 
@@ -415,7 +415,7 @@ function encoderConfig(nextWidth, nextHeight, nextFps, nextBitrate) {
     codec: h264Codec(nextWidth, nextHeight, nextFps, nextBitrate),
     width: nextWidth,
     height: nextHeight,
-    bitrate: nextBitrate,
+    bitrate: Math.floor(nextBitrate * BITRATE_HEADROOM),
     bitrateMode: "quantizer",
     framerate: nextFps,
     hardwareAcceleration: "prefer-hardware",
@@ -445,8 +445,7 @@ function adaptQuantizer(actualBitrate) {
   }
 
   if (actualBitrate < budget * 0.7 && quantizer > MIN_QUANTIZER) {
-    const step = Math.max(1, Math.floor(6 * Math.log2(budget / Math.max(actualBitrate, 1))));
-    quantizer = Math.max(MIN_QUANTIZER, quantizer - Math.min(step, 6));
+    quantizer--;
     quantizerAdjustments++;
   }
 }
