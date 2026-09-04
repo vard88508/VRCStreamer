@@ -3,8 +3,8 @@ use super::limits::{
     try_acquire_streamer_ip,
 };
 use super::media::{
-    StreamerMediaFrame, VideoFrame, VideoGopCache, VideoMessage, h264_sdp_fmtp,
-    parse_streamer_media_frame, validate_aac_access_unit, validate_h264_access_unit,
+    StreamerMediaFrame, VideoMessage, h264_sdp_fmtp, parse_streamer_media_frame,
+    validate_aac_access_unit, validate_h264_access_unit,
 };
 use super::rtsp::{
     RtpClock, RtpMediaTimeline, RtpPacketWriter, RtpState, RtspSession, RtspTrack,
@@ -307,75 +307,6 @@ fn force_resync_channel_advances_epoch() {
     assert_eq!(force_resync_channel(&channel), 1);
     assert_eq!(channel.resync_epoch.load(Ordering::Acquire), 1);
     assert_eq!(force_resync_channel(&channel), 2);
-}
-
-#[test]
-fn video_gop_cache_starts_at_and_replaces_keyframe() {
-    let mut cache = VideoGopCache::default();
-    let p_frame = test_video_frame(1, false, 4, Duration::ZERO);
-    cache.push(&p_frame, 32, 4, Duration::from_secs(2));
-    assert!(cache.snapshot(Duration::from_secs(1)).is_empty());
-
-    let keyframe = test_video_frame(2, true, 8, Duration::ZERO);
-    let p_frame = test_video_frame(3, false, 4, Duration::ZERO);
-    cache.push(&keyframe, 32, 4, Duration::from_secs(2));
-    cache.push(&p_frame, 32, 4, Duration::from_secs(2));
-    assert_eq!(
-        cache
-            .snapshot(Duration::from_secs(1))
-            .iter()
-            .map(|frame| frame.serial)
-            .collect::<Vec<_>>(),
-        vec![2, 3]
-    );
-
-    let next_keyframe = test_video_frame(4, true, 6, Duration::ZERO);
-    cache.push(&next_keyframe, 32, 4, Duration::from_secs(2));
-    assert_eq!(
-        cache
-            .snapshot(Duration::from_secs(1))
-            .iter()
-            .map(|frame| frame.serial)
-            .collect::<Vec<_>>(),
-        vec![4]
-    );
-}
-
-#[test]
-fn video_gop_cache_discards_oversized_or_stale_gop() {
-    let mut cache = VideoGopCache::default();
-    let keyframe = test_video_frame(1, true, 8, Duration::ZERO);
-    let p_frame = test_video_frame(2, false, 5, Duration::ZERO);
-    cache.push(&keyframe, 12, 4, Duration::from_secs(2));
-    cache.push(&p_frame, 12, 4, Duration::from_secs(2));
-    assert!(cache.snapshot(Duration::from_secs(1)).is_empty());
-
-    let stale_keyframe = test_video_frame(3, true, 4, Duration::from_secs(2));
-    cache.push(&stale_keyframe, 12, 4, Duration::from_secs(3));
-    assert!(cache.snapshot(Duration::from_secs(1)).is_empty());
-
-    let keyframe = test_video_frame(4, true, 4, Duration::from_secs(2));
-    let recent_p_frame = test_video_frame(5, false, 4, Duration::ZERO);
-    cache.push(&keyframe, 12, 4, Duration::from_secs(1));
-    cache.push(&recent_p_frame, 12, 4, Duration::from_secs(1));
-    assert!(cache.snapshot(Duration::from_secs(1)).is_empty());
-
-    let keyframe = test_video_frame(6, true, 4, Duration::ZERO);
-    let p_frame = test_video_frame(7, false, 4, Duration::ZERO);
-    cache.push(&keyframe, 12, 1, Duration::from_secs(1));
-    cache.push(&p_frame, 12, 1, Duration::from_secs(1));
-    assert!(cache.snapshot(Duration::from_secs(1)).is_empty());
-}
-
-fn test_video_frame(serial: u64, keyframe: bool, bytes: usize, age: Duration) -> VideoFrame {
-    VideoFrame {
-        access_unit: Bytes::from(vec![serial as u8; bytes]),
-        keyframe,
-        single_nal: true,
-        media_timestamp: serial,
-        published_at: std::time::Instant::now() - age,
-        serial,
-    }
 }
 
 #[test]

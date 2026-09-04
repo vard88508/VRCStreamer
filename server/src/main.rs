@@ -25,7 +25,7 @@ use std::{
     process,
     sync::{
         Arc, Mutex as StdMutex, RwLock as StdRwLock,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -44,9 +44,7 @@ mod tests;
 mod websocket;
 
 use limits::{IpLimitTable, allow_http_request};
-use media::{
-    AudioMessage, VideoFrame, VideoGopCache, VideoMessage, h264_sdp_fmtp, validate_h264_access_unit,
-};
+use media::{AudioMessage, VideoMessage, h264_sdp_fmtp, validate_h264_access_unit};
 use rtsp::rtsp_server;
 use websocket::ingest_ws;
 
@@ -91,8 +89,6 @@ const STREAM_BLACKLIST_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
 const STREAMER_LISTENER_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 const STREAMER_CONTROL_MESSAGES_PER_SECOND: usize = 8;
 const RTCP_REPORT_INTERVAL: Duration = Duration::from_secs(5);
-const VIDEO_GOP_CACHE_MAX_DURATION: Duration = Duration::from_millis(1500);
-const VIDEO_GOP_CACHE_MAX_STALENESS: Duration = Duration::from_millis(500);
 const DEFAULT_VIDEO_QUALITIES: &str =
     "1280x720*30/2000,1280x720*60/4000,1920x1080*30/3000,1920x1080*60/6000";
 const MAX_VIDEO_QUALITIES: usize = 32;
@@ -113,14 +109,6 @@ impl VideoQuality {
     }
 
     fn max_ingest_frames_per_second(self) -> usize {
-        (self.fps as usize).saturating_mul(3).div_ceil(2)
-    }
-
-    fn gop_cache_max_bytes(self) -> usize {
-        self.video_bytes_per_second().saturating_mul(3) / 2
-    }
-
-    fn gop_cache_max_frames(self) -> usize {
         (self.fps as usize).saturating_mul(3).div_ceil(2)
     }
 
@@ -204,8 +192,6 @@ struct Channel {
     resync_epoch: AtomicUsize,
     blacklist_notify: Notify,
     video_fmtp: StdRwLock<Option<Arc<str>>>,
-    video_gop: StdMutex<VideoGopCache>,
-    next_video_serial: AtomicU64,
 }
 
 impl Channel {
@@ -221,8 +207,6 @@ impl Channel {
             resync_epoch: AtomicUsize::new(0),
             blacklist_notify: Notify::new(),
             video_fmtp: StdRwLock::new(None),
-            video_gop: StdMutex::new(VideoGopCache::default()),
-            next_video_serial: AtomicU64::new(1),
         }
     }
 
@@ -238,36 +222,6 @@ impl Channel {
             .video_fmtp
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = value;
-    }
-
-    fn next_video_serial(&self) -> u64 {
-        self.next_video_serial.fetch_add(1, Ordering::Relaxed)
-    }
-
-    fn cache_video_frame(&self, frame: &VideoFrame, quality: VideoQuality) {
-        self.video_gop
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(
-                frame,
-                quality.gop_cache_max_bytes(),
-                quality.gop_cache_max_frames(),
-                VIDEO_GOP_CACHE_MAX_DURATION,
-            );
-    }
-
-    fn video_gop_snapshot(&self) -> Vec<VideoFrame> {
-        self.video_gop
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .snapshot(VIDEO_GOP_CACHE_MAX_STALENESS)
-    }
-
-    fn clear_video_gop(&self) {
-        self.video_gop
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
     }
 }
 

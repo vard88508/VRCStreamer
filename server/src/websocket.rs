@@ -90,7 +90,6 @@ impl MediaTimestampNormalizer {
 fn reset_video_configuration(channel: &Channel, configured: &mut bool) {
     *configured = false;
     channel.set_video_fmtp(None);
-    channel.clear_video_gop();
 }
 
 struct StreamerGuard {
@@ -107,7 +106,6 @@ impl Drop for StreamerGuard {
         self.channel.streamer.store(false, Ordering::Release);
         self.channel.video_active.store(false, Ordering::Release);
         self.channel.set_video_fmtp(None);
-        self.channel.clear_video_gop();
         force_resync_channel(&self.channel);
         wake_media_listeners(&self.channel);
         self.state.active_streamers.fetch_sub(1, Ordering::AcqRel);
@@ -227,7 +225,6 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
         return;
     }
     channel.set_video_fmtp(None);
-    channel.clear_video_gop();
 
     let mut video_configured = false;
     let mut audio_ingest = TokenBucket::new();
@@ -477,11 +474,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                             single_nal,
                             media_timestamp: video_timestamps.normalize(source_timestamp),
                             published_at: received_at,
-                            serial: channel.next_video_serial(),
                         };
-                        // Cache before broadcast so a new subscriber cannot miss this frame.
-                        channel
-                            .cache_video_frame(&frame, state.config.video_qualities[video_quality]);
                         let _ = channel.video_tx.send(VideoMessage::Frame(frame));
                         video_frames += 1;
                         video_bytes = video_bytes.saturating_add(frame_len);
@@ -552,7 +545,6 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                 }
                 match command {
                     Some(StreamerTextCommand::ForceResync) => {
-                        channel.clear_video_gop();
                         let epoch = force_resync_channel(channel);
                         let listeners = channel.listeners.load(Ordering::Acquire);
                         info!(%peer, %key, epoch, listeners, "streamer forced rtsp resync");
@@ -583,7 +575,6 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                             break;
                         }
                         video_quality = index;
-                        channel.clear_video_gop();
                         debug!(%peer, %key, index, "streamer selected video quality");
                     }
                     None => {

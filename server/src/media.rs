@@ -1,6 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use super::{AAC_MAX_ACCESS_UNIT_BYTES, Config, H264_MAX_NAL_UNITS, MEDIA_FRAME_HEADER_BYTES};
 
@@ -42,69 +42,6 @@ pub(crate) struct VideoFrame {
     pub(crate) single_nal: bool,
     pub(crate) media_timestamp: u64,
     pub(crate) published_at: Instant,
-    pub(crate) serial: u64,
-}
-
-#[derive(Default)]
-pub(crate) struct VideoGopCache {
-    frames: Vec<VideoFrame>,
-    bytes: usize,
-}
-
-impl VideoGopCache {
-    pub(crate) fn push(
-        &mut self,
-        frame: &VideoFrame,
-        max_bytes: usize,
-        max_frames: usize,
-        max_duration: Duration,
-    ) {
-        if frame.keyframe {
-            self.clear();
-        } else if self.frames.is_empty() {
-            return;
-        }
-
-        let too_large = self
-            .bytes
-            .checked_add(frame.access_unit.len())
-            .is_none_or(|bytes| bytes > max_bytes);
-        let too_long = self.frames.first().is_some_and(|first| {
-            frame
-                .published_at
-                .saturating_duration_since(first.published_at)
-                > max_duration
-        });
-        if max_bytes == 0
-            || max_frames == 0
-            || self.frames.len() >= max_frames
-            || too_large
-            || too_long
-        {
-            self.clear();
-            return;
-        }
-
-        self.bytes += frame.access_unit.len();
-        self.frames.push(frame.clone());
-    }
-
-    pub(crate) fn snapshot(&self, max_staleness: Duration) -> Vec<VideoFrame> {
-        let now = Instant::now();
-        if !self.frames.first().is_some_and(|frame| frame.keyframe)
-            || self.frames.last().is_none_or(|frame| {
-                now.saturating_duration_since(frame.published_at) > max_staleness
-            })
-        {
-            return Vec::new();
-        }
-        self.frames.clone()
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.frames.clear();
-        self.bytes = 0;
-    }
 }
 
 pub(crate) fn validate_aac_access_unit(access_unit: &[u8]) -> Result<(), &'static str> {

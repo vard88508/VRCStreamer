@@ -20,9 +20,7 @@ use tracing::{debug, info, trace, warn};
 use super::limits::{
     ConnectionGuard, ListenerIpGuard, try_acquire_connection, try_acquire_listener_ip,
 };
-use super::media::{
-    AudioMessage, VideoFrame, VideoMessage, find_h264_start_code, start_h264_payload,
-};
+use super::media::{AudioMessage, VideoMessage, find_h264_start_code, start_h264_payload};
 use super::{
     AAC_AUDIO_SPECIFIC_CONFIG, AAC_CHANNELS, AAC_FRAME_DURATION, AAC_SAMPLE_RATE,
     AAC_SAMPLES_PER_FRAME, AAC_SILENCE_ACCESS_UNIT, AppState, Channel, H264_CLOCK_RATE,
@@ -349,12 +347,9 @@ async fn handle_rtsp_request(
                     return Ok(false);
                 };
                 drop(setup_rx);
-                // Subscribe first; serial deduplication removes overlap without leaving a gap.
-                let rx = stream.video_tx.subscribe();
-                let cached_gop = stream.video_gop_snapshot();
+                // Start at the live edge; VideoRtpTrack waits for the next keyframe.
                 Some(RtspVideoTrackStart {
-                    rx,
-                    cached_gop,
+                    rx: stream.video_tx.subscribe(),
                     channel: session.video_channel,
                     rtp: session.video_rtp,
                 })
@@ -478,7 +473,6 @@ struct RtspAudioTrackStart {
 
 struct RtspVideoTrackStart {
     rx: broadcast::Receiver<VideoMessage>,
-    cached_gop: Vec<VideoFrame>,
     channel: u8,
     rtp: RtpState,
 }
@@ -658,11 +652,9 @@ async fn next_audio_event(
 
 struct VideoRtpTrack {
     rx: broadcast::Receiver<VideoMessage>,
-    cached_gop: Vec<VideoFrame>,
     rtp: RtpState,
     clock: RtpClock,
     seen_keyframe: bool,
-    last_serial: u64,
     last_state: Option<VideoStreamState>,
     rtcp: RtcpReporter,
     rtcp_sleep: Pin<Box<Sleep>>,
@@ -675,11 +667,9 @@ impl VideoRtpTrack {
     fn new(start: RtspVideoTrackStart, play_started_at: TokioInstant) -> Self {
         Self {
             rx: start.rx,
-            cached_gop: start.cached_gop,
             rtp: start.rtp,
             clock: RtpClock::new(start.rtp.timestamp, H264_CLOCK_RATE, play_started_at),
             seen_keyframe: false,
-            last_serial: 0,
             last_state: None,
             rtcp: RtcpReporter::new(RTP_VIDEO_SSRC, H264_CLOCK_RATE),
             rtcp_sleep: Box::pin(sleep_until(TokioInstant::now() + RTCP_REPORT_INTERVAL)),
@@ -691,53 +681,8 @@ impl VideoRtpTrack {
 
     fn resync(&mut self, stream: &Channel) {
         self.rx = stream.video_tx.subscribe();
-        self.cached_gop.clear();
         self.seen_keyframe = false;
-        self.last_serial = 0;
         self.last_state = None;
-    }
-
-    async fn replay_cached_gop(
-        &mut self,
-        writer: &SharedRtspWriter,
-        stream: &Channel,
-    ) -> RtspResult<usize> {
-        if channel_video_state(stream) != VideoStreamState::Video
-            || !self.cached_gop.first().is_some_and(|frame| frame.keyframe)
-        {
-            self.cached_gop.clear();
-            return Ok(0);
-        }
-
-        let frames = std::mem::take(&mut self.cached_gop);
-        let base_timestamp = self.rtp.timestamp;
-        let mut sent = 0usize;
-        for frame in frames {
-            if channel_video_state(stream) != VideoStreamState::Video {
-                self.seen_keyframe = false;
-                self.last_state = None;
-                break;
-            }
-            // This is decoder bootstrap, not delayed playback of the cached interval.
-            self.rtp.timestamp = base_timestamp.wrapping_add(sent as u32);
-            self.sender
-                .send_h264_access_unit(
-                    writer,
-                    &frame.access_unit,
-                    frame.single_nal,
-                    true,
-                    &mut self.rtp,
-                )
-                .await?;
-            self.last_serial = frame.serial;
-            self.packets = self.packets.saturating_add(1);
-            sent = sent.saturating_add(1);
-        }
-        if sent != 0 {
-            self.seen_keyframe = true;
-            self.last_state = Some(VideoStreamState::Video);
-        }
-        Ok(sent)
     }
 
     async fn sync_state(
@@ -795,10 +740,6 @@ impl VideoRtpTrack {
                 self.last_state = None;
             }
             VideoRtpEvent::Message(Ok(VideoMessage::Frame(frame))) => {
-                if frame.serial <= self.last_serial {
-                    return Ok(true);
-                }
-                self.last_serial = frame.serial;
                 if channel_video_state(context.stream) != VideoStreamState::Video {
                     return Ok(true);
                 }
@@ -897,19 +838,6 @@ async fn rtsp_media_rtp_task(task: RtspMediaTask) {
     let mut audio = audio.map(|track| AudioRtpTrack::new(track, play_started_at));
     let mut video = video.map(|track| VideoRtpTrack::new(track, play_started_at));
     let mut resync_epoch = stream.resync_epoch.load(Ordering::Acquire);
-
-    if let Some(track) = video.as_mut() {
-        match track.replay_cached_gop(&writer, &stream).await {
-            Ok(0) => {}
-            Ok(frames) => {
-                debug!(%peer, %key, frames, "rtsp cached video gop replayed");
-            }
-            Err(error) => {
-                warn!(%peer, %key, %error, "rtsp cached video gop writer failed");
-                return;
-            }
-        }
-    }
 
     loop {
         let current_resync_epoch = stream.resync_epoch.load(Ordering::Acquire);
