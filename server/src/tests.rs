@@ -607,7 +607,18 @@ fn validator_accepts_standard_non_vcl_h264_nal_units() {
 }
 
 #[test]
-fn validator_still_rejects_h264_extension_nal_units() {
+fn validator_accepts_h264_prefix_nal_units() {
+    let access_unit = [
+        0, 0, 0, 1, 0x09, 0x30, 0, 0, 0, 1, 0x4e, 0x80, 0x80, 0x0f, 0x20, 0, 0, 0, 1, 0x41, 0x9a,
+    ];
+
+    assert!(
+        validate_h264_access_unit(&access_unit, false, H264_DEFAULT_MAX_ACCESS_UNIT_BYTES).is_ok()
+    );
+}
+
+#[test]
+fn validator_still_rejects_unapproved_h264_extension_nal_units() {
     let access_unit = [0, 0, 0, 1, 0x65, 0x88, 0x84, 0, 0, 0, 1, 0x0d, 0x80];
     assert_eq!(
         validate_h264_access_unit(&access_unit, true, H264_DEFAULT_MAX_ACCESS_UNIT_BYTES),
