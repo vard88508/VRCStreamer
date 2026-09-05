@@ -30,9 +30,9 @@ use super::{
     MEDIA_CLOCK_RATE, STREAMER_CONTROL_MESSAGES_PER_SECOND, STREAMER_LISTENER_UPDATE_INTERVAL,
     allow_http_request, cleanup_channel, force_resync_channel, hash_code, limit_allows,
     max_ws_message_bytes, origin_allowed, password_allowed, peer_id, public_rtsp_base,
-    reserve_channel, stream_is_blacklisted, streamer_hello_message, streamer_listeners_message,
-    text_response, text_response_with_cors, validate_code, wake_media_listeners,
-    wake_video_listeners,
+    reserve_channel, stream_id_for_log, stream_is_blacklisted, streamer_hello_message,
+    streamer_listeners_message, text_response, text_response_with_cors, validate_code,
+    wake_media_listeners, wake_video_listeners,
 };
 
 pub(crate) enum StreamerTextCommand {
@@ -151,8 +151,9 @@ pub(crate) async fn ingest_ws(
     }
 
     let key = hash_code(&query.code);
+    let stream_id = stream_id_for_log(&key);
     if stream_is_blacklisted(&state, &key) {
-        warn!(%peer, %key, "rejected blacklisted stream");
+        warn!(%peer, %stream_id, "rejected blacklisted stream");
         return text_response_with_cors(
             StatusCode::FORBIDDEN,
             "stream is blacklisted\n",
@@ -198,7 +199,7 @@ pub(crate) async fn ingest_ws(
         return text_response(StatusCode::TOO_MANY_REQUESTS, "too many active streamers\n");
     }
 
-    info!(%peer, %key, "streamer connected");
+    info!(%peer, %stream_id, "streamer connected");
     let rtsp_base = public_rtsp_base(&state.config, &headers);
     let max_message_size = max_ws_message_bytes(&state.config);
     let guard = StreamerGuard {
@@ -219,8 +220,9 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
     let key = guard.key.as_str();
     let channel = guard.channel.as_ref();
     let peer = guard.peer.as_str();
+    let stream_id = stream_id_for_log(key);
     if stream_is_blacklisted(state, key) {
-        warn!(%peer, %key, "disconnected blacklisted streamer during startup");
+        warn!(%peer, %stream_id, "disconnected blacklisted streamer during startup");
         close_for_policy(&mut socket, "stream is blacklisted").await;
         return;
     }
@@ -270,7 +272,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
         let message = tokio::select! {
             _ = &mut blacklist_notification => {
                 if stream_is_blacklisted(state, key) {
-                    warn!(%peer, %key, "disconnected blacklisted streamer");
+                    warn!(%peer, %stream_id, "disconnected blacklisted streamer");
                     close_for_policy(&mut socket, "stream is blacklisted").await;
                     break;
                 }
@@ -285,9 +287,9 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                     Some(Ok(message)) => message,
                     Some(Err(error)) => {
                         if is_websocket_disconnect_noise(&error) {
-                            debug!(%peer, %key, %error, "streamer websocket disconnected");
+                            debug!(%peer, %stream_id, %error, "streamer websocket disconnected");
                         } else {
-                            warn!(%peer, %key, %error, "streamer websocket error");
+                            warn!(%peer, %stream_id, %error, "streamer websocket error");
                         }
                         break;
                     }
@@ -295,7 +297,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                 }
             }
             _ = &mut idle_sleep => {
-                warn!(%peer, %key, "streamer idle timeout");
+                warn!(%peer, %stream_id, "streamer idle timeout");
                 close_for_policy(&mut socket, "streamer idle timeout").await;
                 break;
             }
@@ -326,7 +328,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
             STREAMER_CONTROL_MESSAGES_PER_SECOND,
             DEFAULT_TOKEN_BUCKET_BURST_SECS,
         ) {
-            warn!(%peer, %key, "streamer exceeded control message rate");
+            warn!(%peer, %stream_id, "streamer exceeded control message rate");
             close_for_policy(&mut socket, "control message rate exceeded").await;
             break;
         }
@@ -351,7 +353,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                         if !within_abuse_frame_rate || !within_abuse_byte_rate {
                             warn!(
                                 %peer,
-                                %key,
+                                %stream_id,
                                 frame_bytes = frame.len(),
                                 "streamer exceeded hard aac ingest limit"
                             );
@@ -376,7 +378,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                             if audio_rate_drops == 1 {
                                 warn!(
                                     %peer,
-                                    %key,
+                                    %stream_id,
                                     frame_bytes = frame.len(),
                                     "dropping excess aac frames to keep streamer connected"
                                 );
@@ -394,7 +396,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                                 state.config.video_ingest_burst_secs,
                             ) =>
                     {
-                        warn!(%peer, %key, video_quality, "streamer exceeded selected video frame rate");
+                        warn!(%peer, %stream_id, video_quality, "streamer exceeded selected video frame rate");
                         close_for_policy(&mut socket, "video frame rate exceeded").await;
                         break;
                     }
@@ -412,7 +414,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                             state.config.video_qualities[video_quality].video_bytes_per_second();
                         warn!(
                             %peer,
-                            %key,
+                            %stream_id,
                             video_quality,
                             frame_bytes = frame.len(),
                             available_bytes = video_ingest.available_units(),
@@ -444,7 +446,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                         frames += 1;
                         bytes = bytes.saturating_add(frame_len);
                         if frames == 1 {
-                            info!(%peer, %key, "streamer sent first aac frame");
+                            info!(%peer, %stream_id, "streamer sent first aac frame");
                         }
                     }
                     Ok(StreamerMediaFrame::Video {
@@ -463,7 +465,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                                     video_configured = true;
                                 }
                                 Err(reason) => {
-                                    debug!(%peer, %key, %reason, "h264 keyframe has no SDP parameter sets");
+                                    debug!(%peer, %stream_id, %reason, "h264 keyframe has no SDP parameter sets");
                                 }
                             }
                         }
@@ -479,11 +481,11 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                         video_frames += 1;
                         video_bytes = video_bytes.saturating_add(frame_len);
                         if video_frames == 1 {
-                            info!(%peer, %key, keyframe, "streamer sent first h264 frame");
+                            info!(%peer, %stream_id, keyframe, "streamer sent first h264 frame");
                         }
                     }
                     Err(reason) => {
-                        warn!(%peer, %key, %reason, "streamer sent invalid media frame");
+                        warn!(%peer, %stream_id, %reason, "streamer sent invalid media frame");
                         close_for_policy(&mut socket, "invalid media frame").await;
                         break;
                     }
@@ -498,7 +500,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                         .max(0.001);
                     info!(
                         %peer,
-                        %key,
+                        %stream_id,
                         audio_frames = frames,
                         audio_bytes = bytes,
                         audio_fps = frames as f64 / elapsed,
@@ -519,9 +521,9 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
             Message::Pong(_) => {}
             Message::Close(frame) => {
                 if let Some(frame) = &frame {
-                    debug!(%peer, %key, code = frame.code, reason = %frame.reason, "streamer requested websocket close");
+                    debug!(%peer, %stream_id, code = frame.code, reason = %frame.reason, "streamer requested websocket close");
                 } else {
-                    debug!(%peer, %key, "streamer requested websocket close");
+                    debug!(%peer, %stream_id, "streamer requested websocket close");
                 }
                 let _ = socket.send(Message::Close(frame)).await;
                 break;
@@ -539,7 +541,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                         )
                     )
                 {
-                    warn!(%peer, %key, "streamer sent video command while video is disabled");
+                    warn!(%peer, %stream_id, "streamer sent video command while video is disabled");
                     close_for_policy(&mut socket, "video is disabled").await;
                     break;
                 }
@@ -547,38 +549,38 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
                     Some(StreamerTextCommand::ForceResync) => {
                         let epoch = force_resync_channel(channel);
                         let listeners = channel.listeners.load(Ordering::Acquire);
-                        info!(%peer, %key, epoch, listeners, "streamer forced rtsp resync");
+                        info!(%peer, %stream_id, epoch, listeners, "streamer forced rtsp resync");
                     }
                     Some(StreamerTextCommand::VideoStart) => {
                         reset_video_configuration(channel, &mut video_configured);
                         channel.video_active.store(true, Ordering::Release);
                         wake_video_listeners(channel);
-                        debug!(%peer, %key, "streamer started h264 video");
+                        debug!(%peer, %stream_id, "streamer started h264 video");
                     }
                     Some(StreamerTextCommand::VideoStop) => {
                         reset_video_configuration(channel, &mut video_configured);
                         channel.video_active.store(false, Ordering::Release);
                         let epoch = force_resync_channel(channel);
                         wake_video_listeners(channel);
-                        debug!(%peer, %key, epoch, "streamer stopped h264 video");
+                        debug!(%peer, %stream_id, epoch, "streamer stopped h264 video");
                     }
                     Some(StreamerTextCommand::VideoReset) => {
                         reset_video_configuration(channel, &mut video_configured);
                         let epoch = force_resync_channel(channel);
                         wake_video_listeners(channel);
-                        debug!(%peer, %key, epoch, "streamer reset h264 video configuration");
+                        debug!(%peer, %stream_id, epoch, "streamer reset h264 video configuration");
                     }
                     Some(StreamerTextCommand::VideoQuality(index)) => {
                         if index >= state.config.video_qualities.len() {
-                            warn!(%peer, %key, index, "streamer selected invalid video quality");
+                            warn!(%peer, %stream_id, index, "streamer selected invalid video quality");
                             close_for_policy(&mut socket, "invalid video quality").await;
                             break;
                         }
                         video_quality = index;
-                        debug!(%peer, %key, index, "streamer selected video quality");
+                        debug!(%peer, %stream_id, index, "streamer selected video quality");
                     }
                     None => {
-                        warn!(%peer, %key, "streamer sent text message");
+                        warn!(%peer, %stream_id, "streamer sent text message");
                         close_for_policy(&mut socket, "invalid control message").await;
                         break;
                     }
@@ -589,7 +591,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
 
     info!(
         %peer,
-        %key,
+        %stream_id,
         audio_frames = frames,
         audio_rate_drops,
         video_frames,

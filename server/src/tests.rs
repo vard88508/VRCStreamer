@@ -86,6 +86,18 @@ fn hash_code_matches_sha256_128_bit_hex_prefix() {
 }
 
 #[test]
+fn stream_id_log_only_exposes_suffix() {
+    assert_eq!(
+        stream_id_for_log("0123456789abcdef0123456789abcdef").to_string(),
+        "...cdef"
+    );
+    assert_eq!(
+        stream_id_for_log("not-a-stream-id").to_string(),
+        "[invalid]"
+    );
+}
+
+#[test]
 fn stream_blacklist_parses_semicolons_whitespace_and_duplicates() {
     let entries = parse_stream_blacklist(
         "A85C0211C512828C4C52DC5716A79E3A;\n1dd5a1d78b07336b21496ccf7bf79b8a;\n\

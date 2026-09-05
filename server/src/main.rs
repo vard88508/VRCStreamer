@@ -808,6 +808,22 @@ fn valid_hash(key: &str) -> bool {
     key.len() == STREAM_ID_HEX_CHARS && key.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+#[derive(Clone, Copy)]
+struct StreamIdForLog<'a>(&'a str);
+
+fn stream_id_for_log(key: &str) -> StreamIdForLog<'_> {
+    StreamIdForLog(key)
+}
+
+impl std::fmt::Display for StreamIdForLog<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if !valid_hash(self.0) {
+            return formatter.write_str("[invalid]");
+        }
+        write!(formatter, "...{}", &self.0[STREAM_ID_HEX_CHARS - 4..])
+    }
+}
+
 fn hash_code(code: &str) -> String {
     let digest = Sha256::digest(code.as_bytes());
     let mut out = String::with_capacity(STREAM_ID_HEX_CHARS);

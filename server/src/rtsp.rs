@@ -27,7 +27,8 @@ use super::{
     MEDIA_CLOCK_RATE, Placeholders, RTCP_REPORT_INTERVAL, RTP_AUDIO_PAYLOAD_TYPE, RTP_AUDIO_SSRC,
     RTP_MAX_PAYLOAD_BYTES, RTP_VIDEO_PAYLOAD_TYPE, RTP_VIDEO_SSRC, RTSP_DISCARD_BUFFER_BYTES,
     RTSP_MAX_BODY_BYTES, RTSP_MAX_HEADER_BYTES, RTSP_MAX_HEADERS, RTSP_MAX_INTERLEAVED_BYTES,
-    RTSP_MAX_LINE_BYTES, cleanup_channel, limit_allows, peer_id, reserve_channel, valid_hash,
+    RTSP_MAX_LINE_BYTES, cleanup_channel, limit_allows, peer_id, reserve_channel,
+    stream_id_for_log, valid_hash,
 };
 
 type SharedRtspWriter = Arc<Mutex<OwnedWriteHalf>>;
@@ -164,11 +165,12 @@ async fn handle_rtsp_request(
     peer: &str,
 ) -> RtspResult<bool> {
     let cseq = request.header("cseq").unwrap_or("0");
-    info!(%peer, method = %request.method, uri = %request.uri, "rtsp request");
+    let stream_id = stream_id_for_log(key_from_rtsp_uri(&request.uri).unwrap_or_default());
+    info!(%peer, method = %request.method, %stream_id, "rtsp request");
     trace!(
         %peer,
         method = %request.method,
-        uri = %request.uri,
+        %stream_id,
         headers = ?RtspHeadersForLog(&request.headers),
         "rtsp request headers"
     );
@@ -303,7 +305,13 @@ async fn handle_rtsp_request(
                 None,
             )
             .await?;
-            info!(%peer, %key, track = track_name, rtp_channel, "rtsp media setup");
+            info!(
+                %peer,
+                stream_id = %stream_id_for_log(&key),
+                track = track_name,
+                rtp_channel,
+                "rtsp media setup"
+            );
         }
         "PLAY" => {
             if !session.audio_setup && !session.video_setup {
@@ -587,7 +595,12 @@ impl AudioRtpTrack {
             AudioRtpEvent::Message(Err(broadcast::error::RecvError::Lagged(skipped))) => {
                 self.rx = context.stream.audio_tx.subscribe();
                 self.dropped = self.dropped.saturating_add(skipped as usize);
-                debug!(peer = %context.peer, key = %context.key, skipped, "rtsp audio client lagged behind streamer");
+                debug!(
+                    peer = %context.peer,
+                    stream_id = %stream_id_for_log(context.key),
+                    skipped,
+                    "rtsp audio client lagged behind streamer"
+                );
             }
             AudioRtpEvent::Message(Err(broadcast::error::RecvError::Closed)) => return Ok(false),
             AudioRtpEvent::Silence => {
@@ -748,7 +761,12 @@ impl VideoRtpTrack {
                     self.rx = context.stream.video_tx.subscribe();
                     self.seen_keyframe = false;
                     self.dropped = self.dropped.saturating_add(queued.saturating_add(1));
-                    debug!(peer = %context.peer, key = %context.key, queued, "rtsp video backlog expired");
+                    debug!(
+                        peer = %context.peer,
+                        stream_id = %stream_id_for_log(context.key),
+                        queued,
+                        "rtsp video backlog expired"
+                    );
                     return Ok(true);
                 }
                 if self.last_state != Some(VideoStreamState::Video) {
@@ -790,7 +808,12 @@ impl VideoRtpTrack {
                 self.rx = context.stream.video_tx.subscribe();
                 self.seen_keyframe = false;
                 self.dropped = self.dropped.saturating_add(skipped as usize);
-                debug!(peer = %context.peer, key = %context.key, skipped, "rtsp video client lagged behind streamer");
+                debug!(
+                    peer = %context.peer,
+                    stream_id = %stream_id_for_log(context.key),
+                    skipped,
+                    "rtsp video client lagged behind streamer"
+                );
             }
             VideoRtpEvent::Message(Err(broadcast::error::RecvError::Closed)) => return Ok(false),
             VideoRtpEvent::Report => {
@@ -838,6 +861,7 @@ async fn rtsp_media_rtp_task(task: RtspMediaTask) {
     let mut audio = audio.map(|track| AudioRtpTrack::new(track, play_started_at));
     let mut video = video.map(|track| VideoRtpTrack::new(track, play_started_at));
     let mut resync_epoch = stream.resync_epoch.load(Ordering::Acquire);
+    let stream_id = stream_id_for_log(&key);
 
     loop {
         let current_resync_epoch = stream.resync_epoch.load(Ordering::Acquire);
@@ -849,13 +873,13 @@ async fn rtsp_media_rtp_task(task: RtspMediaTask) {
                 track.resync(&stream);
             }
             resync_epoch = current_resync_epoch;
-            debug!(%peer, %key, epoch = current_resync_epoch, "rtsp listener force resynced");
+            debug!(%peer, %stream_id, epoch = current_resync_epoch, "rtsp listener force resynced");
         }
 
         if let Some(track) = audio.as_mut() {
             let queued = track.drop_backlog(&stream);
             if queued != 0 {
-                debug!(%peer, %key, queued, "rtsp audio backlog dropped");
+                debug!(%peer, %stream_id, queued, "rtsp audio backlog dropped");
             }
         }
         if let Some(track) = video.as_mut()
@@ -869,7 +893,7 @@ async fn rtsp_media_rtp_task(task: RtspMediaTask) {
                 )
                 .await
         {
-            warn!(%peer, %key, %error, "rtsp video placeholder writer failed");
+            warn!(%peer, %stream_id, %error, "rtsp video placeholder writer failed");
             break;
         }
         if audio.is_none() && video.is_none() {
@@ -894,7 +918,7 @@ async fn rtsp_media_rtp_task(task: RtspMediaTask) {
                     Ok(true) => {}
                     Ok(false) => break,
                     Err(error) => {
-                        warn!(%peer, %key, %error, "rtsp audio writer failed");
+                        warn!(%peer, %stream_id, %error, "rtsp audio writer failed");
                         break;
                     }
                 }
@@ -908,7 +932,7 @@ async fn rtsp_media_rtp_task(task: RtspMediaTask) {
                     Ok(true) => {}
                     Ok(false) => break,
                     Err(error) => {
-                        warn!(%peer, %key, %error, "rtsp video writer failed");
+                        warn!(%peer, %stream_id, %error, "rtsp video writer failed");
                         break;
                     }
                 }
@@ -923,7 +947,7 @@ async fn rtsp_media_rtp_task(task: RtspMediaTask) {
     let video_dropped = video.as_ref().map_or(0, |track| track.dropped);
     info!(
         %peer,
-        %key,
+        %stream_id,
         audio_packets,
         silence_packets,
         audio_dropped,
@@ -1888,7 +1912,14 @@ impl fmt::Debug for RtspHeadersForLog<'_> {
         for (name, value) in self.0 {
             if matches!(
                 name.as_str(),
-                "authorization" | "proxy-authorization" | "cookie" | "set-cookie"
+                "authorization"
+                    | "proxy-authorization"
+                    | "cookie"
+                    | "set-cookie"
+                    | "content-base"
+                    | "content-location"
+                    | "location"
+                    | "referer"
             ) {
                 headers.entry(name, &"[redacted]");
             } else {
