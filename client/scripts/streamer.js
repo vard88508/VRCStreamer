@@ -484,6 +484,11 @@ function handleAacEncoderError(session, encoder, error) {
 function encodeAudioBlock(session, buffer, timestampSamples) {
   if (!session || app.active !== session) return;
   if (!Number.isSafeInteger(timestampSamples) || timestampSamples < 0) return;
+  const audioClockSamples = timestampSamples + config.framesPerChunk;
+  if (audioClockSamples > session.audioClockSamples) {
+    session.audioClockSamples = audioClockSamples;
+    session.video?.syncAudioClock(audioClockSamples);
+  }
   if (audioTimestampIsStale(session, timestampSamples)) {
     (session.audioEncoderSwap?.encoder || session.encoder).recordDrop();
     return;
@@ -713,18 +718,20 @@ function createVideoWorker(ws, transport, onError) {
 
   return {
     ready,
-    init() {
+    init(audioClockSamples) {
       worker.postMessage({
         type: "init",
         width: config.videoWidth,
         height: config.videoHeight,
         fps: config.videoFps,
         bitrate: config.videoBitrate,
-        timelineOffsetMs: app.active
-          ? Math.max(0, performance.now() - app.active.timelineStartedAt)
-          : 0,
+        audioClockSamples,
+        audioSampleRate: config.sampleRate,
         placeholderUrl: videoPlaceholderUrl
       });
+    },
+    syncAudioClock(timestampSamples) {
+      if (!closed) worker.postMessage({ type: "audio-clock", timestampSamples });
     },
     source(readable) {
       if (closed) {
@@ -867,10 +874,11 @@ async function createVideoStreamer(source, ws, transport, onError) {
   };
 
   try {
-    worker.init();
+    worker.init(app.active?.audioClockSamples || 0);
     await worker.ready;
     if (!app.active || app.active.ws !== ws) throw new Error("Video start cancelled.");
     await setSource(source);
+    worker.syncAudioClock(app.active.audioClockSamples);
     api = {
       source,
       stopTimer: 0,
@@ -889,6 +897,9 @@ async function createVideoStreamer(source, ws, transport, onError) {
           await constrainVideoTrack(processorTrack, options.width, options.height, options.fps);
         }
         await worker.reconfigure(options);
+      },
+      syncAudioClock(timestampSamples) {
+        worker.syncAudioClock(timestampSamples);
       },
       close() {
         clearStopTimer();
@@ -1290,7 +1301,7 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
       ws,
       encoder,
       encoderModeKey: app.selectedEncoderModeKey(),
-      timelineStartedAt: 0,
+      audioClockSamples: Math.round(audioContext.currentTime * config.sampleRate),
       preparingAudioEncoder: null,
       audioEncoderSwap: null,
       audioSendBudget: maxAudioSendBurstBytes,
@@ -1327,7 +1338,7 @@ async function start(kind, deviceId = null, settings = null, mediaStreamOverride
     captureNode.connect(monitor);
     monitor.connect(audioContext.destination);
     await audioContext.resume();
-    session.timelineStartedAt = performance.now() - audioContext.currentTime * 1000;
+    session.audioClockSamples = Math.round(audioContext.currentTime * config.sampleRate);
 
     if (kind === "video") {
       await installVideoSource(mediaStream, settings);

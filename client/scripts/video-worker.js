@@ -3,6 +3,8 @@ const H264_CLOCK_RATE = 90000;
 const ANNEX_B_START_CODE = new Uint8Array([0, 0, 0, 1]);
 const MAX_ENCODER_QUEUE = 2;
 const SOURCE_BUFFER_FRAMES = 2;
+const AUDIO_CLOCK_GRACE_MS = 100;
+const AUDIO_CLOCK_KEYFRAME_GAP_MS = 1000;
 const BITRATE_HEADROOM = 0.85;
 const MIN_QUANTIZER = 28;
 const MAX_QUANTIZER = 51;
@@ -33,7 +35,10 @@ let bitrateLimit = 2000000;
 let quantizer = INITIAL_QUANTIZER;
 let keyframeInterval = 30;
 let framePeriodUs = 33333;
-let timelineStartedAt = 0;
+let audioSampleRate = 48000;
+let audioClockMs = 0;
+let audioClockUpdatedAt = 0;
+let audioClockReady = false;
 let lastFrameIndex = -1;
 let lastTimestampUs = -1;
 let lastKeyframeTimestampUs = -2000000;
@@ -168,8 +173,30 @@ async function loadPlaceholderImage(url) {
   placeholderImage = image;
 }
 
-function timelineElapsedMs() {
-  return Math.max(0, performance.now() - timelineStartedAt);
+function mediaTimeMs() {
+  if (!audioClockReady) return 0;
+  const elapsed = Math.max(0, performance.now() - audioClockUpdatedAt);
+  return audioClockMs + Math.min(elapsed, AUDIO_CLOCK_GRACE_MS);
+}
+
+function audioClockIsFresh() {
+  return audioClockReady
+    && performance.now() - audioClockUpdatedAt < AUDIO_CLOCK_GRACE_MS;
+}
+
+function syncAudioClock(timestampSamples) {
+  const samples = Number(timestampSamples);
+  if (!Number.isSafeInteger(samples) || samples < 0) return;
+  const nextClockMs = samples * 1000 / audioSampleRate;
+  if (audioClockReady && nextClockMs <= audioClockMs) return;
+  const now = performance.now();
+  if (audioClockReady && now - audioClockUpdatedAt >= AUDIO_CLOCK_KEYFRAME_GAP_MS) {
+    forceNextKeyframe = true;
+  }
+  audioClockMs = nextClockMs;
+  audioClockUpdatedAt = now;
+  audioClockReady = true;
+  startCurrentOutput();
 }
 
 function frameTimestampUs(frameIndex) {
@@ -217,8 +244,8 @@ function clearPacingTimer() {
 }
 
 function scheduleNextFrame() {
-  if (closed || paused || networkPaused || pacingTimer) return;
-  const elapsedMs = timelineElapsedMs();
+  if (closed || paused || networkPaused || pacingTimer || !audioClockReady) return;
+  const elapsedMs = mediaTimeMs();
   const elapsedFrame = Math.ceil(elapsedMs * fps / 1000);
   scheduledFrameIndex = Math.max(elapsedFrame, lastFrameIndex + 1);
   const delay = Math.max(0, scheduledFrameIndex * 1000 / fps - elapsedMs);
@@ -228,9 +255,16 @@ function scheduleNextFrame() {
 function runPacing() {
   pacingTimer = 0;
   if (closed || paused || networkPaused) return;
+  const elapsedMs = mediaTimeMs();
+  const scheduledAtMs = scheduledFrameIndex * 1000 / fps;
+  if (scheduledAtMs > elapsedMs) {
+    if (!audioClockIsFresh()) return;
+    pacingTimer = setTimeout(runPacing, Math.max(1, scheduledAtMs - elapsedMs));
+    return;
+  }
   let frameIndex = Math.max(
     scheduledFrameIndex,
-    Math.floor(timelineElapsedMs() * fps / 1000),
+    Math.floor(elapsedMs * fps / 1000),
     lastFrameIndex + 1
   );
   let timestamp = frameTimestampUs(frameIndex);
@@ -244,7 +278,7 @@ function runPacing() {
   const sourceReady = !placeholder && (
     renderedSourceFrame
     || sourceBuffer.length >= SOURCE_BUFFER_FRAMES
-    || timelineElapsedMs() >= sourceBufferReadyAt
+    || mediaTimeMs() >= sourceBufferReadyAt
   );
   const source = sourceReady && sourceBuffer.length ? sourceBuffer.shift() : null;
   const showPlaceholder = placeholder || !renderedSourceFrame && !source;
@@ -289,7 +323,7 @@ function onSourceFrame(frame) {
   }
   sourceBuffer.push(frame);
   if (placeholder) {
-    sourceBufferReadyAt = timelineElapsedMs() + 1000 / fps;
+    sourceBufferReadyAt = mediaTimeMs() + 1000 / fps;
     renderedSourceFrame = false;
     forceNextKeyframe = true;
   }
@@ -522,7 +556,13 @@ async function init(message) {
   quantizer = INITIAL_QUANTIZER;
   keyframeInterval = fps;
   framePeriodUs = Math.round(1000000 / Math.max(1, fps));
-  timelineStartedAt = performance.now() - Math.max(0, Number(message.timelineOffsetMs) || 0);
+  audioSampleRate = Number(message.audioSampleRate);
+  if (!Number.isFinite(audioSampleRate) || audioSampleRate <= 0) {
+    throw new Error("Audio clock sample rate is invalid.");
+  }
+  audioClockMs = 0;
+  audioClockUpdatedAt = 0;
+  audioClockReady = false;
   lastFrameIndex = -1;
   lastTimestampUs = -1;
   sourceBuffer = [];
@@ -566,6 +606,7 @@ async function init(message) {
   if (!ctx) throw new Error("OffscreenCanvas 2D context is not available.");
   encoder = createEncoder(config);
   await loadPlaceholderImage(placeholderImageUrl);
+  syncAudioClock(message.audioClockSamples);
   statsTimer = setInterval(postStats, 1000);
   postMessage({ type: "ready" });
 }
@@ -613,6 +654,8 @@ async function handleMessage(message) {
     networkPaused = false;
     forceNextKeyframe = true;
     startCurrentOutput();
+  } else if (message.type === "audio-clock" && !closed) {
+    syncAudioClock(message.timestampSamples);
   } else if (message.type === "close") {
     await closeAll();
     postMessage({ type: "closed" });
