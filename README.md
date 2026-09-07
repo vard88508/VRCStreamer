@@ -91,7 +91,7 @@ To block publishing to specific stream URLs, create `blacklist.txt` next to the 
 a85c0211c512828c4c52dc5716a79e3a;1dd5a1d78b07336b21496ccf7bf79b8a
 ```
 
-The server reloads the file every minute. Newly blocked streamers are disconnected, and new publishing attempts for those IDs are rejected. Removing the file or leaving it empty clears the blacklist. Invalid updates are ignored so the previous valid list remains active.
+The server reloads the file every minute. Newly blocked streamers are disconnected, and their IP addresses are blocked for publishing until the server restarts. Attempting to publish to an already blocked stream ID also blocks that publisher's IP. Removing the file or leaving it empty clears the stream ID blacklist, but in-memory IP blocks remain until restart. Invalid updates are ignored so the previous valid list remains active.
 
 ## Environment
 

@@ -65,6 +65,7 @@ fn test_state(config: Config) -> Arc<AppState> {
         config,
         channels: StdRwLock::new(HashMap::new()),
         stream_blacklist: StdRwLock::new(HashSet::new()),
+        blocked_streamer_ips: StdRwLock::new(HashSet::new()),
         ip_limits: StdMutex::new(IpLimitTable::new()),
         placeholders: Placeholders {
             offline_video: Bytes::new(),
@@ -126,6 +127,35 @@ fn replacing_blacklist_notifies_active_streamers() {
 
     channel.streamer.store(false, Ordering::Release);
     cleanup_channel(&state, key, &channel);
+}
+
+#[test]
+fn blacklisted_stream_bans_streamer_ip_until_restart() {
+    let state = test_state(test_config());
+    let key = "a85c0211c512828c4c52dc5716a79e3a";
+    let ip: IpAddr = "203.0.113.42".parse().unwrap();
+    state
+        .stream_blacklist
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key.to_owned());
+
+    assert!(!streamer_ip_is_blocked(&state, ip));
+    assert!(block_streamer_ip_if_blacklisted(&state, key, ip));
+    assert!(streamer_ip_is_blocked(&state, ip));
+    assert!(block_streamer_ip_if_blacklisted(&state, key, ip));
+
+    state
+        .stream_blacklist
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+    assert!(streamer_ip_is_blocked(&state, ip));
+    assert!(!block_streamer_ip_if_blacklisted(
+        &state,
+        "1dd5a1d78b07336b21496ccf7bf79b8a",
+        "203.0.113.43".parse().unwrap(),
+    ));
 }
 
 #[test]

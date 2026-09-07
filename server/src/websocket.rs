@@ -1,5 +1,5 @@
 use std::{
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
@@ -28,11 +28,11 @@ use super::{
     AAC_INGEST_BURST_SECS, AAC_MAX_FRAMES_PER_SECOND, AAC_MAX_INGEST_BYTES_PER_SECOND,
     AAC_SAMPLE_RATE, AppState, Channel, DEFAULT_TOKEN_BUCKET_BURST_SECS, H264_CLOCK_RATE,
     MEDIA_CLOCK_RATE, STREAMER_CONTROL_MESSAGES_PER_SECOND, STREAMER_LISTENER_UPDATE_INTERVAL,
-    allow_http_request, cleanup_channel, force_resync_channel, hash_code, limit_allows,
-    max_ws_message_bytes, origin_allowed, password_allowed, peer_id, public_rtsp_base,
-    reserve_channel, stream_id_for_log, stream_is_blacklisted, streamer_hello_message,
-    streamer_listeners_message, text_response, text_response_with_cors, validate_code,
-    wake_media_listeners, wake_video_listeners,
+    allow_http_request, block_streamer_ip_if_blacklisted, cleanup_channel, force_resync_channel,
+    hash_code, limit_allows, max_ws_message_bytes, origin_allowed, password_allowed, peer_id,
+    public_rtsp_base, reserve_channel, stream_id_for_log, streamer_hello_message,
+    streamer_ip_is_blocked, streamer_listeners_message, text_response, text_response_with_cors,
+    validate_code, wake_media_listeners, wake_video_listeners,
 };
 
 pub(crate) enum StreamerTextCommand {
@@ -97,12 +97,14 @@ struct StreamerGuard {
     key: String,
     channel: Arc<Channel>,
     peer: String,
+    ip: IpAddr,
     _ip_guard: Option<StreamerIpGuard>,
     _connection_guard: ConnectionGuard,
 }
 
 impl Drop for StreamerGuard {
     fn drop(&mut self) {
+        block_streamer_ip_if_blacklisted(&self.state, &self.key, self.ip);
         self.channel.streamer.store(false, Ordering::Release);
         self.channel.video_active.store(false, Ordering::Release);
         self.channel.set_video_fmtp(None);
@@ -120,8 +122,9 @@ pub(crate) async fn ingest_ws(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
-    let peer = peer_id(&state, addr.ip());
-    if !allow_http_request(&state, addr.ip()) {
+    let ip = addr.ip();
+    let peer = peer_id(&state, ip);
+    if !allow_http_request(&state, ip) {
         warn!(%peer, "rejected streamer over http request rate limit");
         return text_response_with_cors(
             StatusCode::TOO_MANY_REQUESTS,
@@ -146,13 +149,23 @@ pub(crate) async fn ingest_ws(
         );
     }
 
+    if streamer_ip_is_blocked(&state, ip) {
+        warn!(%peer, "rejected blocked streamer");
+        return text_response_with_cors(
+            StatusCode::FORBIDDEN,
+            "streamer is blocked\n",
+            &headers,
+            &state.config,
+        );
+    }
+
     if let Err(reason) = validate_code(&query.code) {
         return text_response(StatusCode::BAD_REQUEST, reason);
     }
 
     let key = hash_code(&query.code);
     let stream_id = stream_id_for_log(&key);
-    if stream_is_blacklisted(&state, &key) {
+    if block_streamer_ip_if_blacklisted(&state, &key, ip) {
         warn!(%peer, %stream_id, "rejected blacklisted stream");
         return text_response_with_cors(
             StatusCode::FORBIDDEN,
@@ -162,7 +175,7 @@ pub(crate) async fn ingest_ws(
         );
     }
 
-    let ip_guard = match try_acquire_streamer_ip(&state, addr.ip()) {
+    let ip_guard = match try_acquire_streamer_ip(&state, ip) {
         Ok(guard) => guard,
         Err(reason) => {
             return text_response(StatusCode::TOO_MANY_REQUESTS, reason);
@@ -207,6 +220,7 @@ pub(crate) async fn ingest_ws(
         key,
         channel,
         peer,
+        ip,
         _ip_guard: ip_guard,
         _connection_guard: connection_guard,
     };
@@ -220,8 +234,14 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
     let key = guard.key.as_str();
     let channel = guard.channel.as_ref();
     let peer = guard.peer.as_str();
+    let ip = guard.ip;
     let stream_id = stream_id_for_log(key);
-    if stream_is_blacklisted(state, key) {
+    if streamer_ip_is_blocked(state, ip) {
+        warn!(%peer, "disconnected blocked streamer during startup");
+        close_for_policy(&mut socket, "streamer is blocked").await;
+        return;
+    }
+    if block_streamer_ip_if_blacklisted(state, key, ip) {
         warn!(%peer, %stream_id, "disconnected blacklisted streamer during startup");
         close_for_policy(&mut socket, "stream is blacklisted").await;
         return;
@@ -271,7 +291,7 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
     loop {
         let message = tokio::select! {
             _ = &mut blacklist_notification => {
-                if stream_is_blacklisted(state, key) {
+                if block_streamer_ip_if_blacklisted(state, key, ip) {
                     warn!(%peer, %stream_id, "disconnected blacklisted streamer");
                     close_for_policy(&mut socket, "stream is blacklisted").await;
                     break;

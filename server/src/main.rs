@@ -86,6 +86,7 @@ const STREAM_CODE_BYTES: usize = 32;
 const PLACEHOLDERS_PATH: &str = "placeholders";
 const STREAM_BLACKLIST_FILE: &str = "blacklist.txt";
 const STREAM_BLACKLIST_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_BLOCKED_STREAMER_IPS: usize = 65_536;
 const STREAMER_LISTENER_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 const STREAMER_CONTROL_MESSAGES_PER_SECOND: usize = 8;
 const RTCP_REPORT_INTERVAL: Duration = Duration::from_secs(5);
@@ -174,6 +175,7 @@ struct AppState {
     config: Config,
     channels: StdRwLock<HashMap<String, Arc<Channel>>>,
     stream_blacklist: StdRwLock<HashSet<String>>,
+    blocked_streamer_ips: StdRwLock<HashSet<IpAddr>>,
     ip_limits: StdMutex<IpLimitTable>,
     placeholders: Placeholders,
     active_connections: AtomicUsize,
@@ -283,6 +285,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config,
         channels: StdRwLock::new(HashMap::new()),
         stream_blacklist: StdRwLock::new(stream_blacklist),
+        blocked_streamer_ips: StdRwLock::new(HashSet::new()),
         ip_limits: StdMutex::new(IpLimitTable::new()),
         placeholders,
         active_connections: AtomicUsize::new(0),
@@ -505,6 +508,33 @@ fn stream_is_blacklisted(state: &AppState, key: &str) -> bool {
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .contains(key)
+}
+
+fn streamer_ip_is_blocked(state: &AppState, ip: IpAddr) -> bool {
+    let blocked = state
+        .blocked_streamer_ips
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Stop accepting publishers if the persistent in-memory set reaches its safety bound.
+    blocked.contains(&ip) || blocked.len() >= MAX_BLOCKED_STREAMER_IPS
+}
+
+fn block_streamer_ip(state: &AppState, ip: IpAddr) {
+    let mut blocked = state
+        .blocked_streamer_ips
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if blocked.len() < MAX_BLOCKED_STREAMER_IPS {
+        blocked.insert(ip);
+    }
+}
+
+fn block_streamer_ip_if_blacklisted(state: &AppState, key: &str, ip: IpAddr) -> bool {
+    if !stream_is_blacklisted(state, key) {
+        return false;
+    }
+    block_streamer_ip(state, ip);
+    true
 }
 
 fn replace_stream_blacklist(state: &AppState, entries: HashSet<String>) -> Option<(usize, usize)> {
