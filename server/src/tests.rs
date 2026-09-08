@@ -18,7 +18,7 @@ use super::websocket::{
 };
 use super::*;
 use tokio::{
-    io::{AsyncReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     time::Instant as TokioInstant,
 };
 
@@ -65,7 +65,7 @@ fn test_state(config: Config) -> Arc<AppState> {
         config,
         channels: StdRwLock::new(HashMap::new()),
         stream_blacklist: StdRwLock::new(HashSet::new()),
-        blocked_streamer_ips: StdRwLock::new(HashSet::new()),
+        blocked_streamer_ips: StdRwLock::new(StreamerIpBans::default()),
         ip_limits: StdMutex::new(IpLimitTable::new()),
         placeholders: Placeholders {
             offline_video: Bytes::new(),
@@ -122,7 +122,7 @@ fn replacing_blacklist_notifies_active_streamers() {
 
     let changed = replace_stream_blacklist(&state, HashSet::from([key.to_owned()]));
     assert_eq!(changed, Some((1, 1)));
-    assert!(stream_is_blacklisted(&state, key));
+    assert!(state.stream_blacklist.read().unwrap().contains(key));
     assert!(replace_stream_blacklist(&state, HashSet::from([key.to_owned()])).is_none());
 
     channel.streamer.store(false, Ordering::Release);
@@ -130,32 +130,225 @@ fn replacing_blacklist_notifies_active_streamers() {
 }
 
 #[test]
-fn blacklisted_stream_bans_streamer_ip_until_restart() {
+fn removing_blacklisted_stream_releases_its_ips() {
     let state = test_state(test_config());
     let key = "a85c0211c512828c4c52dc5716a79e3a";
     let ip: IpAddr = "203.0.113.42".parse().unwrap();
-    state
-        .stream_blacklist
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(key.to_owned());
+    let other_ip: IpAddr = "2001:db8::1".parse().unwrap();
+    let entries = HashSet::from([key.to_owned()]);
+    replace_stream_blacklist(&state, entries.clone());
 
     assert!(!streamer_ip_is_blocked(&state, ip));
     assert!(block_streamer_ip_if_blacklisted(&state, key, ip));
-    assert!(streamer_ip_is_blocked(&state, ip));
+    assert!(block_streamer_ip_if_blacklisted(&state, key, other_ip));
     assert!(block_streamer_ip_if_blacklisted(&state, key, ip));
-
-    state
-        .stream_blacklist
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clear();
+    assert!(replace_stream_blacklist(&state, entries.clone()).is_none());
     assert!(streamer_ip_is_blocked(&state, ip));
+    assert!(streamer_ip_is_blocked(&state, other_ip));
+
+    replace_stream_blacklist(&state, HashSet::new());
+    assert!(!streamer_ip_is_blocked(&state, ip));
+    assert!(!streamer_ip_is_blocked(&state, other_ip));
+    assert!(!block_streamer_ip_if_blacklisted(&state, key, ip));
+    assert!(!streamer_ip_is_blocked(&state, ip));
+
+    replace_stream_blacklist(&state, entries);
+    assert!(!streamer_ip_is_blocked(&state, ip));
+    assert!(block_streamer_ip_if_blacklisted(&state, key, ip));
+    assert!(streamer_ip_is_blocked(&state, ip));
+}
+
+#[test]
+fn shared_ip_stays_blocked_until_all_its_stream_ids_are_removed() {
+    let state = test_state(test_config());
+    let first = "a85c0211c512828c4c52dc5716a79e3a";
+    let second = "1dd5a1d78b07336b21496ccf7bf79b8a";
+    let shared_ip: IpAddr = "203.0.113.42".parse().unwrap();
+    let first_only_ip: IpAddr = "203.0.113.43".parse().unwrap();
+    replace_stream_blacklist(&state, HashSet::from([first.to_owned(), second.to_owned()]));
+    assert!(block_streamer_ip_if_blacklisted(&state, first, shared_ip));
+    assert!(block_streamer_ip_if_blacklisted(&state, second, shared_ip));
+    assert!(block_streamer_ip_if_blacklisted(
+        &state,
+        first,
+        first_only_ip
+    ));
+
+    replace_stream_blacklist(&state, HashSet::from([second.to_owned()]));
+    assert!(streamer_ip_is_blocked(&state, shared_ip));
+    assert!(!streamer_ip_is_blocked(&state, first_only_ip));
     assert!(!block_streamer_ip_if_blacklisted(
         &state,
-        "1dd5a1d78b07336b21496ccf7bf79b8a",
-        "203.0.113.43".parse().unwrap(),
+        first,
+        first_only_ip
     ));
+    assert!(!streamer_ip_is_blocked(&state, first_only_ip));
+
+    replace_stream_blacklist(&state, HashSet::new());
+    assert!(!streamer_ip_is_blocked(&state, shared_ip));
+}
+
+#[test]
+fn concurrent_blacklist_removal_cannot_leave_a_stale_ip_ban() {
+    let state = test_state(test_config());
+    let key = "a85c0211c512828c4c52dc5716a79e3a";
+    let ip: IpAddr = "203.0.113.42".parse().unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    for _ in 0..32 {
+        replace_stream_blacklist(&state, HashSet::from([key.to_owned()]));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                block_streamer_ip_if_blacklisted(&state, key, ip);
+            });
+            barrier.wait();
+            replace_stream_blacklist(&state, HashSet::new());
+        });
+        assert!(!streamer_ip_is_blocked(&state, ip));
+    }
+}
+
+#[test]
+fn ip_ban_overflow_remains_linked_to_its_stream_id() {
+    let state = test_state(test_config());
+    let first = "a85c0211c512828c4c52dc5716a79e3a";
+    let second = "1dd5a1d78b07336b21496ccf7bf79b8a";
+    replace_stream_blacklist(&state, HashSet::from([first.to_owned(), second.to_owned()]));
+    for index in 0..MAX_STREAMER_IP_BANS {
+        let ip = IpAddr::V6((index as u128 + 1).into());
+        assert!(block_streamer_ip_if_blacklisted(&state, first, ip));
+    }
+    let overflow_ip: IpAddr = "203.0.113.42".parse().unwrap();
+    let other_ip: IpAddr = "203.0.113.43".parse().unwrap();
+    assert!(block_streamer_ip_if_blacklisted(
+        &state,
+        second,
+        overflow_ip
+    ));
+    assert!(streamer_ip_is_blocked(&state, overflow_ip));
+    assert!(streamer_ip_is_blocked(&state, other_ip));
+    assert_eq!(
+        state.blocked_streamer_ips.read().unwrap().associations,
+        MAX_STREAMER_IP_BANS
+    );
+
+    replace_stream_blacklist(&state, HashSet::from([second.to_owned()]));
+    assert!(streamer_ip_is_blocked(&state, overflow_ip));
+    assert!(streamer_ip_is_blocked(&state, other_ip));
+
+    replace_stream_blacklist(&state, HashSet::new());
+    assert!(!streamer_ip_is_blocked(&state, overflow_ip));
+    assert!(!streamer_ip_is_blocked(&state, other_ip));
+    assert_eq!(state.blocked_streamer_ips.read().unwrap().associations, 0);
+}
+
+async fn test_ingest_server(state: Arc<AppState>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route("/ingest", get(ingest_ws))
+        .with_state(state);
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    (address, server)
+}
+
+async fn test_ingest_connect(
+    address: SocketAddr,
+    code: &str,
+) -> (String, BufReader<tokio::net::TcpStream>) {
+    let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    let request = format!(
+        "GET /ingest?code={code} HTTP/1.1\r\nHost: {address}\r\n\
+         Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    );
+    socket.write_all(request.as_bytes()).await.unwrap();
+    let mut socket = BufReader::new(socket);
+    let mut response = String::new();
+    tokio::time::timeout(Duration::from_secs(5), socket.read_line(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    (response, socket)
+}
+
+#[tokio::test]
+async fn rejected_ingest_remembers_each_blacklisted_id_for_the_same_ip() {
+    let state = test_state(test_config());
+    let first = "a".repeat(STREAM_CODE_BYTES);
+    let second = "b".repeat(STREAM_CODE_BYTES);
+    let third = "c".repeat(STREAM_CODE_BYTES);
+    replace_stream_blacklist(
+        &state,
+        HashSet::from([hash_code(&first), hash_code(&second)]),
+    );
+    let (address, server) = test_ingest_server(state.clone()).await;
+    for code in [&first, &second] {
+        let (status, _) = test_ingest_connect(address, code).await;
+        assert!(status.starts_with("HTTP/1.1 403"));
+    }
+    replace_stream_blacklist(&state, HashSet::from([hash_code(&second)]));
+    let (status, _) = test_ingest_connect(address, &third).await;
+    assert!(status.starts_with("HTTP/1.1 403"));
+    assert_eq!(state.active_streamers.load(Ordering::Acquire), 0);
+    replace_stream_blacklist(&state, HashSet::new());
+    let (status, _) = test_ingest_connect(address, &third).await;
+    assert!(status.starts_with("HTTP/1.1 101"));
+
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn blacklist_reload_bans_active_streamer_without_kicking_other_streams_from_its_ip() {
+    let mut config = test_config();
+    config.max_streamers = 2;
+    config.streamer_idle_timeout = Duration::from_secs(30);
+    let state = test_state(config);
+    let first = "a".repeat(STREAM_CODE_BYTES);
+    let second = "b".repeat(STREAM_CODE_BYTES);
+    let (address, server) = test_ingest_server(state.clone()).await;
+    let (status, first_socket) = test_ingest_connect(address, &first).await;
+    assert!(status.starts_with("HTTP/1.1 101"));
+    let (status, second_socket) = test_ingest_connect(address, &second).await;
+    assert!(status.starts_with("HTTP/1.1 101"));
+
+    assert_eq!(
+        replace_stream_blacklist(&state, HashSet::from([hash_code(&first)])),
+        Some((1, 1))
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while state.active_streamers.load(Ordering::Acquire) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(streamer_ip_is_blocked(&state, address.ip()));
+    let second_channel = state.channels.read().unwrap()[&hash_code(&second)].clone();
+    assert!(second_channel.streamer.load(Ordering::Acquire));
+
+    replace_stream_blacklist(&state, HashSet::new());
+    assert!(!streamer_ip_is_blocked(&state, address.ip()));
+    drop((first_socket, second_socket));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while state.active_streamers.load(Ordering::Acquire) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!streamer_ip_is_blocked(&state, address.ip()));
+
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
 }
 
 #[test]

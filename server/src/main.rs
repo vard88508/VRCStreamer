@@ -86,7 +86,7 @@ const STREAM_CODE_BYTES: usize = 32;
 const PLACEHOLDERS_PATH: &str = "placeholders";
 const STREAM_BLACKLIST_FILE: &str = "blacklist.txt";
 const STREAM_BLACKLIST_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
-const MAX_BLOCKED_STREAMER_IPS: usize = 65_536;
+const MAX_STREAMER_IP_BANS: usize = 65_536;
 const STREAMER_LISTENER_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 const STREAMER_CONTROL_MESSAGES_PER_SECOND: usize = 8;
 const RTCP_REPORT_INTERVAL: Duration = Duration::from_secs(5);
@@ -175,7 +175,7 @@ struct AppState {
     config: Config,
     channels: StdRwLock<HashMap<String, Arc<Channel>>>,
     stream_blacklist: StdRwLock<HashSet<String>>,
-    blocked_streamer_ips: StdRwLock<HashSet<IpAddr>>,
+    blocked_streamer_ips: StdRwLock<StreamerIpBans>,
     ip_limits: StdMutex<IpLimitTable>,
     placeholders: Placeholders,
     active_connections: AtomicUsize,
@@ -183,6 +183,13 @@ struct AppState {
     active_listeners: AtomicUsize,
     next_rtsp_session: AtomicUsize,
     log_salt: [u8; 16],
+}
+
+#[derive(Default)]
+struct StreamerIpBans {
+    by_ip: HashMap<IpAddr, HashSet<String>>,
+    associations: usize,
+    overflowed_ids: HashSet<String>,
 }
 
 struct Channel {
@@ -285,7 +292,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config,
         channels: StdRwLock::new(HashMap::new()),
         stream_blacklist: StdRwLock::new(stream_blacklist),
-        blocked_streamer_ips: StdRwLock::new(HashSet::new()),
+        blocked_streamer_ips: StdRwLock::new(StreamerIpBans::default()),
         ip_limits: StdMutex::new(IpLimitTable::new()),
         placeholders,
         active_connections: AtomicUsize::new(0),
@@ -502,38 +509,40 @@ fn parse_stream_blacklist(contents: &str) -> Result<HashSet<String>, String> {
     Ok(entries)
 }
 
-fn stream_is_blacklisted(state: &AppState, key: &str) -> bool {
-    state
-        .stream_blacklist
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .contains(key)
-}
-
 fn streamer_ip_is_blocked(state: &AppState, ip: IpAddr) -> bool {
     let blocked = state
         .blocked_streamer_ips
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // Stop accepting publishers if the persistent in-memory set reaches its safety bound.
-    blocked.contains(&ip) || blocked.len() >= MAX_BLOCKED_STREAMER_IPS
+    // Unknown IPs from an overflowed ID stay blocked until that ID is removed.
+    blocked.by_ip.contains_key(&ip) || !blocked.overflowed_ids.is_empty()
 }
 
-fn block_streamer_ip(state: &AppState, ip: IpAddr) {
+fn block_streamer_ip_if_blacklisted(state: &AppState, key: &str, ip: IpAddr) -> bool {
+    // Keep the ID read lock until the IP ban is recorded, matching reload's lock order.
+    let blacklist = state
+        .stream_blacklist
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !blacklist.contains(key) {
+        return false;
+    }
     let mut blocked = state
         .blocked_streamer_ips
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if blocked.len() < MAX_BLOCKED_STREAMER_IPS {
-        blocked.insert(ip);
+    if blocked.by_ip.get(&ip).is_some_and(|ids| ids.contains(key)) {
+        return true;
     }
-}
-
-fn block_streamer_ip_if_blacklisted(state: &AppState, key: &str, ip: IpAddr) -> bool {
-    if !stream_is_blacklisted(state, key) {
-        return false;
+    if blocked.associations < MAX_STREAMER_IP_BANS {
+        blocked.by_ip.entry(ip).or_default().insert(key.to_owned());
+        blocked.associations += 1;
+    } else if !blocked.overflowed_ids.contains(key) {
+        blocked.overflowed_ids.insert(key.to_owned());
+        warn!(
+            "streamer IP ban table full; new streams blocked until overflowed IDs are removed or the server restarts"
+        );
     }
-    block_streamer_ip(state, ip);
     true
 }
 
@@ -547,6 +556,22 @@ fn replace_stream_blacklist(state: &AppState, entries: HashSet<String>) -> Optio
         if *current == entries {
             return None;
         }
+        let mut blocked = state
+            .blocked_streamer_ips
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut associations = 0;
+        blocked.by_ip.retain(|_, stream_ids| {
+            stream_ids.retain(|key| entries.contains(key));
+            if stream_ids.is_empty() {
+                return false;
+            }
+            stream_ids.shrink_to_fit();
+            associations += stream_ids.len();
+            true
+        });
+        blocked.associations = associations;
+        blocked.overflowed_ids.retain(|key| entries.contains(key));
         *current = entries;
     }
 

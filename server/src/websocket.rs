@@ -104,8 +104,9 @@ struct StreamerGuard {
 
 impl Drop for StreamerGuard {
     fn drop(&mut self) {
-        block_streamer_ip_if_blacklisted(&self.state, &self.key, self.ip);
         self.channel.streamer.store(false, Ordering::Release);
+        // A reload must not notify this session after its final blacklist check.
+        block_streamer_ip_if_blacklisted(&self.state, &self.key, self.ip);
         self.channel.video_active.store(false, Ordering::Release);
         self.channel.set_video_fmtp(None);
         force_resync_channel(&self.channel);
@@ -149,16 +150,6 @@ pub(crate) async fn ingest_ws(
         );
     }
 
-    if streamer_ip_is_blocked(&state, ip) {
-        warn!(%peer, "rejected blocked streamer");
-        return text_response_with_cors(
-            StatusCode::FORBIDDEN,
-            "streamer is blocked\n",
-            &headers,
-            &state.config,
-        );
-    }
-
     if let Err(reason) = validate_code(&query.code) {
         return text_response(StatusCode::BAD_REQUEST, reason);
     }
@@ -170,6 +161,15 @@ pub(crate) async fn ingest_ws(
         return text_response_with_cors(
             StatusCode::FORBIDDEN,
             "stream is blacklisted\n",
+            &headers,
+            &state.config,
+        );
+    }
+    if streamer_ip_is_blocked(&state, ip) {
+        warn!(%peer, "rejected blocked streamer");
+        return text_response_with_cors(
+            StatusCode::FORBIDDEN,
+            "streamer is blocked\n",
             &headers,
             &state.config,
         );
@@ -236,14 +236,14 @@ async fn streamer_session(mut socket: WebSocket, guard: StreamerGuard, rtsp_base
     let peer = guard.peer.as_str();
     let ip = guard.ip;
     let stream_id = stream_id_for_log(key);
-    if streamer_ip_is_blocked(state, ip) {
-        warn!(%peer, "disconnected blocked streamer during startup");
-        close_for_policy(&mut socket, "streamer is blocked").await;
-        return;
-    }
     if block_streamer_ip_if_blacklisted(state, key, ip) {
         warn!(%peer, %stream_id, "disconnected blacklisted streamer during startup");
         close_for_policy(&mut socket, "stream is blacklisted").await;
+        return;
+    }
+    if streamer_ip_is_blocked(state, ip) {
+        warn!(%peer, "disconnected blocked streamer during startup");
+        close_for_policy(&mut socket, "streamer is blocked").await;
         return;
     }
     channel.set_video_fmtp(None);
