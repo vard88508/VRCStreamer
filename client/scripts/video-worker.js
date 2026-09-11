@@ -6,9 +6,90 @@ const SOURCE_BUFFER_FRAMES = 2;
 const AUDIO_CLOCK_GRACE_MS = 100;
 const AUDIO_CLOCK_KEYFRAME_GAP_MS = 1000;
 const BITRATE_HEADROOM = 0.85;
-const MIN_QUANTIZER = 28;
+const MIN_QUANTIZER = 18;
 const MAX_QUANTIZER = 51;
-const INITIAL_QUANTIZER = 51;
+const INITIAL_QUANTIZER = 24;
+const QUANTIZER_RECOVERY_STEP = 2;
+const QUANTIZER_BLOCK_MS = 15000;
+const QUANTIZER_HISTORY_SIZE = 64;
+
+class VideoRateControl {
+  frameTimestamps = new Float64Array(QUANTIZER_HISTORY_SIZE);
+  frameQuantizers = new Uint8Array(QUANTIZER_HISTORY_SIZE);
+  minQuantizer = 0; // Zero means no temporary block.
+  blockedUntil = 0;
+
+  reset(bitrate, frameRate, now, keepBlock = false) {
+    this.budget = Math.floor(bitrate * BITRATE_HEADROOM);
+    // A bit allowance, not a media queue. Leave room below the server's burst limit.
+    this.capacity = Math.max(this.budget * 0.5, this.budget / frameRate);
+    this.available = this.capacity;
+    this.updatedAt = now;
+    this.adjustedAt = now;
+    this.smoothedBitrate = this.budget;
+    if (!keepBlock) this.blockedUntil = 0;
+    this.blockedMinimum(now);
+    this.quantizer = Math.max(MIN_QUANTIZER, INITIAL_QUANTIZER, this.minQuantizer);
+    this.adjustments = 0;
+    this.frameTimestamps.fill(-1);
+    this.frameSlot = 0;
+  }
+
+  blockedMinimum(now) {
+    if (now >= this.blockedUntil) {
+      this.minQuantizer = 0;
+      this.blockedUntil = 0;
+    }
+    return this.minQuantizer;
+  }
+
+  submit(timestamp) {
+    this.frameTimestamps[this.frameSlot] = timestamp;
+    this.frameQuantizers[this.frameSlot] = this.quantizer;
+    this.frameSlot = (this.frameSlot + 1) % QUANTIZER_HISTORY_SIZE;
+    return this.quantizer;
+  }
+
+  setQuantizer(value, now) {
+    const next = Math.max(MIN_QUANTIZER, this.minQuantizer, Math.min(MAX_QUANTIZER, value));
+    if (next === this.quantizer) return;
+    this.quantizer = next;
+    this.adjustedAt = now;
+    this.adjustments++;
+  }
+
+  record(bytes, now, timestamp) {
+    const slot = this.frameTimestamps.indexOf(timestamp);
+    const frameQuantizer = slot < 0 ? this.quantizer : this.frameQuantizers[slot];
+    if (slot >= 0) this.frameTimestamps[slot] = -1;
+    this.blockedMinimum(now);
+    const elapsed = Math.max(0, now - this.updatedAt) / 1000;
+    this.updatedAt = now;
+    this.available = Math.min(this.capacity, this.available + elapsed * this.budget) - bytes * 8;
+    if (this.available < 0) {
+      // Block the overflowing frame's QP, not untested levels or a newer in-flight QP.
+      // Missing metadata falls back to blocking the current QP.
+      const nextMinimum = frameQuantizer + 1;
+      this.minQuantizer = Math.max(this.minQuantizer, Math.min(MAX_QUANTIZER, nextMinimum));
+      this.blockedUntil = now + QUANTIZER_BLOCK_MS;
+      this.setQuantizer(Math.max(this.quantizer, this.minQuantizer), now);
+      this.available = 0;
+    }
+  }
+
+  update(actualBitrate, elapsed, now, canImprove) {
+    this.blockedMinimum(now);
+    // Keep a short bitrate history; recover slowly and leave room for the next QP step.
+    this.smoothedBitrate += (actualBitrate - this.smoothedBitrate) * elapsed / (2 + elapsed);
+    const nextQuantizer = this.quantizer - QUANTIZER_RECOVERY_STEP;
+    if (canImprove
+        && nextQuantizer >= Math.max(MIN_QUANTIZER, this.minQuantizer)
+        && now - this.adjustedAt >= 1000
+        && Math.max(actualBitrate, this.smoothedBitrate) < this.budget * 0.75) {
+      this.setQuantizer(nextQuantizer, now);
+    }
+  }
+}
 
 let encoder = null;
 let canvas = null;
@@ -32,7 +113,7 @@ let width = 1280;
 let height = 720;
 let fps = 30;
 let bitrateLimit = 2000000;
-let quantizer = INITIAL_QUANTIZER;
+const rateControl = new VideoRateControl();
 let keyframeInterval = 30;
 let framePeriodUs = 33333;
 let audioSampleRate = 48000;
@@ -55,7 +136,6 @@ let lastSubmitted = 0;
 let lastEncoded = 0;
 let lastSourceFrames = 0;
 let lastEncodedBytes = 0;
-let quantizerAdjustments = 0;
 let avcHeader = null;
 let forceNextKeyframe = false;
 let commandQueue = Promise.resolve();
@@ -124,7 +204,8 @@ function sendVideoPacket(chunk, header) {
   packet[4] = rtpTimestamp;
   if (headerLength) packet.set(header, VIDEO_FRAME_HEADER_BYTES);
   chunk.copyTo(packet.subarray(VIDEO_FRAME_HEADER_BYTES + headerLength));
-  encodedBytes += chunk.byteLength + headerLength;
+  encodedBytes += packet.byteLength;
+  rateControl.record(packet.byteLength, performance.now(), chunk.timestamp);
   postMessage({ type: "packet", packet: packet.buffer }, [packet.buffer]);
 }
 
@@ -227,7 +308,7 @@ function submitFrame(source, showPlaceholder, timestamp, duration, repeated = fa
   try {
     const keyFrame = forceNextKeyframe
       || timestamp - lastKeyframeTimestampUs >= keyframeInterval * framePeriodUs;
-    encoder.encode(frame, { keyFrame, avc: { quantizer } });
+    encoder.encode(frame, { keyFrame, avc: { quantizer: rateControl.submit(timestamp) } });
     forceNextKeyframe = false;
     if (keyFrame) lastKeyframeTimestampUs = timestamp;
     if (repeated) repeatedFrames++;
@@ -396,7 +477,7 @@ function postStats() {
   lastSourceFrames = sourceFrames;
   lastEncodedBytes = encodedBytes;
   if (!closed && !paused && !networkPaused && !placeholder && encodedDelta > 0) {
-    adaptQuantizer(actualBitrate);
+    rateControl.update(actualBitrate, elapsed, now, encodedDelta >= fps * elapsed * 0.9);
   }
   postMessage({
     type: "stats",
@@ -411,8 +492,9 @@ function postStats() {
       queue: encoder ? encoder.encodeQueueSize : 0,
       path: outputPath,
       limitKbps: bitrateLimit / 1000,
-      quantizerAdjustments,
-      quantizer
+      minQuantizer: rateControl.blockedMinimum(now),
+      quantizerAdjustments: rateControl.adjustments,
+      quantizer: rateControl.quantizer
     }
   });
 }
@@ -466,22 +548,14 @@ async function assertEncoderSupport(config) {
   }
 }
 
-function adaptQuantizer(actualBitrate) {
-  const budget = bitrateLimit * BITRATE_HEADROOM;
-  if (actualBitrate > budget) {
-    const step = Math.max(1, Math.ceil(6 * Math.log2(actualBitrate / budget)));
-    const nextQuantizer = Math.min(MAX_QUANTIZER, quantizer + step);
-    if (nextQuantizer !== quantizer) {
-      quantizer = nextQuantizer;
-      quantizerAdjustments++;
-    }
-    return;
-  }
-
-  if (actualBitrate < budget * 0.7 && quantizer > MIN_QUANTIZER) {
-    quantizer--;
-    quantizerAdjustments++;
-  }
+function resetRateControl(keepBlock = false) {
+  const now = performance.now();
+  rateControl.reset(bitrateLimit, fps, now, keepBlock);
+  lastStatsAt = now;
+  lastSubmitted = submitted;
+  lastEncoded = encoded;
+  lastSourceFrames = sourceFrames;
+  lastEncodedBytes = encodedBytes;
 }
 
 function createEncoder(config) {
@@ -520,11 +594,12 @@ async function reconfigure(message) {
     nextEncoder = null;
     previousEncoder.close();
 
+    const keepQuantizerBlock = message.width === width && message.height === height;
     width = message.width;
     height = message.height;
     fps = message.fps;
     bitrateLimit = message.bitrate;
-    quantizer = INITIAL_QUANTIZER;
+    resetRateControl(keepQuantizerBlock);
     keyframeInterval = fps;
     framePeriodUs = Math.round(1000000 / fps);
     lastFrameIndex = Math.floor(lastTimestampUs * fps / 1000000);
@@ -553,7 +628,6 @@ async function init(message) {
   height = message.height;
   fps = message.fps;
   bitrateLimit = message.bitrate;
-  quantizer = INITIAL_QUANTIZER;
   keyframeInterval = fps;
   framePeriodUs = Math.round(1000000 / Math.max(1, fps));
   audioSampleRate = Number(message.audioSampleRate);
@@ -578,12 +652,7 @@ async function init(message) {
   repeatedFrames = 0;
   encodedBytes = 0;
   outputPath = "placeholder";
-  lastStatsAt = performance.now();
-  lastSubmitted = 0;
-  lastEncoded = 0;
-  lastSourceFrames = 0;
-  lastEncodedBytes = 0;
-  quantizerAdjustments = 0;
+  resetRateControl();
   avcHeader = null;
   forceNextKeyframe = true;
   placeholderImageUrl = message.placeholderUrl || "";

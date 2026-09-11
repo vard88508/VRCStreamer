@@ -887,6 +887,7 @@ function videoStatsSection(video) {
   return statsSection("VIDEO", [
     "Codec: H.264",
     `Rate control: adaptive quantizer (QP ${video.quantizer ?? "-"}, limit ${video.limitKbps?.toFixed(0) || "-"} kbps)`,
+    `Blocked QP: ${video.minQuantizer > 0 ? video.minQuantizer - 1 : "-"}`,
     `Quantizer adjustments: ${video.quantizerAdjustments || 0}`,
     `Output: ${app.config.videoWidth}×${app.config.videoHeight} @ ${app.config.videoFps} FPS`,
     `Capture track: ${captureSize} @ ${videoFpsLabel(video.trackFps)} FPS (${video.trackResizeMode || "unknown"})`,
