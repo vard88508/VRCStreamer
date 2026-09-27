@@ -5,12 +5,11 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
-RUN cargo build --release --bin VRCStreamer
+RUN cargo build --release --bin VRCast
 
 FROM gcr.io/distroless/cc-debian13 AS runtime
 WORKDIR /app
-COPY --from=builder /app/target/release/VRCStreamer .
-COPY placeholders ./placeholders
+COPY --from=builder /app/target/release/VRCast .
 
 EXPOSE 80 443 554
 
@@ -21,4 +20,4 @@ ENV TLS_KEY_PATH=none
 ENV RTSP_BIND_ADDR="0.0.0.0:554"
 ENV RUST_LOG="warn"
 
-CMD ["./VRCStreamer"]
+CMD ["./VRCast"]

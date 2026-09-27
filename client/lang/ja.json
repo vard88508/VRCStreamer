@@ -1,4 +1,8 @@
 {
+  "streamModeTitle": "配信",
+  "streamModeAudio": "音声",
+  "streamModeVideo": "音声 + 映像",
+  "backButton": "戻る",
   "customServerApiPlaceholder": "HTTP API アドレス",
   "streamUrlCopyHint": "クリックでコピー",
   "customServerConnectButton": "接続",

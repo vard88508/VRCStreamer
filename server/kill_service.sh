@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SERVICE_NAME="VRCStreamer"
+SERVICE_NAME="VRCast"
 UNIT_FILE="/etc/systemd/system/$SERVICE_NAME.service"
 
 if [ "$(id -u)" -ne 0 ]; then

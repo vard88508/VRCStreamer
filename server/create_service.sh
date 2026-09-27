@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SERVICE_NAME="VRCStreamer"
+SERVICE_NAME="VRCast"
 SERVER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN="$SERVER_DIR/VRCStreamer"
+BIN="$SERVER_DIR/VRCast"
 ENV_FILE="$SERVER_DIR/.env"
+CONF_FILE="$SERVER_DIR/VRCast.conf"
 UNIT_FILE="/etc/systemd/system/$SERVICE_NAME.service"
 
 case "$SERVER_DIR" in
@@ -20,7 +21,7 @@ if [ ! -x "$BIN" ]; then
   exit 1
 fi
 
-if [ ! -f "$ENV_FILE" ]; then
+if [ ! -f "$ENV_FILE" ] && [ ! -f "$CONF_FILE" ]; then
   if [ -f "$SERVER_DIR/.env.example" ]; then
     cp "$SERVER_DIR/.env.example" "$ENV_FILE"
   fi
@@ -35,14 +36,13 @@ fi
 
 tee "$UNIT_FILE" >/dev/null <<SERVICE
 [Unit]
-Description=VRCStreamer
+Description=VRCast
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=$SERVER_DIR
-EnvironmentFile=$ENV_FILE
 ExecStart=$BIN
 Restart=always
 RestartSec=2

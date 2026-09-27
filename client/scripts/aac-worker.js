@@ -5,7 +5,6 @@ let sampleRate = 48000;
 let channels = 2;
 let bitrate = 320000;
 let expectedAacConfigHex = "1190";
-let nativeAacBitrates = [320000, 256000, 192000, 160000, 128000, 96000];
 let nativeEncoder = null;
 let nativeS16Scratch = null;
 
@@ -30,11 +29,6 @@ function errorText(error) {
   return error.message || String(error);
 }
 
-function limitText(text, maxLength = 220) {
-  const value = String(text || "");
-  return value.length <= maxLength ? value : value.slice(0, maxLength - 1) + "...";
-}
-
 function kbps(value) {
   return `${Math.round(value / 1000)} kbps`;
 }
@@ -46,42 +40,13 @@ function bytesToHex(bytes) {
 }
 
 function nativeAacConfigs() {
-  const configs = [];
-  for (const candidateBitrate of nativeAacBitrates) {
-    const base = {
-      codec: "mp4a.40.2",
-      sampleRate,
-      numberOfChannels: channels,
-      bitrate: candidateBitrate
-    };
-    configs.push([
-      `raw AAC + CBR ${kbps(candidateBitrate)}`,
-      { ...base, bitrateMode: "constant", aac: { format: "aac" } }
-    ]);
-    configs.push([
-      `raw AAC ${kbps(candidateBitrate)}`,
-      { ...base, aac: { format: "aac" } }
-    ]);
-    configs.push([
-      `default AAC + CBR ${kbps(candidateBitrate)}`,
-      { ...base, bitrateMode: "constant" }
-    ]);
-    configs.push([
-      `default AAC ${kbps(candidateBitrate)}`,
-      base
-    ]);
-  }
-  if (nativeAacBitrates.length === 0) {
-    configs.push([
-      "raw AAC browser default bitrate",
-      { codec: "mp4a.40.2", sampleRate, numberOfChannels: channels, aac: { format: "aac" } }
-    ]);
-    configs.push([
-      "default AAC browser default bitrate",
-      { codec: "mp4a.40.2", sampleRate, numberOfChannels: channels }
-    ]);
-  }
-  return configs;
+  const base = { codec: "mp4a.40.2", sampleRate, numberOfChannels: channels, bitrate };
+  return [
+    [`raw AAC + CBR ${kbps(bitrate)}`, { ...base, bitrateMode: "constant", aac: { format: "aac" } }],
+    [`raw AAC ${kbps(bitrate)}`, { ...base, aac: { format: "aac" } }],
+    [`default AAC + CBR ${kbps(bitrate)}`, { ...base, bitrateMode: "constant" }],
+    [`default AAC ${kbps(bitrate)}`, base],
+  ];
 }
 
 function copyEncodedChunk(chunk) {
@@ -117,7 +82,9 @@ async function probeNativeAacEncoder(config) {
   let configHex = "";
   let encoderError = null;
   let finishProbe = null;
-  const probeDone = new Promise(resolve => { finishProbe = resolve; });
+  const probeDone = new Promise((resolve) => {
+    finishProbe = resolve;
+  });
   const encoder = new AudioEncoder({
     output(chunk, metadata) {
       if (!firstPacket) firstPacket = copyEncodedChunk(chunk);
@@ -128,7 +95,7 @@ async function probeNativeAacEncoder(config) {
     error(error) {
       encoderError = error;
       finishProbe();
-    }
+    },
   });
 
   try {
@@ -139,15 +106,17 @@ async function probeNativeAacEncoder(config) {
         sampleRate,
         numberOfFrames: 1024,
         numberOfChannels: channels,
-        timestamp: Math.round(i * 1024 * 1000000 / sampleRate),
-        data: new Int16Array(1024 * channels).buffer
+        timestamp: Math.round((i * 1024 * 1000000) / sampleRate),
+        data: new Int16Array(1024 * channels).buffer,
       });
       encoder.encode(audioData);
       audioData.close();
     }
-    await Promise.race([probeDone, new Promise(resolve => setTimeout(resolve, 1500))]);
+    await Promise.race([probeDone, new Promise((resolve) => setTimeout(resolve, 1500))]);
   } finally {
-    try { encoder.close(); } catch (_) {}
+    try {
+      encoder.close();
+    } catch (_) {}
   }
 
   if (encoderError) throw encoderError;
@@ -203,7 +172,7 @@ async function initNative() {
       const description = metadata && metadata.decoderConfig && metadata.decoderConfig.description;
       if (description) configHex = bytesToHex(new Uint8Array(description));
 
-      const rtpTimestamp = Math.round(chunk.timestamp * sampleRate / 1000000) >>> 0;
+      const rtpTimestamp = Math.round((chunk.timestamp * sampleRate) / 1000000) >>> 0;
       const packet = createMediaPacket(chunk.byteLength, rtpTimestamp);
       chunk.copyTo(packet.subarray(MEDIA_FRAME_HEADER_BYTES));
       try {
@@ -219,14 +188,14 @@ async function initNative() {
           packet: packet.buffer,
           bytes: chunk.byteLength,
           timestamp: rtpTimestamp,
-          queue: nativeEncoder ? nativeEncoder.encodeQueueSize : 0
+          queue: nativeEncoder ? nativeEncoder.encodeQueueSize : 0,
         },
-        [packet.buffer]
+        [packet.buffer],
       );
     },
     error(error) {
       if (mode === "native") self.postMessage({ type: "error", message: errorText(error) });
-    }
+    },
   });
 
   encoder.configure(config);
@@ -236,7 +205,6 @@ async function initNative() {
     type: "ready",
     name: "Native WebCodecs AAC",
     detail: label,
-    fallbackReason: ""
   });
 }
 
@@ -248,8 +216,8 @@ function encodeNative(pcm, timestampSamples) {
     sampleRate,
     numberOfFrames: frameCount,
     numberOfChannels: channels,
-    timestamp: Math.round(timestampSamples * 1000000 / sampleRate),
-    data: float32ToS16View(pcm)
+    timestamp: Math.round((timestampSamples * 1000000) / sampleRate),
+    data: float32ToS16View(pcm),
   });
   nativeEncoder.encode(audioData);
   audioData.close();
@@ -257,14 +225,16 @@ function encodeNative(pcm, timestampSamples) {
 
 function closeNative() {
   if (!nativeEncoder) return;
-  try { nativeEncoder.close(); } catch (_) {}
+  try {
+    nativeEncoder.close();
+  } catch (_) {}
   nativeEncoder = null;
   nativeS16Scratch = null;
 }
 
 async function ensureModule() {
   if (module) return module;
-  if (!modulePromise) modulePromise = import("./vendor/mediabunny-aac.js").then(mod => mod.default());
+  if (!modulePromise) modulePromise = import("./vendor/mediabunny-aac.js").then((mod) => mod.default());
   module = await modulePromise;
   initEncoderFn = module.cwrap("init_encoder", "number", ["number", "number", "number"]);
   getEncoderFrameSizeFn = module.cwrap("get_encoder_frame_size", "number", ["number"]);
@@ -288,16 +258,19 @@ function drainWasmPackets() {
 
     const packet = createMediaPacket(size, pts >>> 0);
     packet.set(module.HEAPU8.subarray(ptr, ptr + size), MEDIA_FRAME_HEADER_BYTES);
-    self.postMessage({
-      type: "packet",
-      packet: packet.buffer,
-      bytes: size,
-      timestamp: pts >>> 0
-    }, [packet.buffer]);
+    self.postMessage(
+      {
+        type: "packet",
+        packet: packet.buffer,
+        bytes: size,
+        timestamp: pts >>> 0,
+      },
+      [packet.buffer],
+    );
   }
 }
 
-async function initWasm(fallbackReason) {
+async function initWasm() {
   await ensureModule();
   ctx = initEncoderFn(channels, sampleRate, bitrate);
   if (ctx === 0) throw new Error("Failed to initialize AAC encoder.");
@@ -318,8 +291,7 @@ async function initWasm(fallbackReason) {
     type: "ready",
     name: "WASM AAC",
     detail: kbps(bitrate),
-    fallbackReason,
-    configHex
+    configHex,
   });
 }
 
@@ -359,33 +331,14 @@ function close() {
   closeWasm();
 }
 
-async function flush() {
-  if (mode === "native" && nativeEncoder) await nativeEncoder.flush();
-  else if (mode === "wasm") drainWasmPackets();
-  self.postMessage({ type: "flushed" });
-}
-
 async function init(message) {
   close();
   sampleRate = message.sampleRate;
   channels = message.channels;
   bitrate = message.bitrate;
   expectedAacConfigHex = message.expectedAacConfigHex || expectedAacConfigHex;
-  nativeAacBitrates = message.nativeAacBitrates || nativeAacBitrates;
-
-  if (message.preferNative === false) {
-    await initWasm("");
-    return;
-  }
-
-  try {
-    await initNative();
-  } catch (error) {
-    if (message.allowWasmFallback === false) throw error;
-    const fallbackReason = limitText(errorText(error));
-    closeNative();
-    await initWasm(fallbackReason);
-  }
+  if (message.native) await initNative();
+  else await initWasm();
 }
 
 function encode(pcm, timestampSamples) {
@@ -397,7 +350,7 @@ function encode(pcm, timestampSamples) {
   else throw new Error("AAC encoder is not initialized.");
 }
 
-self.onmessage = event => {
+self.onmessage = (event) => {
   const message = event.data;
   Promise.resolve()
     .then(async () => {
@@ -406,13 +359,11 @@ self.onmessage = event => {
         encode(message.pcm, Number(message.timestampSamples));
         self.postMessage({
           type: "consumed",
-          queue: mode === "native" && nativeEncoder ? nativeEncoder.encodeQueueSize : 0
+          queue: mode === "native" && nativeEncoder ? nativeEncoder.encodeQueueSize : 0,
         });
-      }
-      else if (message.type === "flush") await flush();
-      else if (message.type === "close") close();
+      } else if (message.type === "close") close();
     })
-    .catch(error => {
+    .catch((error) => {
       self.postMessage({ type: "error", message: errorText(error) });
     });
 };

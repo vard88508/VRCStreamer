@@ -1,13 +1,12 @@
 use std::{
     fmt::{self, Write as _},
-    future::pending,
+    future::{Future, pending},
     io::ErrorKind,
     pin::Pin,
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
 };
 
-use bytes::Bytes;
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, tcp::OwnedWriteHalf},
@@ -18,40 +17,38 @@ use tokio::{
 use tracing::{debug, info, trace, warn};
 
 use super::limits::{
-    ConnectionGuard, ListenerIpGuard, try_acquire_connection, try_acquire_listener_ip,
+    ConnectionGuard, ListenerIpGuard, TokenBucket, try_acquire_connection, try_acquire_listener_ip,
 };
 use super::media::{AudioMessage, VideoMessage, find_h264_start_code, start_h264_payload};
 use super::{
     AAC_AUDIO_SPECIFIC_CONFIG, AAC_CHANNELS, AAC_FRAME_DURATION, AAC_SAMPLE_RATE,
     AAC_SAMPLES_PER_FRAME, AAC_SILENCE_ACCESS_UNIT, AppState, Channel, H264_CLOCK_RATE,
-    MEDIA_CLOCK_RATE, Placeholders, RTCP_REPORT_INTERVAL, RTP_AUDIO_PAYLOAD_TYPE, RTP_AUDIO_SSRC,
+    MEDIA_CLOCK_RATE, RTCP_REPORT_INTERVAL, RTP_AUDIO_PAYLOAD_TYPE, RTP_AUDIO_SSRC,
     RTP_MAX_PAYLOAD_BYTES, RTP_VIDEO_PAYLOAD_TYPE, RTP_VIDEO_SSRC, RTSP_DISCARD_BUFFER_BYTES,
     RTSP_MAX_BODY_BYTES, RTSP_MAX_HEADER_BYTES, RTSP_MAX_HEADERS, RTSP_MAX_INTERLEAVED_BYTES,
-    RTSP_MAX_LINE_BYTES, cleanup_channel, limit_allows, peer_id, reserve_channel,
+    RTSP_MAX_LINE_BYTES, StreamMode, cleanup_channel, limit_allows, peer_id, reserve_channel,
     stream_id_for_log, valid_hash,
 };
 
-type SharedRtspWriter = Arc<Mutex<OwnedWriteHalf>>;
+// Take the socket while writing and return it only on success. Cancellation closes it.
+type SharedRtspWriter = Arc<Mutex<Option<OwnedWriteHalf>>>;
 type RtspResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const RTCP_SENDER_REPORT: u8 = 200;
 const RTCP_SOURCE_DESCRIPTION: u8 = 202;
+pub(crate) const RTSP_CONTROL_MESSAGES_PER_SECOND: usize = 16;
+pub(crate) const RTSP_CONTROL_BURST_SECS: usize = 2;
 const NTP_UNIX_EPOCH_OFFSET: u64 = 2_208_988_800;
 const MAX_AUDIO_BACKLOG_FRAMES: usize = 12;
 const MAX_VIDEO_BACKLOG_AGE: Duration = Duration::from_secs(1);
 const RTP_PACKET_BUFFER_BYTES: usize = 4 + 12 + RTP_MAX_PAYLOAD_BYTES;
 const RTP_TCP_WRITE_BATCH_BYTES: usize = 16 * 1024;
 const MEDIA_TIMELINE_REANCHOR_TICKS: i64 = MEDIA_CLOCK_RATE as i64 * 60 * 30;
+const RTSP_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const RTSP_MAX_LEADING_NEWLINES: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RtspTrack {
     Audio,
-    Video,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VideoStreamState {
-    Offline,
-    AudioOnly,
     Video,
 }
 
@@ -105,14 +102,14 @@ async fn handle_rtsp_client(
 ) -> RtspResult<()> {
     stream.set_nodelay(true)?;
     let (read_half, write_half) = stream.into_split();
-    let writer = Arc::new(Mutex::new(write_half));
+    let writer = Arc::new(Mutex::new(Some(write_half)));
     let mut reader = BufReader::with_capacity(RTSP_MAX_LINE_BYTES, read_half);
     let mut session = RtspSession {
         _listener_ip_guard: listener_ip_guard,
         ..RtspSession::default()
     };
     let handshake_deadline = TokioInstant::now() + state.config.rtsp_handshake_timeout;
-    let mut requests = 0usize;
+    let mut control_ingest = TokenBucket::new();
     loop {
         let input = if session.media_rtp_task.is_none() {
             let now = TokioInstant::now();
@@ -137,16 +134,14 @@ async fn handle_rtsp_client(
         let Some(input) = input else {
             break;
         };
+        // Count RTCP as well as commands; a long-lived session has no lifetime request cap.
+        if !control_ingest.allow(1, RTSP_CONTROL_MESSAGES_PER_SECOND, RTSP_CONTROL_BURST_SECS) {
+            return Err("rtsp control message rate exceeded".into());
+        }
         let request = match input {
             RtspInput::Request(request) => request,
             RtspInput::Interleaved => continue,
         };
-        requests = requests.saturating_add(1);
-        if state.config.max_rtsp_requests_per_connection != 0
-            && requests > state.config.max_rtsp_requests_per_connection
-        {
-            return Err("too many rtsp requests on one connection".into());
-        }
         if handle_rtsp_request(&request, &writer, &state, &mut session, peer).await? {
             break;
         }
@@ -174,10 +169,6 @@ async fn handle_rtsp_request(
         headers = ?RtspHeadersForLog(&request.headers),
         "rtsp request headers"
     );
-    if !session.androidx_media3 && request.is_androidx_media3() {
-        session.androidx_media3 = true;
-        debug!(%peer, "rtsp AndroidX Media3 compatibility enabled");
-    }
     match request.method.as_str() {
         "OPTIONS" => {
             write_rtsp_response(
@@ -193,20 +184,35 @@ async fn handle_rtsp_request(
             .await?;
         }
         "DESCRIBE" => {
-            let Some(key) = key_from_rtsp_uri(&request.uri) else {
+            let Some(target) =
+                parse_rtsp_target(&request.uri).filter(|target| target.track.is_none())
+            else {
                 write_rtsp_response(writer, "400 Bad Request", cseq, &[], None).await?;
                 return Ok(false);
             };
-            if !valid_hash(key) {
-                write_rtsp_response(writer, "400 Bad Request", cseq, &[], None).await?;
+            if session.guard.is_some() {
+                write_rtsp_response(
+                    writer,
+                    "455 Method Not Valid In This State",
+                    cseq,
+                    &[],
+                    None,
+                )
+                .await?;
                 return Ok(false);
             }
-
+            let key = target.key;
+            let description = video_description(state, key, target.audio_only).await;
+            let Ok((video_fmtp, epoch)) = description else {
+                write_rtsp_response(writer, "503 Service Unavailable", cseq, &[], None).await?;
+                return Ok(false);
+            };
             session.key = Some(key.to_owned());
+            session.audio_only = target.audio_only;
+            session.described_epoch = epoch;
+            session.video_advertised = video_fmtp.is_some();
             let content_base = rtsp_content_base(&request.uri);
-            let (video_state, video_fmtp) = rtsp_video_description(state, key);
-            session.video_omitted = !should_advertise_video(session.androidx_media3, video_state);
-            let sdp = rtsp_sdp(session.video_advertised().then_some(video_fmtp.as_ref()));
+            let sdp = rtsp_sdp(video_fmtp.as_deref());
             write_rtsp_response(
                 writer,
                 "200 OK",
@@ -220,41 +226,14 @@ async fn handle_rtsp_request(
             .await?;
         }
         "SETUP" => {
-            let Some(key) = key_from_rtsp_uri(&request.uri)
-                .map(str::to_owned)
-                .or_else(|| session.key.clone())
-            else {
+            let Some(target) = parse_rtsp_target(&request.uri) else {
                 write_rtsp_response(writer, "400 Bad Request", cseq, &[], None).await?;
                 return Ok(false);
             };
-            if !valid_hash(&key) {
-                write_rtsp_response(writer, "400 Bad Request", cseq, &[], None).await?;
-                return Ok(false);
-            }
-
-            let transport = request.header("transport").unwrap_or_default();
-            if !transport.to_ascii_lowercase().contains("rtp/avp/tcp") {
-                write_rtsp_response(writer, "461 Unsupported Transport", cseq, &[], None).await?;
-                return Ok(false);
-            }
-
-            let track = rtsp_track_from_uri(&request.uri, session.video_advertised());
-
-            if session.guard.is_none() {
-                match subscribe_listener(state, &key) {
-                    Ok(subscription) => {
-                        session.audio_rx = Some(subscription.audio_rx);
-                        if session.video_advertised() {
-                            session.video_rx = Some(subscription.video_rx);
-                        }
-                        session.guard = Some(subscription.guard);
-                    }
-                    Err(status) => {
-                        write_rtsp_response(writer, status, cseq, &[], None).await?;
-                        return Ok(false);
-                    }
-                }
-            } else if session.key.as_deref() != Some(key.as_str()) {
+            if session.key.as_deref() != Some(target.key)
+                || session.audio_only != target.audio_only
+                || !session.media_rtp_task.is_none()
+            {
                 write_rtsp_response(
                     writer,
                     "455 Method Not Valid In This State",
@@ -264,6 +243,42 @@ async fn handle_rtsp_request(
                 )
                 .await?;
                 return Ok(false);
+            }
+            let key = target.key;
+            let track = match target.track {
+                Some(0) if session.video_advertised => RtspTrack::Video,
+                Some(id) if id == usize::from(session.video_advertised) => RtspTrack::Audio,
+                _ => {
+                    write_rtsp_response(writer, "404 Not Found", cseq, &[], None).await?;
+                    return Ok(false);
+                }
+            };
+
+            let transport = request.header("transport").unwrap_or_default();
+            if !transport.to_ascii_lowercase().contains("rtp/avp/tcp") {
+                write_rtsp_response(writer, "461 Unsupported Transport", cseq, &[], None).await?;
+                return Ok(false);
+            }
+
+            if session.guard.is_none() {
+                let mode = if session.video_advertised {
+                    StreamMode::Video
+                } else {
+                    StreamMode::Audio
+                };
+                match subscribe_listener(state, key, mode) {
+                    Ok(subscription) => {
+                        session.audio_rx = Some(subscription.audio_rx);
+                        if session.video_advertised {
+                            session.video_rx = Some(subscription.video_rx);
+                        }
+                        session.guard = Some(subscription.guard);
+                    }
+                    Err(status) => {
+                        write_rtsp_response(writer, status, cseq, &[], None).await?;
+                        return Ok(false);
+                    }
+                }
             }
 
             if session.id.is_none() {
@@ -276,7 +291,6 @@ async fn handle_rtsp_request(
                 track,
                 parse_interleaved_channel(transport),
             );
-            session.key = Some(key.clone());
             let (track_name, ssrc) = match track {
                 RtspTrack::Audio => {
                     session.audio_setup = true;
@@ -307,7 +321,7 @@ async fn handle_rtsp_request(
             .await?;
             info!(
                 %peer,
-                stream_id = %stream_id_for_log(&key),
+                stream_id = %stream_id_for_log(key),
                 track = track_name,
                 rtp_channel,
                 "rtsp media setup"
@@ -334,6 +348,22 @@ async fn handle_rtsp_request(
                 write_rtsp_response(writer, "454 Session Not Found", cseq, &[], None).await?;
                 return Ok(false);
             };
+
+            if !session.audio_only
+                && (stream.mode() == Some(StreamMode::Video)) != session.video_advertised
+                || session.video_advertised
+                    && stream.generation.load(Ordering::Acquire) != session.described_epoch
+            {
+                write_rtsp_response(
+                    writer,
+                    "455 Method Not Valid In This State",
+                    cseq,
+                    &[],
+                    None,
+                )
+                .await?;
+                return Ok(true);
+            }
 
             let start_media = session.media_rtp_task.is_none();
             let audio = if start_media && session.audio_setup {
@@ -384,13 +414,14 @@ async fn handle_rtsp_request(
                     .media_rtp_task
                     .start(tokio::spawn(rtsp_media_rtp_task(RtspMediaTask {
                         writer: writer.clone(),
-                        state: state.clone(),
                         stream,
                         key,
                         peer: peer.to_owned(),
                         audio,
                         video,
-                        suppress_placeholders: session.androidx_media3,
+                        audio_only: session.audio_only,
+                        video_session: session.video_advertised,
+                        epoch: session.described_epoch,
                     })));
             }
         }
@@ -426,6 +457,7 @@ async fn handle_rtsp_request(
 fn subscribe_listener(
     state: &Arc<AppState>,
     key: &str,
+    mode: StreamMode,
 ) -> Result<ListenerSubscription, &'static str> {
     if state
         .active_listeners
@@ -459,7 +491,9 @@ fn subscribe_listener(
         state: state.clone(),
         key: key.to_owned(),
         channel,
+        mode,
     };
+    state.listeners.counter(mode).fetch_add(1, Ordering::AcqRel);
     Ok(ListenerSubscription {
         audio_rx,
         video_rx,
@@ -487,19 +521,20 @@ struct RtspVideoTrackStart {
 
 struct RtspMediaTask {
     writer: SharedRtspWriter,
-    state: Arc<AppState>,
     stream: Arc<Channel>,
     key: String,
     peer: String,
     audio: Option<RtspAudioTrackStart>,
     video: Option<RtspVideoTrackStart>,
-    suppress_placeholders: bool,
+    audio_only: bool,
+    video_session: bool,
+    epoch: usize,
 }
 
 struct RtpTaskContext<'a> {
     writer: &'a SharedRtspWriter,
     stream: &'a Channel,
-    resync_epoch: usize,
+    generation: usize,
     key: &'a str,
     peer: &'a str,
 }
@@ -539,6 +574,8 @@ impl AudioRtpTrack {
     fn resync(&mut self, stream: &Channel) {
         self.rx = stream.audio_tx.subscribe();
         self.next_send_at = TokioInstant::now();
+        // Preserve the next AAC timestamp when a new streamer replaces silence.
+        self.clock = RtpClock::new(self.rtp.timestamp, AAC_SAMPLE_RATE, self.next_send_at);
         self.silence_sleep.as_mut().reset(self.next_send_at);
     }
 
@@ -560,6 +597,9 @@ impl AudioRtpTrack {
         context: &RtpTaskContext<'_>,
         timeline: &mut RtpMediaTimeline,
     ) -> RtspResult<bool> {
+        if context.stream.generation.load(Ordering::Acquire) != context.generation {
+            return Ok(true);
+        }
         match event {
             AudioRtpEvent::Message(Ok(AudioMessage::Wake)) => {
                 self.next_send_at = TokioInstant::now();
@@ -570,11 +610,10 @@ impl AudioRtpTrack {
                 media_timestamp,
                 published_at,
             })) => {
-                if !context.stream.streamer.load(Ordering::Acquire) {
+                if context.stream.mode().is_none() {
                     return Ok(true);
                 }
-                self.rtp.timestamp =
-                    timeline.map(context.resync_epoch, media_timestamp, &self.clock);
+                self.rtp.timestamp = timeline.map(context.generation, media_timestamp, &self.clock);
                 let media_time = RtcpMediaTime::new(self.rtp.timestamp, published_at);
                 self.rtcp
                     .start_if_needed(
@@ -668,7 +707,6 @@ struct VideoRtpTrack {
     rtp: RtpState,
     clock: RtpClock,
     seen_keyframe: bool,
-    last_state: Option<VideoStreamState>,
     rtcp: RtcpReporter,
     rtcp_sleep: Pin<Box<Sleep>>,
     packets: usize,
@@ -683,7 +721,6 @@ impl VideoRtpTrack {
             rtp: start.rtp,
             clock: RtpClock::new(start.rtp.timestamp, H264_CLOCK_RATE, play_started_at),
             seen_keyframe: false,
-            last_state: None,
             rtcp: RtcpReporter::new(RTP_VIDEO_SSRC, H264_CLOCK_RATE),
             rtcp_sleep: Box::pin(sleep_until(TokioInstant::now() + RTCP_REPORT_INTERVAL)),
             packets: 0,
@@ -692,68 +729,21 @@ impl VideoRtpTrack {
         }
     }
 
-    fn resync(&mut self, stream: &Channel) {
-        self.rx = stream.video_tx.subscribe();
-        self.seen_keyframe = false;
-        self.last_state = None;
-    }
-
-    async fn sync_state(
-        &mut self,
-        writer: &SharedRtspWriter,
-        placeholders: &Placeholders,
-        stream: &Channel,
-        key: &str,
-        suppress_placeholders: bool,
-    ) -> RtspResult<()> {
-        let current_state = channel_video_state(stream);
-        if self.last_state == Some(current_state) {
-            return Ok(());
-        }
-        self.seen_keyframe = false;
-        self.last_state = Some(current_state);
-        if current_state != VideoStreamState::Video {
-            self.sender.shrink_to_packet_buffer();
-        }
-        if suppress_placeholders {
-            return Ok(());
-        }
-        let Some(frame) = placeholder_access_unit(placeholders, current_state) else {
-            return Ok(());
-        };
-        self.rtp.timestamp = self.clock.timestamp();
-        let media_time = RtcpMediaTime::new(self.rtp.timestamp, StdInstant::now());
-        self.rtcp
-            .start_if_needed(
-                &mut self.sender,
-                writer,
-                media_time,
-                &mut self.rtcp_sleep,
-                &self.rtp,
-                key,
-            )
-            .await?;
-        self.sender
-            .send_h264_access_unit(writer, frame, false, false, &mut self.rtp)
-            .await?;
-        self.rtcp.record(media_time);
-        self.packets += 1;
-        Ok(())
-    }
-
     async fn handle_event(
         &mut self,
         event: VideoRtpEvent,
         context: &RtpTaskContext<'_>,
         timeline: &mut RtpMediaTimeline,
     ) -> RtspResult<bool> {
+        if context.stream.generation.load(Ordering::Acquire) != context.generation {
+            return Ok(true);
+        }
         match event {
             VideoRtpEvent::Message(Ok(VideoMessage::Wake)) => {
                 self.seen_keyframe = false;
-                self.last_state = None;
             }
             VideoRtpEvent::Message(Ok(VideoMessage::Frame(frame))) => {
-                if channel_video_state(context.stream) != VideoStreamState::Video {
+                if context.stream.mode() != Some(StreamMode::Video) {
                     return Ok(true);
                 }
                 let queued = self.rx.len();
@@ -769,10 +759,6 @@ impl VideoRtpTrack {
                     );
                     return Ok(true);
                 }
-                if self.last_state != Some(VideoStreamState::Video) {
-                    self.seen_keyframe = false;
-                    self.last_state = Some(VideoStreamState::Video);
-                }
                 if frame.keyframe {
                     self.seen_keyframe = true;
                 }
@@ -780,7 +766,7 @@ impl VideoRtpTrack {
                     return Ok(true);
                 }
                 self.rtp.timestamp =
-                    timeline.map(context.resync_epoch, frame.media_timestamp, &self.clock);
+                    timeline.map(context.generation, frame.media_timestamp, &self.clock);
                 let media_time = RtcpMediaTime::new(self.rtp.timestamp, frame.published_at);
                 self.rtcp
                     .start_if_needed(
@@ -797,7 +783,6 @@ impl VideoRtpTrack {
                         context.writer,
                         &frame.access_unit,
                         frame.single_nal,
-                        true,
                         &mut self.rtp,
                     )
                     .await?;
@@ -848,32 +833,37 @@ async fn next_video_event(track: Option<&mut VideoRtpTrack>) -> VideoRtpEvent {
 async fn rtsp_media_rtp_task(task: RtspMediaTask) {
     let RtspMediaTask {
         writer,
-        state,
         stream,
         key,
         peer,
         audio,
         video,
-        suppress_placeholders,
+        audio_only,
+        video_session,
+        epoch,
     } = task;
     let play_started_at = TokioInstant::now();
     let mut timeline = RtpMediaTimeline::default();
     let mut audio = audio.map(|track| AudioRtpTrack::new(track, play_started_at));
     let mut video = video.map(|track| VideoRtpTrack::new(track, play_started_at));
-    let mut resync_epoch = stream.resync_epoch.load(Ordering::Acquire);
+    let mut generation = epoch;
     let stream_id = stream_id_for_log(&key);
 
     loop {
-        let current_resync_epoch = stream.resync_epoch.load(Ordering::Acquire);
-        if current_resync_epoch != resync_epoch {
+        let current_generation = stream.generation.load(Ordering::Acquire);
+        // A video session belongs to one streamer generation. Audio-only sessions stay alive.
+        if video_session
+            && (stream.mode() != Some(StreamMode::Video) || current_generation != epoch)
+            || !audio_only && !video_session && stream.mode() == Some(StreamMode::Video)
+        {
+            break;
+        }
+        if current_generation != generation {
             if let Some(track) = audio.as_mut() {
                 track.resync(&stream);
             }
-            if let Some(track) = video.as_mut() {
-                track.resync(&stream);
-            }
-            resync_epoch = current_resync_epoch;
-            debug!(%peer, %stream_id, epoch = current_resync_epoch, "rtsp listener force resynced");
+            generation = current_generation;
+            debug!(%peer, %stream_id, epoch = current_generation, "rtsp audio listener joined new stream generation");
         }
 
         if let Some(track) = audio.as_mut() {
@@ -882,60 +872,38 @@ async fn rtsp_media_rtp_task(task: RtspMediaTask) {
                 debug!(%peer, %stream_id, queued, "rtsp audio backlog dropped");
             }
         }
-        if let Some(track) = video.as_mut()
-            && let Err(error) = track
-                .sync_state(
-                    &writer,
-                    &state.placeholders,
-                    &stream,
-                    &key,
-                    suppress_placeholders,
-                )
-                .await
-        {
-            warn!(%peer, %stream_id, %error, "rtsp video placeholder writer failed");
-            break;
-        }
         if audio.is_none() && video.is_none() {
             break;
         }
 
-        let streamer_active = stream.streamer.load(Ordering::Acquire);
+        let streamer_active = stream.mode().is_some();
         let context = RtpTaskContext {
             writer: &writer,
             stream: &stream,
-            resync_epoch,
+            generation,
             key: &key,
             peer: &peer,
         };
-        tokio::select! {
+        let (track_name, result) = tokio::select! {
             event = next_audio_event(audio.as_mut(), streamer_active) => {
                 let Some(track) = audio.as_mut() else {
                     continue;
                 };
-                let result = track.handle_event(event, &context, &mut timeline).await;
-                match result {
-                    Ok(true) => {}
-                    Ok(false) => break,
-                    Err(error) => {
-                        warn!(%peer, %stream_id, %error, "rtsp audio writer failed");
-                        break;
-                    }
-                }
+                ("audio", with_write_timeout(track.handle_event(event, &context, &mut timeline)).await)
             }
             event = next_video_event(video.as_mut()) => {
                 let Some(track) = video.as_mut() else {
                     continue;
                 };
-                let result = track.handle_event(event, &context, &mut timeline).await;
-                match result {
-                    Ok(true) => {}
-                    Ok(false) => break,
-                    Err(error) => {
-                        warn!(%peer, %stream_id, %error, "rtsp video writer failed");
-                        break;
-                    }
-                }
+                ("video", with_write_timeout(track.handle_event(event, &context, &mut timeline)).await)
+            }
+        };
+        match result {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(error) => {
+                warn!(%peer, %stream_id, track = track_name, %error, "rtsp media writer failed");
+                break;
             }
         }
     }
@@ -957,29 +925,16 @@ async fn rtsp_media_rtp_task(task: RtspMediaTask) {
     );
 }
 
-enum RtspInput {
+pub(crate) enum RtspInput {
     Request(RtspRequest),
     Interleaved,
 }
 
-#[cfg(test)]
-pub(crate) async fn read_rtsp_request<R>(reader: &mut R) -> RtspResult<Option<RtspRequest>>
+pub(crate) async fn read_rtsp_input<R>(reader: &mut R) -> RtspResult<Option<RtspInput>>
 where
     R: AsyncBufRead + Unpin,
 {
-    loop {
-        match read_rtsp_input(reader).await? {
-            Some(RtspInput::Request(request)) => return Ok(Some(request)),
-            Some(RtspInput::Interleaved) => {}
-            None => return Ok(None),
-        }
-    }
-}
-
-async fn read_rtsp_input<R>(reader: &mut R) -> RtspResult<Option<RtspInput>>
-where
-    R: AsyncBufRead + Unpin,
-{
+    let mut leading_newlines = 0;
     loop {
         let Some(first) = read_one(reader).await? else {
             return Ok(None);
@@ -997,28 +952,30 @@ where
         }
 
         if first == b'\r' || first == b'\n' {
+            leading_newlines += 1;
+            if leading_newlines > RTSP_MAX_LEADING_NEWLINES {
+                return Err("too many leading rtsp newlines".into());
+            }
             continue;
         }
 
         let mut first_line = vec![first];
         read_until_limited(reader, b'\n', &mut first_line, RTSP_MAX_LINE_BYTES).await?;
         let first_line = String::from_utf8(first_line)?;
-        let mut parts = first_line.split_whitespace();
-        let Some(method) = parts.next() else {
-            continue;
-        };
-        let Some(uri) = parts.next() else {
-            continue;
-        };
-        let version = parts.next().unwrap_or("RTSP/1.0").to_owned();
+        let mut parts = first_line.split_ascii_whitespace();
+        let method = parts.next().ok_or("missing rtsp method")?;
+        let uri = parts.next().ok_or("missing rtsp uri")?;
+        if parts.next() != Some("RTSP/1.0") || parts.next().is_some() {
+            return Err("invalid rtsp request line".into());
+        }
         let mut headers = Vec::new();
         let mut header_bytes = 0usize;
-        let mut content_length = 0usize;
+        let mut content_length = None;
 
         loop {
             let mut line = Vec::new();
             let bytes = read_until_limited(reader, b'\n', &mut line, RTSP_MAX_LINE_BYTES).await?;
-            if bytes == 0 || line == b"\r\n" || line == b"\n" {
+            if line == b"\r\n" || line == b"\n" {
                 break;
             }
             if headers.len() >= RTSP_MAX_HEADERS {
@@ -1030,16 +987,33 @@ where
             }
 
             let line = String::from_utf8(line)?;
-            if let Some((name, value)) = line.split_once(':') {
-                let name = name.trim().to_ascii_lowercase();
-                let value = value.trim().to_owned();
-                if name == "content-length" {
-                    content_length = value.parse().unwrap_or(0);
-                }
-                headers.push((name, value));
+            let (name, value) = line.split_once(':').ok_or("invalid rtsp header")?;
+            let name = name.trim().to_ascii_lowercase();
+            let value = value.trim();
+            if name.is_empty()
+                || value
+                    .bytes()
+                    .any(|byte| byte.is_ascii_control() && byte != b'\t')
+            {
+                return Err("invalid rtsp header".into());
             }
+            if name == "content-length" {
+                if content_length.is_some()
+                    || value.is_empty()
+                    || !value.bytes().all(|byte| byte.is_ascii_digit())
+                {
+                    return Err("invalid rtsp content-length".into());
+                }
+                content_length = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| "invalid rtsp content-length")?,
+                );
+            }
+            headers.push((name, value.to_owned()));
         }
 
+        let content_length = content_length.unwrap_or(0);
         if content_length != 0 {
             if content_length > RTSP_MAX_BODY_BYTES {
                 return Err("rtsp request body too large".into());
@@ -1050,7 +1024,6 @@ where
         return Ok(Some(RtspInput::Request(RtspRequest {
             method: method.to_ascii_uppercase(),
             uri: uri.to_owned(),
-            _version: version,
             headers,
         })));
     }
@@ -1070,14 +1043,14 @@ where
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
-            return Ok(buffer.len().saturating_sub(started));
+            return Err(std::io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "incomplete rtsp line",
+            ));
         }
 
-        let take = available
-            .iter()
-            .position(|byte| *byte == delimiter)
-            .map_or(available.len(), |index| index + 1);
-        let found = available[..take].contains(&delimiter);
+        let delimiter_index = available.iter().position(|byte| *byte == delimiter);
+        let take = delimiter_index.map_or(available.len(), |index| index + 1);
 
         if buffer.len().saturating_add(take) > limit {
             return Err(std::io::Error::new(
@@ -1089,7 +1062,7 @@ where
         buffer.extend_from_slice(&available[..take]);
         reader.consume(take);
 
-        if found {
+        if delimiter_index.is_some() {
             return Ok(buffer.len().saturating_sub(started));
         }
     }
@@ -1120,6 +1093,15 @@ where
     }
 }
 
+// A partial TCP write cannot be skipped: callers must close the connection on failure.
+pub(crate) async fn with_write_timeout<T>(
+    write: impl Future<Output = RtspResult<T>>,
+) -> RtspResult<T> {
+    timeout(RTSP_WRITE_TIMEOUT, write)
+        .await
+        .map_err(|_| "rtsp write timeout")?
+}
+
 async fn write_rtsp_response(
     writer: &SharedRtspWriter,
     status: &str,
@@ -1129,7 +1111,7 @@ async fn write_rtsp_response(
 ) -> RtspResult<()> {
     let body_len = body.map_or(0, <[u8]>::len);
     let mut response = format!(
-        "RTSP/1.0 {status}\r\nCSeq: {cseq}\r\nServer: VRCStreamer\r\nCache-Control: no-cache\r\n"
+        "RTSP/1.0 {status}\r\nCSeq: {cseq}\r\nServer: VRCast\r\nCache-Control: no-cache\r\n"
     );
 
     for (name, value) in headers {
@@ -1147,13 +1129,17 @@ async fn write_rtsp_response(
 
     response.push_str("\r\n");
 
-    let mut writer = writer.lock().await;
-    writer.write_all(response.as_bytes()).await?;
-    if let Some(body) = body {
-        writer.write_all(body).await?;
-    }
-    writer.flush().await?;
-    Ok(())
+    with_write_timeout(async {
+        let mut slot = writer.lock().await;
+        let mut socket = slot.take().ok_or("rtsp writer is closed")?;
+        socket.write_all(response.as_bytes()).await?;
+        if let Some(body) = body {
+            socket.write_all(body).await?;
+        }
+        *slot = Some(socket);
+        Ok(())
+    })
+    .await
 }
 
 pub(crate) struct RtpPacketWriter {
@@ -1285,8 +1271,10 @@ impl RtpPacketWriter {
         self.packet.push(((au_size & 0x1f) << 3) as u8);
         self.packet.extend_from_slice(access_unit);
 
-        let mut writer = writer.lock().await;
-        writer.write_all(&self.packet).await?;
+        let mut slot = writer.lock().await;
+        let mut socket = slot.take().ok_or("rtsp writer is closed")?;
+        socket.write_all(&self.packet).await?;
+        *slot = Some(socket);
         rtp.advance_by(AAC_SAMPLES_PER_FRAME, 4 + access_unit.len());
         Ok(())
     }
@@ -1296,50 +1284,45 @@ impl RtpPacketWriter {
         writer: &SharedRtspWriter,
         access_unit: &[u8],
         single_nal: bool,
-        batch_writes: bool,
         rtp: &mut RtpState,
     ) -> RtspResult<()> {
         let mut nal_start = start_h264_payload(access_unit)?;
-        let mut locked = writer.lock().await;
-        let batch_limit = if batch_writes {
-            RTP_TCP_WRITE_BATCH_BYTES
-        } else {
-            RTP_PACKET_BUFFER_BYTES
-        };
+        let mut slot = writer.lock().await;
+        let mut socket = slot.take().ok_or("rtsp writer is closed")?;
+        let batch_limit = RTP_TCP_WRITE_BATCH_BYTES;
         self.packet.clear();
         if single_nal {
             self.send_h264_nal(
-                &mut locked,
+                &mut socket,
                 &access_unit[nal_start..],
                 true,
                 batch_limit,
                 rtp,
             )
             .await?;
-            return self.flush_h264_packets(&mut locked).await;
-        }
-
-        let mut pending = None;
-
-        loop {
-            let next = find_h264_start_code(access_unit, nal_start);
-            let nal_end = next.map_or(access_unit.len(), |(index, _)| index);
-            if nal_end > nal_start
-                && let Some(nal) = pending.replace(&access_unit[nal_start..nal_end])
-            {
-                self.send_h264_nal(&mut locked, nal, false, batch_limit, rtp)
-                    .await?;
+        } else {
+            let mut pending = None;
+            loop {
+                let next = find_h264_start_code(access_unit, nal_start);
+                let nal_end = next.map_or(access_unit.len(), |(index, _)| index);
+                if nal_end > nal_start
+                    && let Some(nal) = pending.replace(&access_unit[nal_start..nal_end])
+                {
+                    self.send_h264_nal(&mut socket, nal, false, batch_limit, rtp)
+                        .await?;
+                }
+                let Some((start, len)) = next else {
+                    break;
+                };
+                nal_start = start + len;
             }
-            let Some((start, len)) = next else {
-                break;
-            };
-            nal_start = start + len;
+            let nal = pending.ok_or("h264 access unit has no nal units")?;
+            self.send_h264_nal(&mut socket, nal, true, batch_limit, rtp)
+                .await?;
         }
-
-        let nal = pending.ok_or("h264 access unit has no nal units")?;
-        self.send_h264_nal(&mut locked, nal, true, batch_limit, rtp)
-            .await?;
-        self.flush_h264_packets(&mut locked).await
+        self.flush_h264_packets(&mut socket).await?;
+        *slot = Some(socket);
+        Ok(())
     }
 
     async fn send_h264_nal(
@@ -1416,11 +1399,6 @@ impl RtpPacketWriter {
         Ok(())
     }
 
-    fn shrink_to_packet_buffer(&mut self) {
-        self.packet.clear();
-        self.packet.shrink_to(RTP_PACKET_BUFFER_BYTES);
-    }
-
     async fn flush_h264_packets(&mut self, writer: &mut OwnedWriteHalf) -> RtspResult<()> {
         if !self.packet.is_empty() {
             writer.write_all(&self.packet).await?;
@@ -1450,8 +1428,10 @@ impl RtpPacketWriter {
             rtp,
             cname,
         );
-        let mut writer = writer.lock().await;
-        writer.write_all(&self.packet).await?;
+        let mut slot = writer.lock().await;
+        let mut socket = slot.take().ok_or("rtsp writer is closed")?;
+        socket.write_all(&self.packet).await?;
+        *slot = Some(socket);
         Ok(())
     }
 
@@ -1567,7 +1547,15 @@ fn rtsp_content_base(uri: &str) -> String {
     base
 }
 
-pub(crate) fn key_from_rtsp_uri(uri: &str) -> Option<&str> {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RtspTarget<'a> {
+    pub(crate) key: &'a str,
+    pub(crate) audio_only: bool,
+    pub(crate) track: Option<usize>,
+}
+
+pub(crate) fn parse_rtsp_target(uri: &str) -> Option<RtspTarget<'_>> {
+    let uri = uri.split(['?', '#']).next()?;
     let path = if let Some((_, rest)) = uri.split_once("://") {
         let slash = rest.find('/')?;
         &rest[slash..]
@@ -1575,25 +1563,31 @@ pub(crate) fn key_from_rtsp_uri(uri: &str) -> Option<&str> {
         uri
     };
 
-    path.trim_start_matches('/')
-        .split(['/', '?', '#'])
-        .next()
-        .filter(|value| !value.is_empty())
+    let mut parts = path.trim_matches('/').split('/');
+    let key = parts.next().filter(|key| valid_hash(key))?;
+    let mut next = parts.next();
+    let audio_only = next == Some("audio");
+    if audio_only {
+        next = parts.next();
+    }
+    let track = match next {
+        Some("trackID=0") => Some(0),
+        Some("trackID=1") => Some(1),
+        None => None,
+        _ => return None,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(RtspTarget {
+        key,
+        audio_only,
+        track,
+    })
 }
 
-pub(crate) fn rtsp_track_from_uri(uri: &str, video_advertised: bool) -> RtspTrack {
-    if video_advertised
-        && uri
-            .split(['?', '#'])
-            .next()
-            .unwrap_or(uri)
-            .rsplit('/')
-            .next()
-            .is_some_and(|segment| segment.eq_ignore_ascii_case("trackID=0"))
-    {
-        return RtspTrack::Video;
-    }
-    RtspTrack::Audio
+pub(crate) fn key_from_rtsp_uri(uri: &str) -> Option<&str> {
+    parse_rtsp_target(uri).map(|target| target.key)
 }
 
 pub(crate) fn rtsp_rtp_info(uri: &str, session: &RtspSession) -> String {
@@ -1611,7 +1605,7 @@ pub(crate) fn rtsp_rtp_info(uri: &str, session: &RtspSession) -> String {
         if !out.is_empty() {
             out.push(',');
         }
-        let track_id = usize::from(session.video_advertised());
+        let track_id = usize::from(session.video_advertised);
         let _ = write!(
             out,
             "url={base}/trackID={track_id};seq={};rtptime={}",
@@ -1633,7 +1627,7 @@ pub(crate) fn select_rtsp_interleaved_channel(
     requested: Option<u8>,
 ) -> u8 {
     let preferred = requested.unwrap_or(match track {
-        RtspTrack::Audio if session.video_advertised() => 2,
+        RtspTrack::Audio if session.video_advertised => 2,
         RtspTrack::Audio => 0,
         RtspTrack::Video => 0,
     });
@@ -1673,17 +1667,11 @@ fn rtsp_channel_pairs_overlap(left: u8, right: u8) -> bool {
     left <= right + 1 && right <= left + 1
 }
 
-pub(crate) fn channel_video_state(channel: &Channel) -> VideoStreamState {
-    if !channel.streamer.load(Ordering::Acquire) {
-        VideoStreamState::Offline
-    } else if channel.video_active.load(Ordering::Acquire) {
-        VideoStreamState::Video
-    } else {
-        VideoStreamState::AudioOnly
-    }
-}
-
-fn rtsp_video_description(state: &AppState, key: &str) -> (VideoStreamState, Arc<str>) {
+async fn video_description(
+    state: &AppState,
+    key: &str,
+    audio_only: bool,
+) -> Result<(Option<Arc<str>>, usize), ()> {
     let channel = state
         .channels
         .read()
@@ -1691,40 +1679,31 @@ fn rtsp_video_description(state: &AppState, key: &str) -> (VideoStreamState, Arc
         .get(key)
         .cloned();
     let Some(channel) = channel else {
-        return (
-            VideoStreamState::Offline,
-            state.placeholders.offline_fmtp.clone(),
-        );
+        return Ok((None, 0));
     };
-
-    let video_state = channel_video_state(&channel);
-    let fmtp = match video_state {
-        VideoStreamState::Video => channel
-            .video_fmtp()
-            .unwrap_or_else(|| state.placeholders.audio_only_fmtp.clone()),
-        VideoStreamState::AudioOnly => state.placeholders.audio_only_fmtp.clone(),
-        VideoStreamState::Offline => state.placeholders.offline_fmtp.clone(),
-    };
-    (video_state, fmtp)
-}
-
-pub(crate) fn should_advertise_video(androidx_media3: bool, state: VideoStreamState) -> bool {
-    !androidx_media3 || state == VideoStreamState::Video
-}
-
-pub(crate) fn placeholder_access_unit(
-    placeholders: &Placeholders,
-    state: VideoStreamState,
-) -> Option<&Bytes> {
-    match state {
-        VideoStreamState::Offline if !placeholders.offline_video.is_empty() => {
-            Some(&placeholders.offline_video)
-        }
-        VideoStreamState::AudioOnly if !placeholders.audio_only_video.is_empty() => {
-            Some(&placeholders.audio_only_video)
-        }
-        _ => None,
+    let epoch = channel.generation.load(Ordering::Acquire);
+    if audio_only || channel.mode() != Some(StreamMode::Video) {
+        return Ok((None, epoch));
     }
+    // Never advertise a temporary audio track or invented SPS/PPS while video starts.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let changed = channel.configuration_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if channel.generation.load(Ordering::Acquire) != epoch
+                || channel.mode() != Some(StreamMode::Video)
+            {
+                return Err(());
+            }
+            if let Some(fmtp) = channel.video_fmtp() {
+                return Ok((Some(fmtp), epoch));
+            }
+            changed.await;
+        }
+    })
+    .await
+    .map_err(|_| ())?
 }
 
 #[derive(Default)]
@@ -1742,15 +1721,12 @@ pub(crate) struct RtspSession {
     pub(crate) video_channel: u8,
     pub(crate) audio_rtp: RtpState,
     pub(crate) video_rtp: RtpState,
-    pub(crate) androidx_media3: bool,
-    pub(crate) video_omitted: bool,
+    pub(crate) audio_only: bool,
+    pub(crate) video_advertised: bool,
+    pub(crate) described_epoch: usize,
 }
 
 impl RtspSession {
-    fn video_advertised(&self) -> bool {
-        !self.video_omitted
-    }
-
     fn stop(&mut self) {
         self.media_rtp_task.stop();
     }
@@ -1866,12 +1842,6 @@ impl RtpClock {
         }
     }
 
-    fn timestamp(&self) -> u32 {
-        let ticks =
-            (self.started_at.elapsed().as_nanos() * self.clock_rate as u128 / 1_000_000_000) as u32;
-        self.base_timestamp.wrapping_add(ticks)
-    }
-
     fn media_timestamp(&self) -> i64 {
         (self.started_at.elapsed().as_nanos() * MEDIA_CLOCK_RATE as u128 / 1_000_000_000) as i64
     }
@@ -1886,7 +1856,6 @@ impl RtpClock {
 pub(crate) struct RtspRequest {
     pub(crate) method: String,
     pub(crate) uri: String,
-    _version: String,
     headers: Vec<(String, String)>,
 }
 
@@ -1896,11 +1865,6 @@ impl RtspRequest {
             .iter()
             .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
-    }
-
-    pub(crate) fn is_androidx_media3(&self) -> bool {
-        self.header("user-agent")
-            .is_some_and(|value| value.starts_with("AndroidXMedia3"))
     }
 }
 
@@ -1934,12 +1898,17 @@ pub(crate) struct ListenerGuard {
     state: Arc<AppState>,
     key: String,
     channel: Arc<Channel>,
+    mode: StreamMode,
 }
 
 impl Drop for ListenerGuard {
     fn drop(&mut self) {
         self.channel.listeners.fetch_sub(1, Ordering::AcqRel);
         self.state.active_listeners.fetch_sub(1, Ordering::AcqRel);
+        self.state
+            .listeners
+            .counter(self.mode)
+            .fetch_sub(1, Ordering::AcqRel);
         cleanup_channel(&self.state, &self.key, &self.channel);
     }
 }

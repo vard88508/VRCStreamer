@@ -1,22 +1,26 @@
+use super::config::{
+    DEFAULT_VIDEO_QUALITIES, H264_DEFAULT_MAX_ACCESS_UNIT_BYTES, H264_HARD_MAX_ACCESS_UNIT_BYTES,
+    parse_redirect_url, parse_video_qualities,
+};
 use super::limits::{
-    TokenBucket, allow_http_request, try_acquire_connection, try_acquire_listener_ip,
-    try_acquire_streamer_ip,
+    TokenBucket, try_acquire_connection, try_acquire_listener_ip, try_acquire_streamer_ip,
 };
 use super::media::{
-    StreamerMediaFrame, VideoMessage, h264_sdp_fmtp, parse_streamer_media_frame,
-    validate_aac_access_unit, validate_h264_access_unit,
+    StreamerMediaFrame, h264_sdp_fmtp, inspect_h264_access_unit, parse_streamer_media_frame,
+    validate_aac_access_unit,
 };
 use super::rtsp::{
-    RtpClock, RtpMediaTimeline, RtpPacketWriter, RtpState, RtspSession, RtspTrack,
-    VideoStreamState, build_rtcp_sender_report, channel_video_state, key_from_rtsp_uri,
-    placeholder_access_unit, project_rtp_timestamp, read_rtsp_request, rtsp_rtp_info, rtsp_sdp,
-    rtsp_track_from_uri, select_rtsp_interleaved_channel, should_advertise_video,
+    RTSP_CONTROL_BURST_SECS, RTSP_CONTROL_MESSAGES_PER_SECOND, RtpClock, RtpMediaTimeline,
+    RtpPacketWriter, RtpState, RtspInput, RtspSession, RtspTrack, build_rtcp_sender_report,
+    parse_rtsp_target, project_rtp_timestamp, read_rtsp_input, rtsp_rtp_info,
+    select_rtsp_interleaved_channel, with_write_timeout,
 };
 use super::websocket::{
-    MediaTimestampNormalizer, StreamerTextCommand, is_websocket_disconnect_noise,
-    streamer_text_command,
+    MediaTimestampNormalizer, is_websocket_disconnect_noise, parse_stream_start,
 };
 use super::*;
+use bytes::Bytes;
+use std::time::Instant;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     time::Instant as TokioInstant,
@@ -25,13 +29,863 @@ use tokio::{
 const TEST_VIDEO_FMTP: &str =
     "packetization-mode=1; profile-level-id=42e01f; sprop-parameter-sets=Z0LgHw==,aM48gA==";
 
+type TestSocket = BufReader<tokio::net::TcpStream>;
+
+struct ConfigTestDir(PathBuf);
+
+impl ConfigTestDir {
+    fn new() -> Self {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "vrcast-config-{}-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for ConfigTestDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn config_layers_files_then_environment_without_mutating_environment() {
+    let directory = ConfigTestDir::new();
+    let previous_name = std::env::var_os("SERVER_NAME");
+    let load = || Config::from_sources(&directory.0, []).unwrap();
+    let defaults = load();
+    assert_eq!(defaults.server_name, "Self-Hosted Instance");
+    assert_eq!(
+        defaults.video_qualities,
+        parse_video_qualities(DEFAULT_VIDEO_QUALITIES).unwrap()
+    );
+
+    fs::write(
+        directory.0.join("VRCast.conf"),
+        concat!(
+            "SERVER_NAME=Config server\n",
+            "SERVER_DESCRIPTION=Shared configuration\n",
+            "PASSWORD=secret\n",
+            "VIDEO=false\n",
+            "RUST_LOG=debug\n",
+            "MAX_CONNECTIONS=90\n",
+            "AVAILABLE_VIDEO_QUALITY=1440x1080*60/6000\n",
+        ),
+    )
+    .unwrap();
+    let conf = load();
+    assert_eq!(conf.server_name, "Config server");
+    assert!(!conf.video_enabled);
+    assert_eq!(conf.log_filter, "debug");
+    assert_eq!(conf.video_qualities[0].width, 1440);
+
+    fs::write(
+        directory.0.join(".env"),
+        concat!(
+            "SERVER_NAME=Env server\n",
+            "PASSWORD=\n",
+            "VIDEO=true\n",
+            "MAX_CONNECTIONS=0\n",
+        ),
+    )
+    .unwrap();
+    let combined = load();
+    assert_eq!(combined.server_name, "Env server");
+    assert_eq!(combined.server_description, "Shared configuration");
+    assert!(combined.passwords.is_empty());
+    assert!(combined.video_enabled);
+    assert_eq!(combined.max_connections, 0);
+
+    let config = Config::from_sources(
+        &directory.0,
+        [
+            ("SERVER_NAME".into(), "Process server".into()),
+            ("RUST_LOG".into(), "trace".into()),
+        ],
+    )
+    .unwrap();
+    assert_eq!(config.server_name, "Process server");
+    assert_eq!(config.log_filter, "trace");
+    assert_eq!(config.server_description, combined.server_description);
+    assert_eq!(std::env::var_os("SERVER_NAME"), previous_name);
+
+    fs::remove_file(directory.0.join("VRCast.conf")).unwrap();
+    assert_eq!(load().server_name, "Env server");
+}
+
+#[test]
+fn config_accepts_example_quotes_comments_crlf_and_utf8_bom() {
+    let directory = ConfigTestDir::new();
+    fs::write(
+        directory.0.join("VRCast.conf"),
+        include_str!("../.env.example"),
+    )
+    .unwrap();
+    let config = Config::from_sources(&directory.0, []).unwrap();
+    assert_eq!(config.server_name, "Self-Hosted Instance");
+    assert_eq!(config.channel_buffer, 128);
+    assert_eq!(
+        config.max_h264_frame_bytes,
+        H264_DEFAULT_MAX_ACCESS_UNIT_BYTES
+    );
+
+    fs::write(
+        directory.0.join(".env"),
+        concat!(
+            "\u{feff}# Local overrides\r\n",
+            "SERVER_NAME=\"Vard's server\"\r\n",
+            "PASSWORD='p#$$word'\r\n",
+            "TLS_CERT_PATH=none\r\n",
+            "TLS_KEY_PATH=\r\n",
+        ),
+    )
+    .unwrap();
+    let config = Config::from_sources(&directory.0, []).unwrap();
+    assert_eq!(config.server_name, "Vard's server");
+    assert_eq!(config.passwords, ["p#$$word"]);
+    assert!(config.tls_cert_path.is_none());
+    assert!(config.tls_key_path.is_none());
+
+    fs::write(
+        directory.0.join(".env"),
+        concat!(
+            "SERVER_NAME=Vard's Server\n",
+            "PASSWORD=p#$$word=a\n",
+            "TLS_CERT_PATH=C:\\certs\\fullchain.pem\n",
+            "SERVER_DESCRIPTION=\u{65e5}\u{672c}\u{8a9e}\n",
+        ),
+    )
+    .unwrap();
+    let config = Config::from_sources(&directory.0, []).unwrap();
+    assert_eq!(config.server_name, "Vard's Server");
+    assert_eq!(config.passwords, ["p#$$word=a"]);
+    assert_eq!(
+        config.tls_cert_path.as_deref(),
+        Some(r"C:\certs\fullchain.pem")
+    );
+    assert_eq!(config.server_description, "\u{65e5}\u{672c}\u{8a9e}");
+}
+
+#[test]
+fn config_rejects_broken_files_without_exposing_their_contents() {
+    let directory = ConfigTestDir::new();
+    for name in ["VRCast.conf", ".env"] {
+        let path = directory.0.join(name);
+        for contents in [
+            "PASSWORD=\"private-secret",
+            "PASSWORD='private-secret",
+            "private-secret",
+            "BAD KEY=private-secret",
+        ] {
+            fs::write(&path, contents).unwrap();
+            let error = Config::from_sources(&directory.0, [])
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains(name));
+            assert!(error.contains("line 1"));
+            assert!(!error.contains("private-secret"));
+        }
+        fs::remove_file(&path).unwrap();
+
+        fs::create_dir(&path).unwrap();
+        let error = Config::from_sources(&directory.0, [])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("cannot read"));
+        assert!(error.contains(name));
+        fs::remove_dir(&path).unwrap();
+    }
+}
+
+#[test]
+fn config_validates_merged_limits_addresses_and_tls_pair() {
+    let directory = ConfigTestDir::new();
+    for (key, value) in [
+        ("MAX_H264_FRAME_BYTES", "0"),
+        ("MAX_H264_FRAME_BYTES", "8388609"),
+        ("VIDEO_INGEST_BURST_SECS", "61"),
+        ("VIDEO_INGEST_BURST_SECS", "invalid"),
+        ("TLS_KEY_PATH", "none"),
+        ("BIND_ADDR", "invalid"),
+        ("ROOT_REDIRECT_URL", "javascript:alert(1)"),
+        ("AVAILABLE_VIDEO_QUALITY", "invalid"),
+    ] {
+        assert!(
+            Config::from_sources(&directory.0, [(key.into(), value.into())]).is_err(),
+            "{key}"
+        );
+    }
+}
+
+async fn send_ws(socket: &mut TestSocket, opcode: u8, payload: &[u8]) {
+    assert!(payload.len() < 126);
+    let mut frame = vec![0x80 | opcode, 0x80 | payload.len() as u8, 0, 0, 0, 0];
+    frame.extend_from_slice(payload);
+    socket.get_mut().write_all(&frame).await.unwrap();
+}
+
+async fn recv_ws(socket: &mut TestSocket) -> (u8, Vec<u8>) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut header = [0; 2];
+        socket.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[1] & 0x80, 0);
+        let length = match header[1] {
+            126 => socket.read_u16().await.unwrap() as usize,
+            127 => panic!("unexpected large server message"),
+            length => length as usize,
+        };
+        let mut body = vec![0; length];
+        socket.read_exact(&mut body).await.unwrap();
+        (header[0] & 0xf, body)
+    })
+    .await
+    .unwrap()
+}
+
+async fn start_test_stream(socket: &mut TestSocket, config: &str) {
+    send_ws(socket, 1, config.as_bytes()).await;
+    let (opcode, body) = recv_ws(socket).await;
+    assert_eq!(opcode, 1, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["type"],
+        "ready"
+    );
+}
+
+async fn http_get(address: SocketAddr, path: &str) -> (String, String) {
+    let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    socket
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(Duration::from_secs(5), socket.read_to_string(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+    (headers.to_owned(), body.to_owned())
+}
+
+#[test]
+fn stream_configuration_is_explicit_and_validated() {
+    let mut config = test_config();
+    assert_eq!(
+        parse_stream_start(r#"{"mode":"audio"}"#, &config).unwrap(),
+        (StreamMode::Audio, None)
+    );
+    assert_eq!(
+        parse_stream_start(
+            r#"{"mode":"video","video_quality":"1280x720*30/2000"}"#,
+            &config
+        )
+        .unwrap(),
+        (StreamMode::Video, Some(config.video_qualities[0]))
+    );
+    for invalid in [
+        "video_start",
+        "{}",
+        r#"{"mode":"other"}"#,
+        r#"{"mode":"video"}"#,
+        r#"{"mode":"audio","video_quality":"1280x720*30/2000"}"#,
+        r#"{"mode":"video","video_quality":"1280x720*30/9000"}"#,
+        r#"{"mode":"audio","extra":true}"#,
+    ] {
+        assert!(parse_stream_start(invalid, &config).is_err(), "{invalid}");
+    }
+    assert!(parse_stream_start(&" ".repeat(513), &config).is_err());
+    config.video_enabled = false;
+    assert!(
+        parse_stream_start(
+            r#"{"mode":"video","video_quality":"1280x720*30/2000"}"#,
+            &config
+        )
+        .is_err()
+    );
+    assert!(parse_stream_start(r#"{"mode":"audio"}"#, &config).is_ok());
+}
+
+#[tokio::test]
+async fn http_api_omits_optional_flag_and_uses_only_mode_counters() {
+    for official in [false, true] {
+        let mut config = test_config();
+        config.official_public = official;
+        config.server_name = "A \"quoted\" server".into();
+        let state = test_state(config);
+        state.streams.audio.store(2, Ordering::Release);
+        state.streams.video.store(3, Ordering::Release);
+        state.listeners.audio.store(4, Ordering::Release);
+        state.listeners.video.store(5, Ordering::Release);
+        let (address, server) = test_http_server(state).await;
+        let (headers, body) = http_get(address, "/info").await;
+        assert!(headers.starts_with("HTTP/1.1 200"));
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(info["name"], "A \"quoted\" server");
+        assert_eq!(info["audio_streams"], 2);
+        assert_eq!(info["video_streams"], 3);
+        assert_eq!(info["audio_listeners"], 4);
+        assert_eq!(info["video_listeners"], 5);
+        assert_eq!(info.get("official_public").is_some(), official);
+        for key in [
+            "active_streamers",
+            "active_streams",
+            "active_listeners",
+            "active_connections",
+            "policies_link",
+            "report_abuse_link",
+            "estimated_egress_kbps",
+        ] {
+            assert!(info.get(key).is_none());
+        }
+        assert_eq!(info["video_qualities"][0], "1280x720*30/2000");
+        assert_eq!(http_get(address, "/status").await.1, "ok\n");
+        for path in ["/", "/anything", "/stats", "/healthz", "/ingest"] {
+            let (headers, _) = http_get(address, path).await;
+            assert!(headers.starts_with("HTTP/1.1 302"), "{path}");
+            assert!(headers.contains("location: https://vrcast.net"));
+        }
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn http_rate_limit_covers_unknown_paths_and_invalid_upgrades() {
+    let mut config = test_config();
+    config.max_http_requests_per_ip = 2;
+    let (address, server) = test_http_server(test_state(config)).await;
+    assert!(
+        http_get(address, "/unknown")
+            .await
+            .0
+            .starts_with("HTTP/1.1 302")
+    );
+    assert!(
+        http_get(address, "/status")
+            .await
+            .0
+            .starts_with("HTTP/1.1 200")
+    );
+    for path in ["/status", "/stream?code=bad", "/another-unknown"] {
+        assert!(http_get(address, path).await.0.starts_with("HTTP/1.1 429"));
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn stream_start_and_close_update_counts_and_release_reservation() {
+    let state = test_state(test_config());
+    let code = "a".repeat(STREAM_CODE_BYTES);
+    let (address, server) = test_http_server(state.clone()).await;
+    for mode in [StreamMode::Audio, StreamMode::Video] {
+        let (status, mut socket) = test_stream_connect(address, &code).await;
+        assert!(status.starts_with("HTTP/1.1 101"));
+        assert_eq!(state.streams.counter(mode).load(Ordering::Acquire), 0);
+        start_test_stream(
+            &mut socket,
+            match mode {
+                StreamMode::Audio => r#"{"mode":"audio"}"#,
+                StreamMode::Video => r#"{"mode":"video","video_quality":"1280x720*30/2000"}"#,
+            },
+        )
+        .await;
+        assert_eq!(state.streams.counter(mode).load(Ordering::Acquire), 1);
+        let (status, _) = test_stream_connect(address, &code).await;
+        assert!(status.starts_with("HTTP/1.1 409"));
+        send_ws(&mut socket, 8, &1000_u16.to_be_bytes()).await;
+        assert_eq!(recv_ws(&mut socket).await.0, 8);
+        drop(socket);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.active_streamers.load(Ordering::Acquire) != 0
+                || !state.channels.read().unwrap().is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(state.streams.counter(mode).load(Ordering::Acquire), 0);
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn websocket_rejects_early_media_video_in_audio_mode_and_reconfiguration() {
+    for (start, opcode, payload) in [
+        (false, 2, vec![0, 0, 0, 0, 0, 1]),
+        (true, 2, vec![1, 0, 0, 0, 0, 1]),
+        (
+            true,
+            1,
+            br#"{"mode":"video","video_quality":"1280x720*30/2000"}"#.to_vec(),
+        ),
+    ] {
+        let state = test_state(test_config());
+        let (address, server) = test_http_server(state).await;
+        let (status, mut socket) =
+            test_stream_connect(address, &"a".repeat(STREAM_CODE_BYTES)).await;
+        assert!(status.starts_with("HTTP/1.1 101"));
+        if start {
+            start_test_stream(&mut socket, r#"{"mode":"audio"}"#).await;
+        }
+        send_ws(&mut socket, opcode, &payload).await;
+        let (opcode, body) = recv_ws(&mut socket).await;
+        assert_eq!(opcode, 8);
+        assert_eq!(&body[..2], &1008_u16.to_be_bytes());
+        server.abort();
+    }
+}
+
+#[test]
+fn rtsp_audio_suffix_and_track_are_independent() {
+    let id = "0123456789abcdef0123456789abcdef";
+    for base in [format!("/{id}"), format!("rtspt://example.com:8554/{id}")] {
+        let bare = parse_rtsp_target(&base).unwrap();
+        assert_eq!(bare.key, id);
+        assert!(!bare.audio_only);
+        assert_eq!(bare.track, None);
+        let queried = format!("{base}/trackID=0?x=1");
+        let track = parse_rtsp_target(&queried).unwrap();
+        assert_eq!(track.key, id);
+        assert_eq!(track.track, Some(0));
+        let uri = format!("{base}/audio/trackID=0");
+        let audio = parse_rtsp_target(&uri).unwrap();
+        assert!(audio.audio_only);
+        assert_eq!(audio.track, Some(0));
+        assert!(parse_rtsp_target(&format!("{base}/audio/extra")).is_none());
+        assert!(parse_rtsp_target(&format!("{base}/trackID=2")).is_none());
+    }
+    assert!(parse_rtsp_target(&format!("/live/{id}")).is_none());
+    assert!(parse_rtsp_target(&format!("/{id}{id}")).is_none());
+}
+
+async fn rtsp_request(
+    socket: &mut TestSocket,
+    method: &str,
+    uri: &str,
+    extra: &str,
+) -> (String, String) {
+    socket
+        .get_mut()
+        .write_all(format!("{method} {uri} RTSP/1.0\r\nCSeq: 1\r\n{extra}\r\n").as_bytes())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        // Skip any already queued interleaved RTP/RTCP before the response.
+        while socket.fill_buf().await.unwrap().first() == Some(&b'$') {
+            let mut header = [0; 4];
+            socket.read_exact(&mut header).await.unwrap();
+            let mut payload = vec![0; u16::from_be_bytes([header[2], header[3]]) as usize];
+            socket.read_exact(&mut payload).await.unwrap();
+        }
+        let mut headers = String::new();
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            assert!(!line.is_empty(), "RTSP connection closed before response");
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = value.trim().parse::<usize>().unwrap();
+            }
+            headers.push_str(&line);
+        }
+        let mut body = vec![0; length];
+        socket.read_exact(&mut body).await.unwrap();
+        (headers, String::from_utf8(body).unwrap())
+    })
+    .await
+    .unwrap()
+}
+
+async fn test_rtsp_server(state: Arc<AppState>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    (address, tokio::spawn(rtsp_server(state, listener)))
+}
+
+#[tokio::test]
+async fn rtsp_control_flood_closes_only_the_offending_connection() {
+    for playing in [false, true] {
+        for interleaved in [false, true] {
+            let state = test_state(test_config());
+            let (address, server) = test_rtsp_server(state.clone()).await;
+            let mut socket = BufReader::new(tokio::net::TcpStream::connect(address).await.unwrap());
+            let uri = format!("rtsp://{address}/0123456789abcdef0123456789abcdef/audio");
+            let mut healthy =
+                BufReader::new(tokio::net::TcpStream::connect(address).await.unwrap());
+            assert!(
+                rtsp_request(&mut healthy, "OPTIONS", &uri, "")
+                    .await
+                    .0
+                    .starts_with("RTSP/1.0 200")
+            );
+            assert!(
+                rtsp_request(&mut socket, "OPTIONS", &uri, "")
+                    .await
+                    .0
+                    .starts_with("RTSP/1.0 200")
+            );
+            if playing {
+                assert!(
+                    rtsp_request(&mut socket, "DESCRIBE", &uri, "")
+                        .await
+                        .0
+                        .starts_with("RTSP/1.0 200")
+                );
+                assert!(
+                    rtsp_request(
+                        &mut socket,
+                        "SETUP",
+                        &format!("{uri}/trackID=0"),
+                        "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n",
+                    )
+                    .await
+                    .0
+                    .starts_with("RTSP/1.0 200")
+                );
+                assert!(
+                    rtsp_request(&mut socket, "PLAY", &uri, "")
+                        .await
+                        .0
+                        .starts_with("RTSP/1.0 200")
+                );
+            }
+            let message: &[u8] = if interleaved {
+                b"$\x01\x00\x08\x80\xc9\x00\x01\x00\x00\x00\x01"
+            } else {
+                b"OPTIONS * RTSP/1.0\r\nCSeq: 100\r\n\r\n"
+            };
+            let flood = message.repeat(1024);
+            let result = tokio::time::timeout(Duration::from_secs(5), async {
+                socket.get_mut().write_all(&flood).await?;
+                socket.read_to_end(&mut Vec::new()).await
+            })
+            .await
+            .expect("control flood was not disconnected");
+            if let Err(error) = result {
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::BrokenPipe
+                    ),
+                    "{error}"
+                );
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while state.active_connections.load(Ordering::Acquire) != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(state.active_listeners.load(Ordering::Acquire), 0);
+            assert!(state.channels.read().unwrap().is_empty());
+
+            assert!(
+                rtsp_request(&mut healthy, "OPTIONS", &uri, "")
+                    .await
+                    .0
+                    .starts_with("RTSP/1.0 200")
+            );
+            server.abort();
+        }
+    }
+}
+
+async fn read_interleaved(socket: &mut TestSocket) -> (u8, Vec<u8>) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut header = [0; 4];
+        socket.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[0], b'$');
+        let mut body = vec![0; u16::from_be_bytes([header[2], header[3]]) as usize];
+        socket.read_exact(&mut body).await.unwrap();
+        (header[1], body)
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn audio_view_remains_audio_and_stays_connected_across_video_sessions() {
+    let state = test_state(test_config());
+    let key = "0123456789abcdef0123456789abcdef";
+    let (channel, ()) = reserve_channel(&state, key, |_| ());
+    let (address, server) = test_rtsp_server(state.clone()).await;
+    let mut socket = BufReader::new(tokio::net::TcpStream::connect(address).await.unwrap());
+    let uri = format!("rtsp://{address}/{key}/audio");
+    let (status, sdp) = rtsp_request(
+        &mut socket,
+        "DESCRIBE",
+        &uri,
+        "User-Agent: AndroidXMedia3/1.8\r\n",
+    )
+    .await;
+    assert!(status.starts_with("RTSP/1.0 200"));
+    assert!(!sdp.contains("video"));
+    assert!(!sdp.contains("H264"));
+    assert!(sdp.contains("m=audio 0 RTP/AVP 97\r\n"));
+    assert!(sdp.contains("a=control:trackID=0\r\n"));
+    assert!(!sdp.contains("trackID=1"));
+    let (status, _) = rtsp_request(
+        &mut socket,
+        "SETUP",
+        &format!("{uri}/trackID=0"),
+        "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n",
+    )
+    .await;
+    assert!(status.starts_with("RTSP/1.0 200"));
+    assert_eq!(state.listeners.audio.load(Ordering::Acquire), 1);
+    assert_eq!(state.listeners.video.load(Ordering::Acquire), 0);
+    assert_eq!(state.active_streamers.load(Ordering::Acquire), 0);
+    assert!(
+        rtsp_request(&mut socket, "PLAY", &uri, "")
+            .await
+            .0
+            .starts_with("RTSP/1.0 200")
+    );
+    let mut previous = None;
+    for live in [false, true, false, true, false] {
+        advance_stream_generation(&channel);
+        channel.mode.store(
+            if live { StreamMode::Video as u8 } else { 0 },
+            Ordering::Release,
+        );
+        channel.set_video_fmtp(live.then(|| Arc::from(TEST_VIDEO_FMTP)));
+        wake_media_listeners(&channel);
+        // Ensure the listener has entered the new generation before publishing test audio.
+        let (status, _) = rtsp_request(&mut socket, "OPTIONS", &uri, "").await;
+        assert!(status.starts_with("RTSP/1.0 200"));
+        let feeder = tokio::spawn({
+            let channel = channel.clone();
+            async move {
+                if live {
+                    for index in 0..20 {
+                        let _ = channel.audio_tx.send(AudioMessage::Frame {
+                            access_unit: Bytes::from_static(AAC_SILENCE_ACCESS_UNIT),
+                            media_timestamp: index
+                                * AAC_SAMPLES_PER_FRAME as u64
+                                * MEDIA_CLOCK_RATE as u64
+                                / AAC_SAMPLE_RATE as u64,
+                            published_at: Instant::now(),
+                        });
+                        tokio::time::sleep(AAC_FRAME_DURATION).await;
+                    }
+                }
+            }
+        });
+        loop {
+            let (interleaved, packet) = read_interleaved(&mut socket).await;
+            assert!(interleaved <= 1);
+            if interleaved == 0 {
+                assert_eq!(packet[1] & 0x7f, RTP_AUDIO_PAYLOAD_TYPE);
+                let timestamp = u32::from_be_bytes(packet[4..8].try_into().unwrap());
+                if let Some(previous) = previous {
+                    assert!(timestamp.wrapping_sub(previous) < u32::MAX / 2);
+                }
+                previous = Some(timestamp);
+                break;
+            }
+        }
+        feeder.abort();
+    }
+    assert!(
+        rtsp_request(&mut socket, "TEARDOWN", &uri, "")
+            .await
+            .0
+            .starts_with("RTSP/1.0 200")
+    );
+    drop(socket);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while state.active_listeners.load(Ordering::Acquire) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(state.listeners.audio.load(Ordering::Acquire), 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn bare_audio_view_ends_when_video_starts() {
+    let state = test_state(test_config());
+    let key = "0123456789abcdef0123456789abcdef";
+    let (address, server) = test_rtsp_server(state.clone()).await;
+    let uri = format!("rtsp://{address}/{key}");
+    let mut socket = BufReader::new(tokio::net::TcpStream::connect(address).await.unwrap());
+    let (_, sdp) = rtsp_request(&mut socket, "DESCRIBE", &uri, "").await;
+    assert!(!sdp.contains("m=video"));
+    assert!(
+        rtsp_request(
+            &mut socket,
+            "SETUP",
+            &format!("{uri}/trackID=0"),
+            "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n"
+        )
+        .await
+        .0
+        .starts_with("RTSP/1.0 200")
+    );
+    assert!(
+        rtsp_request(&mut socket, "PLAY", &uri, "")
+            .await
+            .0
+            .starts_with("RTSP/1.0 200")
+    );
+    let (channel, ()) = reserve_channel(&state, key, |channel| {
+        advance_stream_generation(channel);
+        channel
+            .mode
+            .store(StreamMode::Video as u8, Ordering::Release);
+    });
+    wake_media_listeners(&channel);
+    tokio::time::timeout(Duration::from_secs(5), socket.read_to_end(&mut Vec::new()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.listeners.audio.load(Ordering::Acquire), 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn video_play_rejects_a_recreated_channel_after_describe() {
+    let state = test_state(test_config());
+    let key = "0123456789abcdef0123456789abcdef";
+    let make_video = |channel: &Channel| {
+        advance_stream_generation(channel);
+        channel
+            .mode
+            .store(StreamMode::Video as u8, Ordering::Release);
+        channel.set_video_fmtp(Some(Arc::from(TEST_VIDEO_FMTP)));
+    };
+    let (old, ()) = reserve_channel(&state, key, make_video);
+    let (address, server) = test_rtsp_server(state.clone()).await;
+    let uri = format!("rtsp://{address}/{key}");
+    let mut socket = BufReader::new(tokio::net::TcpStream::connect(address).await.unwrap());
+    assert!(
+        rtsp_request(&mut socket, "DESCRIBE", &uri, "")
+            .await
+            .1
+            .contains("m=video")
+    );
+    cleanup_channel(&state, key, &old);
+    let (current, ()) = reserve_channel(&state, key, make_video);
+    assert!(!Arc::ptr_eq(&old, &current));
+    assert!(
+        rtsp_request(
+            &mut socket,
+            "SETUP",
+            &format!("{uri}/trackID=0"),
+            "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n"
+        )
+        .await
+        .0
+        .starts_with("RTSP/1.0 200")
+    );
+    assert!(
+        rtsp_request(&mut socket, "PLAY", &uri, "")
+            .await
+            .0
+            .starts_with("RTSP/1.0 455")
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn video_description_waits_for_real_configuration_and_playback_ends_on_disconnect() {
+    let state = test_state(test_config());
+    let key = "0123456789abcdef0123456789abcdef";
+    let (channel, ()) = reserve_channel(&state, key, |channel| {
+        channel
+            .mode
+            .store(StreamMode::Video as u8, Ordering::Release);
+    });
+    let (address, server) = test_rtsp_server(state.clone()).await;
+    let mut socket = BufReader::new(tokio::net::TcpStream::connect(address).await.unwrap());
+    let uri = format!("rtsp://{address}/{key}");
+    let setter = tokio::spawn({
+        let channel = channel.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            channel.set_video_fmtp(Some(Arc::from(TEST_VIDEO_FMTP)));
+        }
+    });
+    let (status, sdp) = rtsp_request(&mut socket, "DESCRIBE", &uri, "").await;
+    setter.await.unwrap();
+    assert!(status.starts_with("RTSP/1.0 200"));
+    assert!(sdp.contains(TEST_VIDEO_FMTP));
+    assert!(sdp.contains("a=range:npt=now-\r\n"));
+    assert!(sdp.contains("a=control:*\r\n"));
+    assert!(sdp.contains("m=video 0 RTP/AVP 96\r\n"));
+    assert!(sdp.contains("a=control:trackID=0\r\n"));
+    assert!(sdp.contains("a=rtpmap:96 H264/90000\r\n"));
+    assert!(sdp.contains("m=audio 0 RTP/AVP 97\r\n"));
+    assert!(sdp.contains("a=control:trackID=1\r\n"));
+    assert!(sdp.contains("a=rtpmap:97 mpeg4-generic/48000/2\r\n"));
+    assert!(sdp.contains("config=1190"));
+    assert!(sdp.find("m=video").unwrap() < sdp.find("m=audio").unwrap());
+    for id in 0..2 {
+        assert!(
+            rtsp_request(
+                &mut socket,
+                "SETUP",
+                &format!("{uri}/trackID={id}"),
+                &format!(
+                    "Transport: RTP/AVP/TCP;unicast;interleaved={}-{}\r\n",
+                    id * 2,
+                    id * 2 + 1
+                )
+            )
+            .await
+            .0
+            .starts_with("RTSP/1.0 200")
+        );
+    }
+    assert_eq!(state.listeners.video.load(Ordering::Acquire), 1);
+    assert_eq!(state.listeners.audio.load(Ordering::Acquire), 0);
+    assert!(
+        rtsp_request(&mut socket, "PLAY", &uri, "")
+            .await
+            .0
+            .starts_with("RTSP/1.0 200")
+    );
+    channel.mode.store(0, Ordering::Release);
+    advance_stream_generation(&channel);
+    wake_media_listeners(&channel);
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), socket.read_to_end(&mut rest))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.active_listeners.load(Ordering::Acquire), 0);
+    assert_eq!(state.listeners.video.load(Ordering::Acquire), 0);
+    server.abort();
+}
+
 fn test_config() -> Config {
     Config {
-        server_name: "VRCStreamer".to_owned(),
+        log_filter: "warn".to_owned(),
+        server_name: "VRCast".to_owned(),
         server_description: "Test server".to_owned(),
-        policies_link: None,
-        report_abuse_link: None,
-        redirect_url: HeaderValue::from_static("https://stream.vard.cc"),
+        official_public: false,
+        redirect_url: HeaderValue::from_static("https://vrcast.net"),
         bind_addr: "127.0.0.1:8080".parse().unwrap(),
         rtsp_bind_addr: "127.0.0.1:8554".parse().unwrap(),
         rtsp_public_base: None,
@@ -48,14 +902,11 @@ fn test_config() -> Config {
         max_listeners_per_stream: 1,
         max_listeners_per_ip: 16,
         max_http_requests_per_ip: 120,
-        max_rtsp_requests_per_connection: 4096,
         rtsp_handshake_timeout: Duration::from_secs(30),
         http_rate_limit_window: Duration::from_secs(60),
-        egress_kbps_per_listener: 384,
         channel_buffer: 8,
         streamer_idle_timeout: Duration::from_secs(1),
         passwords: Vec::new(),
-        allow_any_origin: false,
         allowed_origins: Vec::new(),
     }
 }
@@ -67,12 +918,8 @@ fn test_state(config: Config) -> Arc<AppState> {
         stream_blacklist: StdRwLock::new(HashSet::new()),
         blocked_streamer_ips: StdRwLock::new(StreamerIpBans::default()),
         ip_limits: StdMutex::new(IpLimitTable::new()),
-        placeholders: Placeholders {
-            offline_video: Bytes::new(),
-            audio_only_video: Bytes::new(),
-            offline_fmtp: Arc::from(TEST_VIDEO_FMTP),
-            audio_only_fmtp: Arc::from(TEST_VIDEO_FMTP),
-        },
+        streams: MediaCounts::default(),
+        listeners: MediaCounts::default(),
         active_connections: AtomicUsize::new(0),
         active_streamers: AtomicUsize::new(0),
         active_listeners: AtomicUsize::new(0),
@@ -242,12 +1089,10 @@ fn ip_ban_overflow_remains_linked_to_its_stream_id() {
     assert_eq!(state.blocked_streamer_ips.read().unwrap().associations, 0);
 }
 
-async fn test_ingest_server(state: Arc<AppState>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+async fn test_http_server(state: Arc<AppState>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let app = Router::new()
-        .route("/ingest", get(ingest_ws))
-        .with_state(state);
+    let app = http_router(state);
     let server = tokio::spawn(async move {
         axum::serve(
             listener,
@@ -259,13 +1104,13 @@ async fn test_ingest_server(state: Arc<AppState>) -> (SocketAddr, tokio::task::J
     (address, server)
 }
 
-async fn test_ingest_connect(
+async fn test_stream_connect(
     address: SocketAddr,
     code: &str,
 ) -> (String, BufReader<tokio::net::TcpStream>) {
     let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
     let request = format!(
-        "GET /ingest?code={code} HTTP/1.1\r\nHost: {address}\r\n\
+        "GET /stream?code={code} HTTP/1.1\r\nHost: {address}\r\n\
          Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
          Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
     );
@@ -276,6 +1121,13 @@ async fn test_ingest_connect(
         .await
         .unwrap()
         .unwrap();
+    loop {
+        let mut header = String::new();
+        socket.read_line(&mut header).await.unwrap();
+        if header == "\r\n" || header.is_empty() {
+            break;
+        }
+    }
     (response, socket)
 }
 
@@ -289,17 +1141,17 @@ async fn rejected_ingest_remembers_each_blacklisted_id_for_the_same_ip() {
         &state,
         HashSet::from([hash_code(&first), hash_code(&second)]),
     );
-    let (address, server) = test_ingest_server(state.clone()).await;
+    let (address, server) = test_http_server(state.clone()).await;
     for code in [&first, &second] {
-        let (status, _) = test_ingest_connect(address, code).await;
+        let (status, _) = test_stream_connect(address, code).await;
         assert!(status.starts_with("HTTP/1.1 403"));
     }
     replace_stream_blacklist(&state, HashSet::from([hash_code(&second)]));
-    let (status, _) = test_ingest_connect(address, &third).await;
+    let (status, _) = test_stream_connect(address, &third).await;
     assert!(status.starts_with("HTTP/1.1 403"));
     assert_eq!(state.active_streamers.load(Ordering::Acquire), 0);
     replace_stream_blacklist(&state, HashSet::new());
-    let (status, _) = test_ingest_connect(address, &third).await;
+    let (status, _) = test_stream_connect(address, &third).await;
     assert!(status.starts_with("HTTP/1.1 101"));
 
     server.abort();
@@ -314,12 +1166,14 @@ async fn blacklist_reload_bans_active_streamer_without_kicking_other_streams_fro
     let state = test_state(config);
     let first = "a".repeat(STREAM_CODE_BYTES);
     let second = "b".repeat(STREAM_CODE_BYTES);
-    let (address, server) = test_ingest_server(state.clone()).await;
-    let (status, first_socket) = test_ingest_connect(address, &first).await;
+    let (address, server) = test_http_server(state.clone()).await;
+    let (status, mut first_socket) = test_stream_connect(address, &first).await;
     assert!(status.starts_with("HTTP/1.1 101"));
-    let (status, second_socket) = test_ingest_connect(address, &second).await;
+    let (status, mut second_socket) = test_stream_connect(address, &second).await;
     assert!(status.starts_with("HTTP/1.1 101"));
 
+    start_test_stream(&mut first_socket, r#"{"mode":"audio"}"#).await;
+    start_test_stream(&mut second_socket, r#"{"mode":"audio"}"#).await;
     assert_eq!(
         replace_stream_blacklist(&state, HashSet::from([hash_code(&first)])),
         Some((1, 1))
@@ -374,111 +1228,132 @@ fn websocket_disconnect_noise_is_not_warning_worthy() {
     ));
 }
 
-fn run_async_test<F: std::future::Future<Output = ()>>(future: F) {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(future);
+#[tokio::test]
+async fn rtsp_parser_accepts_bounded_request_line() {
+    let input = b"OPTIONS rtspt://127.0.0.1/abc RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+    let mut reader = BufReader::new(&input[..]);
+    let Some(RtspInput::Request(request)) = read_rtsp_input(&mut reader).await.unwrap() else {
+        panic!("expected RTSP request");
+    };
+    assert_eq!(request.method, "OPTIONS");
+    assert_eq!(request.uri, "rtspt://127.0.0.1/abc");
+    assert_eq!(request.header("cseq"), Some("1"));
+    assert!(read_rtsp_input(&mut reader).await.unwrap().is_none());
 }
 
-#[test]
-fn rtsp_parser_accepts_bounded_request_line() {
-    run_async_test(async {
-        let input = b"OPTIONS rtspt://127.0.0.1/abc RTSP/1.0\r\nCSeq: 1\r\n\r\n";
-        let mut reader = BufReader::new(&input[..]);
-        let request = read_rtsp_request(&mut reader).await.unwrap().unwrap();
-
-        assert_eq!(request.method, "OPTIONS");
-        assert_eq!(request.uri, "rtspt://127.0.0.1/abc");
-        assert_eq!(request.header("cseq"), Some("1"));
-    });
+#[tokio::test]
+async fn rtsp_parser_consumes_interleaved_client_data_before_next_request() {
+    let input = b"\r\n$\x01\x00\x04testOPTIONS rtspt://127.0.0.1/abc RTSP/1.0\r\nCSeq: 2\r\nContent-Length: 4\r\n\r\nbodyOPTIONS * RTSP/1.0\r\nCSeq: 3\r\n\r\n";
+    let mut reader = BufReader::new(&input[..]);
+    assert!(matches!(
+        read_rtsp_input(&mut reader).await.unwrap(),
+        Some(RtspInput::Interleaved)
+    ));
+    let Some(RtspInput::Request(request)) = read_rtsp_input(&mut reader).await.unwrap() else {
+        panic!("expected RTSP request");
+    };
+    assert_eq!(request.method, "OPTIONS");
+    assert_eq!(request.header("cseq"), Some("2"));
+    let Some(RtspInput::Request(request)) = read_rtsp_input(&mut reader).await.unwrap() else {
+        panic!("expected the next request after the body");
+    };
+    assert_eq!(request.header("cseq"), Some("3"));
+    assert!(read_rtsp_input(&mut reader).await.unwrap().is_none());
 }
 
-#[test]
-fn rtsp_parser_ignores_interleaved_client_data() {
-    run_async_test(async {
-        let input = b"$\x01\x00\x04testOPTIONS rtspt://127.0.0.1/abc RTSP/1.0\r\nCSeq: 2\r\n\r\n";
-        let mut reader = BufReader::new(&input[..]);
-        let request = read_rtsp_request(&mut reader).await.unwrap().unwrap();
-
-        assert_eq!(request.method, "OPTIONS");
-        assert_eq!(request.header("cseq"), Some("2"));
-    });
+#[tokio::test]
+async fn rtsp_parser_rejects_malformed_or_incomplete_messages() {
+    for input in [
+        "\r\n\r\n\r\n\r\n\r\n",
+        "OPTIONS\r\n",
+        "OPTIONS * HTTP/1.1\r\n\r\n",
+        "OPTIONS * RTSP/1.0 extra\r\n\r\n",
+        "OPTIONS * RTSP/1.0",
+        "OPTIONS * RTSP/1.0\r\n",
+        "OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n",
+        "OPTIONS * RTSP/1.0\r\nBroken header\r\n\r\n",
+        "OPTIONS * RTSP/1.0\r\nCSeq: 1\rInjected: yes\r\n\r\n",
+        "OPTIONS * RTSP/1.0\r\nContent-Length: nope\r\n\r\n",
+        "OPTIONS * RTSP/1.0\r\nContent-Length: -1\r\n\r\n",
+        "OPTIONS * RTSP/1.0\r\nContent-Length: +1\r\n\r\na",
+        "OPTIONS * RTSP/1.0\r\nContent-Length: 999999999999999999999\r\n\r\n",
+        "OPTIONS * RTSP/1.0\r\nContent-Length: 1\r\nContent-Length: 0\r\n\r\na",
+        "OPTIONS * RTSP/1.0\r\nContent-Length: 4\r\n\r\nab",
+    ] {
+        assert!(
+            read_rtsp_input(&mut BufReader::new(input.as_bytes()))
+                .await
+                .is_err(),
+            "accepted {input:?}"
+        );
+    }
 }
 
-#[test]
-fn rtsp_parser_rejects_oversized_interleaved_client_data() {
-    run_async_test(async {
-        let length = (RTSP_MAX_INTERLEAVED_BYTES + 1) as u16;
-        let mut input = vec![b'$', 1];
-        input.extend_from_slice(&length.to_be_bytes());
-        let mut reader = BufReader::new(input.as_slice());
-        let error = match read_rtsp_request(&mut reader).await {
-            Ok(_) => panic!("oversized interleaved packet was accepted"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains("interleaved packet too large"));
-    });
+#[tokio::test]
+async fn rtsp_write_timeout_cancels_stalled_work_and_releases_resources() {
+    assert_eq!(with_write_timeout(async { Ok(42) }).await.unwrap(), 42);
+    assert_eq!(
+        with_write_timeout::<()>(async { Err("write failed".into()) })
+            .await
+            .unwrap_err()
+            .to_string(),
+        "write failed"
+    );
+    let state = Arc::new(test_state(test_config()));
+    let error = tokio::time::timeout(
+        Duration::from_secs(12),
+        with_write_timeout(async {
+            let _guard = try_acquire_connection(&state).unwrap();
+            std::future::pending::<Result<(), Box<dyn std::error::Error + Send + Sync>>>().await
+        }),
+    )
+    .await
+    .expect("stalled write did not time out")
+    .unwrap_err();
+    assert_eq!(error.to_string(), "rtsp write timeout");
+    assert_eq!(state.active_connections.load(Ordering::Acquire), 0);
 }
 
-#[test]
-fn rtsp_parser_rejects_unbounded_request_line() {
-    run_async_test(async {
-        let input = vec![b'A'; RTSP_MAX_LINE_BYTES + 1];
-        let mut reader = BufReader::new(input.as_slice());
-        let error = match read_rtsp_request(&mut reader).await {
-            Ok(_) => panic!("oversized request line was accepted"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains("rtsp line too long"));
-    });
+#[tokio::test]
+async fn rtsp_parser_rejects_oversized_interleaved_client_data() {
+    let length = (RTSP_MAX_INTERLEAVED_BYTES + 1) as u16;
+    let mut input = vec![b'$', 1];
+    input.extend_from_slice(&length.to_be_bytes());
+    let mut reader = BufReader::new(input.as_slice());
+    let error = match read_rtsp_input(&mut reader).await {
+        Ok(_) => panic!("oversized interleaved packet was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("interleaved packet too large"));
 }
 
-#[test]
-fn rtsp_parser_rejects_oversized_header_block() {
-    run_async_test(async {
-        let mut input = b"OPTIONS rtspt://127.0.0.1/abc RTSP/1.0\r\n".to_vec();
-        let value = vec![b'A'; RTSP_MAX_LINE_BYTES - 6];
-        for _ in 0..5 {
-            input.extend_from_slice(b"X: ");
-            input.extend_from_slice(&value);
-            input.extend_from_slice(b"\r\n");
-        }
+#[tokio::test]
+async fn rtsp_parser_rejects_unbounded_request_line() {
+    let input = vec![b'A'; RTSP_MAX_LINE_BYTES + 1];
+    let mut reader = BufReader::new(input.as_slice());
+    let error = match read_rtsp_input(&mut reader).await {
+        Ok(_) => panic!("oversized request line was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("rtsp line too long"));
+}
+
+#[tokio::test]
+async fn rtsp_parser_rejects_oversized_header_block() {
+    let mut input = b"OPTIONS rtspt://127.0.0.1/abc RTSP/1.0\r\n".to_vec();
+    let value = vec![b'A'; RTSP_MAX_LINE_BYTES - 6];
+    for _ in 0..5 {
+        input.extend_from_slice(b"X: ");
+        input.extend_from_slice(&value);
         input.extend_from_slice(b"\r\n");
-
-        let mut reader = BufReader::new(input.as_slice());
-        let error = match read_rtsp_request(&mut reader).await {
-            Ok(_) => panic!("oversized RTSP headers were accepted"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains("rtsp headers are too large"));
-    });
-}
-
-#[test]
-fn streamer_text_command_accepts_force_resync() {
-    assert!(matches!(
-        streamer_text_command("force_resync"),
-        Some(StreamerTextCommand::ForceResync)
-    ));
-    assert!(matches!(
-        streamer_text_command(" FORCE_RESYNC "),
-        Some(StreamerTextCommand::ForceResync)
-    ));
-    assert!(streamer_text_command("hello").is_none());
-    assert!(matches!(
-        streamer_text_command("video_reset"),
-        Some(StreamerTextCommand::VideoReset)
-    ));
-    assert!(matches!(
-        streamer_text_command("video_quality:3"),
-        Some(StreamerTextCommand::VideoQuality(3))
-    ));
-    assert!(streamer_text_command("video_quality:nope").is_none());
+    }
+    input.extend_from_slice(b"\r\n");
+    let mut reader = BufReader::new(input.as_slice());
+    let error = match read_rtsp_input(&mut reader).await {
+        Ok(_) => panic!("oversized RTSP headers were accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("rtsp headers are too large"));
 }
 
 #[test]
@@ -506,21 +1381,43 @@ fn video_quality_parser_accepts_custom_presets() {
 
 #[test]
 fn redirect_url_requires_absolute_http_url() {
-    assert!(parse_redirect_url("https://stream.vard.cc/path").is_ok());
+    assert!(parse_redirect_url("https://vrcast.net/path").is_ok());
     assert!(parse_redirect_url("javascript:alert(1)").is_err());
     assert!(parse_redirect_url("/relative").is_err());
 }
 
 #[test]
 fn media_rate_limiter_bounds_initial_burst() {
+    let now = Instant::now();
     let mut limiter = TokenBucket::new();
-    assert!(limiter.allow(2000, 1000, 2));
-    assert!(!limiter.allow(1000, 1000, 2));
+    assert!(limiter.allow_at(now, 2000, 1000, 2));
+    assert!(!limiter.allow_at(now, 1000, 1000, 2));
     assert_eq!(limiter.available_units(), 0);
+    let later = now + Duration::from_secs(1);
+    assert!(limiter.allow_at(later, 1000, 1000, 2));
+    assert!(!limiter.allow_at(later, 1, 1000, 2));
 
     let mut larger_burst = TokenBucket::new();
-    assert!(larger_burst.allow(3000, 1000, 3));
-    assert!(!larger_burst.allow(1, 1000, 3));
+    assert!(larger_burst.allow_at(now, 3000, 1000, 3));
+    assert!(!larger_burst.allow_at(now, 1, 1000, 3));
+}
+
+#[test]
+fn rtsp_control_budget_refills_without_a_lifetime_limit() {
+    let mut limiter = TokenBucket::new();
+    let mut now = Instant::now();
+    let rate = RTSP_CONTROL_MESSAGES_PER_SECOND;
+    let burst = RTSP_CONTROL_BURST_SECS;
+    assert!(limiter.allow_at(now, 8, rate, burst));
+    for _ in 0..10_000 {
+        now += Duration::from_secs(60);
+        assert!(limiter.allow_at(now, 1, rate, burst));
+    }
+    assert!(limiter.allow_at(now, rate * burst - 1, rate, burst));
+    assert!(!limiter.allow_at(now, 1, rate, burst));
+    now += Duration::from_secs(1);
+    assert!(limiter.allow_at(now, rate, rate, burst));
+    assert!(!limiter.allow_at(now, 1, rate, burst));
 }
 
 #[test]
@@ -536,73 +1433,10 @@ fn video_quality_rate_matches_selected_bitrate() {
 }
 
 #[test]
-fn force_resync_channel_advances_epoch() {
-    let channel = Channel::new(8);
-    assert_eq!(channel.resync_epoch.load(Ordering::Acquire), 0);
-    assert_eq!(force_resync_channel(&channel), 1);
-    assert_eq!(channel.resync_epoch.load(Ordering::Acquire), 1);
-    assert_eq!(force_resync_channel(&channel), 2);
-}
-
-#[test]
-fn audio_only_stream_start_wakes_video_listeners() {
-    let channel = Channel::new(8);
-    let mut rx = channel.video_tx.subscribe();
-
-    assert!(matches!(
-        channel_video_state(&channel),
-        VideoStreamState::Offline
-    ));
-    channel.streamer.store(true, Ordering::Release);
-    wake_video_listeners(&channel);
-
-    assert!(matches!(rx.try_recv().unwrap(), VideoMessage::Wake));
-    assert!(matches!(
-        channel_video_state(&channel),
-        VideoStreamState::AudioOnly
-    ));
-}
-
-#[test]
-fn streamer_hello_message_escapes_json_strings() {
-    let mut config = test_config();
-    config.server_name = "Name \"A\"".to_owned();
-    config.server_description = "Line\nTwo".to_owned();
-
-    assert_eq!(
-        streamer_hello_message(&config, 7, "rtspt://example.com"),
-        "{\"type\":\"hello\",\"name\":\"Name \\\"A\\\"\",\"description\":\"Line\\nTwo\",\"rtsp_base\":\"rtspt://example.com\",\"video\":true,\"video_qualities\":[\"1280x720*30/2000\",\"1280x720*60/4000\",\"1920x1080*30/3000\",\"1920x1080*60/6000\"],\"listeners\":7}"
-    );
-}
-
-#[test]
-fn streamer_hello_message_includes_optional_links() {
-    let mut config = test_config();
-    config.policies_link = Some("https://example.com/policies".to_owned());
-    config.report_abuse_link = Some("https://example.com/report-abuse".to_owned());
-
-    let message = streamer_hello_message(&config, 0, "rtspt://example.com");
-    assert!(message.contains("\"policies_link\":\"https://example.com/policies\""));
-    assert!(message.contains("\"report_abuse_link\":\"https://example.com/report-abuse\""));
-}
-
-#[test]
 fn code_accepts_exact_length_printable_ascii_without_spaces() {
     assert!(validate_code("Abc123!@Abc123!@Abc123!@Abc123!@").is_ok());
     assert!(validate_code("Abc 123!Abc123!@Abc123!@Abc123!@").is_err());
     assert!(validate_code("short").is_err());
-}
-
-#[test]
-fn http_rate_limit_blocks_after_configured_requests() {
-    let mut config = test_config();
-    config.max_http_requests_per_ip = 2;
-    let state = test_state(config);
-    let ip = "127.0.0.1".parse().unwrap();
-
-    assert!(allow_http_request(&state, ip));
-    assert!(allow_http_request(&state, ip));
-    assert!(!allow_http_request(&state, ip));
 }
 
 #[test]
@@ -691,15 +1525,6 @@ fn channel_reservation_cannot_race_cleanup() {
 }
 
 #[test]
-fn estimated_egress_uses_listener_limit_and_per_listener_cost() {
-    let mut config = test_config();
-    config.max_listeners_total = 85;
-    config.egress_kbps_per_listener = 384;
-
-    assert_eq!(estimated_egress_kbps(&config), 32640);
-}
-
-#[test]
 fn websocket_message_limit_ignores_h264_size_when_video_is_disabled() {
     let mut config = test_config();
     config.max_h264_frame_bytes = 2 * 1024 * 1024;
@@ -750,11 +1575,24 @@ fn websocket_origin_and_cors_share_one_policy() {
     headers.insert(ORIGIN, HeaderValue::from_static("https://server.example"));
     assert!(origin_allowed(&headers, &config));
     assert!(cors_origin(&headers, &config).is_some());
-}
 
-#[test]
-fn validator_accepts_raw_aac_access_unit() {
-    assert!(validate_aac_access_unit(&[0x21, 0x10, 0x56, 0xe5]).is_ok());
+    headers.insert(ORIGIN, HeaderValue::from_static("https://other.example"));
+    config.allowed_origins = vec!["https://*.example".to_owned()];
+    assert!(!origin_allowed(&headers, &config));
+    assert!(cors_origin(&headers, &config).is_none());
+
+    for allowed in [vec!["*"], vec!["https://client.example", "*"]] {
+        config.allowed_origins = allowed.into_iter().map(str::to_owned).collect();
+        assert!(origin_allowed(&headers, &config));
+        let mut response = HeaderMap::new();
+        apply_http_cors(&mut response, &headers, &config);
+        assert_eq!(response[ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert_eq!(response[VARY], "Origin");
+    }
+
+    config.allowed_origins.clear();
+    assert!(!origin_allowed(&headers, &config));
+    assert!(cors_origin(&headers, &config).is_none());
 }
 
 #[test]
@@ -820,21 +1658,11 @@ fn validator_rejects_oversized_access_unit() {
 }
 
 #[test]
-fn validator_accepts_annex_b_h264_keyframe() {
-    let access_unit = [
-        0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x1f, 0, 0, 1, 0x65, 0x88, 0x84,
-    ];
-    assert!(
-        validate_h264_access_unit(&access_unit, true, H264_DEFAULT_MAX_ACCESS_UNIT_BYTES).is_ok()
-    );
-}
-
-#[test]
 fn validator_accepts_standard_non_vcl_h264_nal_units() {
     for nal_type in 10..=12 {
         let access_unit = [0, 0, 0, 1, 0x65, 0x88, 0x84, 0, 0, 0, 1, nal_type, 0x80];
         assert!(
-            validate_h264_access_unit(&access_unit, true, H264_DEFAULT_MAX_ACCESS_UNIT_BYTES)
+            inspect_h264_access_unit(&access_unit, true, H264_DEFAULT_MAX_ACCESS_UNIT_BYTES)
                 .is_ok(),
             "NAL type {nal_type} should be accepted",
         );
@@ -848,7 +1676,7 @@ fn validator_accepts_h264_prefix_nal_units() {
     ];
 
     assert!(
-        validate_h264_access_unit(&access_unit, false, H264_DEFAULT_MAX_ACCESS_UNIT_BYTES).is_ok()
+        inspect_h264_access_unit(&access_unit, false, H264_DEFAULT_MAX_ACCESS_UNIT_BYTES).is_ok()
     );
 }
 
@@ -856,7 +1684,7 @@ fn validator_accepts_h264_prefix_nal_units() {
 fn validator_still_rejects_unapproved_h264_extension_nal_units() {
     let access_unit = [0, 0, 0, 1, 0x65, 0x88, 0x84, 0, 0, 0, 1, 0x0d, 0x80];
     assert_eq!(
-        validate_h264_access_unit(&access_unit, true, H264_DEFAULT_MAX_ACCESS_UNIT_BYTES),
+        inspect_h264_access_unit(&access_unit, true, H264_DEFAULT_MAX_ACCESS_UNIT_BYTES),
         Err("unsupported h264 nal unit")
     );
 }
@@ -1003,34 +1831,9 @@ fn streamer_rejects_video_frames_when_video_is_disabled() {
 fn validator_rejects_h264_keyframe_without_idr() {
     let access_unit = [0, 0, 0, 1, 0x41, 0x9a, 0x22];
     assert_eq!(
-        validate_h264_access_unit(&access_unit, true, H264_DEFAULT_MAX_ACCESS_UNIT_BYTES),
+        inspect_h264_access_unit(&access_unit, true, H264_DEFAULT_MAX_ACCESS_UNIT_BYTES),
         Err("h264 keyframe has no idr slice")
     );
-}
-
-#[test]
-fn rtsp_uri_parser_extracts_hash() {
-    let key = "a85c0211c512828c4c52dc5716a79e3a";
-
-    assert_eq!(
-        key_from_rtsp_uri("rtspt://example.com/a85c0211c512828c4c52dc5716a79e3a"),
-        Some(key)
-    );
-    assert_eq!(
-        key_from_rtsp_uri("/a85c0211c512828c4c52dc5716a79e3a/trackID=0"),
-        Some(key)
-    );
-    assert_eq!(
-        key_from_rtsp_uri("rtspt://example.com:8554/a85c0211c512828c4c52dc5716a79e3a?x=1"),
-        Some(key)
-    );
-    assert!(valid_hash(key));
-    assert!(!valid_hash(
-        "a85c0211c512828c4c52dc5716a79e3acba2b62dd6575b986366fd84e0903bc1"
-    ));
-    assert!(!valid_hash(
-        key_from_rtsp_uri("/live/a85c0211c512828c4c52dc5716a79e3a").unwrap()
-    ));
 }
 
 #[test]
@@ -1066,20 +1869,8 @@ fn rtsp_interleaved_channels_do_not_overlap_between_tracks() {
 
 #[test]
 fn rtsp_live_tracks_match_advertised_order() {
-    assert!(matches!(
-        rtsp_track_from_uri("rtsp://example.com/stream/trackID=0", true),
-        RtspTrack::Video
-    ));
-    assert!(matches!(
-        rtsp_track_from_uri("rtsp://example.com/stream/trackID=1", true),
-        RtspTrack::Audio
-    ));
-    assert!(matches!(
-        rtsp_track_from_uri("rtsp://example.com/stream/trackID=0", false),
-        RtspTrack::Audio
-    ));
-
     let session = RtspSession {
+        video_advertised: true,
         video_setup: true,
         audio_setup: true,
         audio_channel: 2,
@@ -1109,7 +1900,6 @@ fn rtsp_live_tracks_match_advertised_order() {
     );
 
     let audio_only = RtspSession {
-        video_omitted: true,
         audio_setup: true,
         audio_rtp: RtpState {
             sequence: 30,
@@ -1148,7 +1938,7 @@ async fn batched_h264_keeps_rtp_packet_boundaries() {
     let (server, _) = accepted.unwrap();
     let (read_half, write_half) = server.into_split();
     drop(read_half);
-    let writer = Arc::new(tokio::sync::Mutex::new(write_half));
+    let writer = Arc::new(tokio::sync::Mutex::new(Some(write_half)));
 
     let mut access_unit = vec![0, 0, 0, 1, 0x65];
     access_unit.resize(4 + 1 + RTP_MAX_PAYLOAD_BYTES * 3, 0x55);
@@ -1161,7 +1951,7 @@ async fn batched_h264_keeps_rtp_packet_boundaries() {
     };
     let mut sender = RtpPacketWriter::new(2, 4 + 12 + RTP_MAX_PAYLOAD_BYTES);
     sender
-        .send_h264_access_unit(&writer, &access_unit, true, true, &mut rtp)
+        .send_h264_access_unit(&writer, &access_unit, true, &mut rtp)
         .await
         .unwrap();
     drop(sender);
@@ -1194,6 +1984,43 @@ async fn batched_h264_keeps_rtp_packet_boundaries() {
     assert_eq!(packets, expected_packets);
     assert_eq!(rtp.packet_count as usize, expected_packets);
     assert_eq!(rtp.sequence, 10 + expected_packets as u16);
+}
+
+#[tokio::test]
+async fn cancelling_a_media_write_closes_the_writer_before_other_writes() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let (_read_half, write_half) = server.into_split();
+    let writer = Arc::new(tokio::sync::Mutex::new(Some(write_half)));
+    let mut packet_writer = RtpPacketWriter::new(2, 16 * 1024);
+    let mut rtp = RtpState::default();
+    let mut access_unit = vec![0x61; H264_HARD_MAX_ACCESS_UNIT_BYTES];
+    access_unit[..4].copy_from_slice(&[0, 0, 0, 1]);
+    {
+        let send = packet_writer.send_h264_access_unit(&writer, &access_unit, true, &mut rtp);
+        tokio::pin!(send);
+        // Stop while the large write waits for socket readiness or a cooperative yield.
+        let poll = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(send.as_mut(), cx))
+        })
+        .await;
+        assert!(poll.is_pending());
+        assert!(writer.try_lock().is_err());
+    }
+    assert!(writer.lock().await.is_none());
+    assert!(
+        packet_writer
+            .send_h264_access_unit(&writer, &[0, 0, 0, 1, 0x61], true, &mut rtp)
+            .await
+            .is_err()
+    );
+    tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut Vec::new()))
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[test]
@@ -1237,77 +2064,4 @@ fn rtcp_rtp_timestamp_projects_from_latest_media_time() {
         project_rtp_timestamp(u32::MAX - 9, Duration::from_secs(1), 10),
         0
     );
-}
-
-#[test]
-fn rtsp_sdp_describes_live_aggregate_session() {
-    let sdp = rtsp_sdp(Some(TEST_VIDEO_FMTP));
-
-    assert!(sdp.contains("a=range:npt=now-\r\n"));
-    assert!(sdp.contains("a=control:*\r\n"));
-    assert!(sdp.contains("m=video 0 RTP/AVP 96\r\n"));
-    assert!(sdp.contains("a=control:trackID=0\r\n"));
-    assert!(sdp.contains("a=rtpmap:96 H264/90000\r\n"));
-    assert!(sdp.contains(TEST_VIDEO_FMTP));
-    assert!(sdp.contains("m=audio 0 RTP/AVP 97\r\n"));
-    assert!(sdp.contains("a=control:trackID=1\r\n"));
-    assert!(sdp.contains("a=rtpmap:97 mpeg4-generic/48000/2\r\n"));
-    assert!(sdp.contains("config=1190"));
-    assert!(sdp.find("m=video").unwrap() < sdp.find("m=audio").unwrap());
-}
-
-#[test]
-fn rtsp_sdp_can_describe_audio_only_session() {
-    let sdp = rtsp_sdp(None);
-
-    assert!(sdp.contains("m=audio 0 RTP/AVP 97\r\n"));
-    assert!(sdp.contains("a=control:trackID=0\r\n"));
-    assert!(!sdp.contains("m=video"));
-    assert!(!sdp.contains("trackID=1"));
-    assert!(!sdp.contains("H264"));
-}
-
-#[test]
-fn androidx_media3_only_gets_video_track_for_active_video() {
-    assert!(!should_advertise_video(true, VideoStreamState::Offline));
-    assert!(!should_advertise_video(true, VideoStreamState::AudioOnly));
-    assert!(should_advertise_video(true, VideoStreamState::Video));
-    assert!(should_advertise_video(false, VideoStreamState::Offline));
-    assert!(should_advertise_video(false, VideoStreamState::AudioOnly));
-}
-
-#[test]
-fn streamer_video_flag_is_independent_from_rtsp_placeholder_track() {
-    let mut config = test_config();
-    config.video_enabled = false;
-
-    assert!(streamer_hello_message(&config, 0, "rtspt://example.com").contains("\"video\":false"));
-    assert!(rtsp_sdp(Some(TEST_VIDEO_FMTP)).contains("m=video 0 RTP/AVP 96\r\n"));
-}
-
-#[test]
-fn active_video_never_selects_a_placeholder() {
-    let placeholders = Placeholders {
-        offline_video: Bytes::from_static(b"offline"),
-        audio_only_video: Bytes::from_static(b"audio"),
-        offline_fmtp: Arc::from(TEST_VIDEO_FMTP),
-        audio_only_fmtp: Arc::from(TEST_VIDEO_FMTP),
-    };
-    assert!(placeholder_access_unit(&placeholders, VideoStreamState::Offline).is_some());
-    assert!(placeholder_access_unit(&placeholders, VideoStreamState::AudioOnly).is_some());
-    assert!(placeholder_access_unit(&placeholders, VideoStreamState::Video).is_none());
-}
-
-#[tokio::test]
-async fn detects_androidx_media3_user_agent_prefix() {
-    let mut android = BufReader::new(
-        b"OPTIONS * RTSP/1.0\r\nUser-Agent: AndroidXMedia3/1.8.0\r\n\r\n".as_slice(),
-    );
-    let request = read_rtsp_request(&mut android).await.unwrap().unwrap();
-    assert!(request.is_androidx_media3());
-
-    let mut other =
-        BufReader::new(b"OPTIONS * RTSP/1.0\r\nUser-Agent: ExoPlayerLib/2.19.1\r\n\r\n".as_slice());
-    let request = read_rtsp_request(&mut other).await.unwrap().unwrap();
-    assert!(!request.is_androidx_media3());
 }

@@ -1,4 +1,8 @@
 {
+  "streamModeTitle": "Stream",
+  "streamModeAudio": "Audio",
+  "streamModeVideo": "Audio + Video",
+  "backButton": "Back",
   "customServerApiPlaceholder": "HTTP API Address",
   "streamUrlCopyHint": "Click to Copy",
   "customServerConnectButton": "Connect",

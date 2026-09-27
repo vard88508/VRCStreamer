@@ -1,12 +1,14 @@
 # Rust build output
 /target/
 /server/target/
-/server/VRCStreamer
+/server/VRCast
+/server/VRCast.exe
 
 # Local env and secrets
 .env
 .env.*
 !.env.example
+VRCast.conf
 certs/
 *.key
 *.pem

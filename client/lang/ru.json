@@ -1,4 +1,8 @@
 {
+  "streamModeTitle": "Трансляция",
+  "streamModeAudio": "Аудио",
+  "streamModeVideo": "Аудио + Видео",
+  "backButton": "Назад",
   "customServerApiPlaceholder": "HTTP API адрес",
   "streamUrlCopyHint": "Нажми, чтобы скопировать",
   "customServerConnectButton": "Подключить",

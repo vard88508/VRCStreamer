@@ -3,12 +3,14 @@ import { createUi } from "./ui.js";
 
 const aacWorkerUrl = new URL("aac-worker.js", import.meta.url);
 const textEncoder = new TextEncoder();
-const streamCodeCharset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&()*+,-./:;<=>?@[]^_{|}~";
-const storagePrefix = "vrc-audio-streamer-";
+const streamCodeCharset =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&()*+,-./:;<=>?@[]^_{|}~";
+const storagePrefix = "vrcast-";
 const storageVersion = "2";
-const systemCaptureSupported = /\b(?:Chrome|Chromium|Edg|OPR)\//i.test(navigator.userAgent)
-  && !/\b(?:CriOS|EdgiOS|OPiOS)\//i.test(navigator.userAgent)
-  && typeof navigator.mediaDevices?.getDisplayMedia === "function";
+const systemCaptureSupported =
+  /\b(?:Chrome|Chromium|Edg|OPR)\//i.test(navigator.userAgent) &&
+  !/\b(?:CriOS|EdgiOS|OPiOS)\//i.test(navigator.userAgent) &&
+  typeof navigator.mediaDevices?.getDisplayMedia === "function";
 
 const storageKeys = {
   version: `${storagePrefix}storage-version`,
@@ -22,7 +24,7 @@ const storageKeys = {
   videoQuality: `${storagePrefix}video-quality`,
   micDevice: `${storagePrefix}mic-device`,
   language: `${storagePrefix}language`,
-  sourceSettings: `${storagePrefix}source-settings`
+  sourceSettings: `${storagePrefix}source-settings`,
 };
 
 const config = {
@@ -38,11 +40,10 @@ const config = {
   videoHeight: 720,
   videoFps: 30,
   videoBitrate: 2000000,
-  videoPlaceholderHoldMs: 15000,
   wsPauseBufferedBytes: 1024 * 1024,
   wsResumeBufferedBytes: 256 * 1024,
   wsStallTimeoutMs: 5000,
-  systemCaptureSupported
+  systemCaptureSupported,
 };
 
 config.expectedEncodedFpsLabel = (config.sampleRate / config.framesPerChunk).toFixed(1);
@@ -50,37 +51,24 @@ config.expectedEncodedFpsLabel = (config.sampleRate / config.framesPerChunk).toF
 const encoderModes = {
   native192: {
     bitrate: 192000,
-    preferNative: true,
-    allowWasmFallback: false,
-    nativeAacBitrates: [192000]
+    native: true,
   },
   wasm192: {
     bitrate: 192000,
-    preferNative: false,
-    allowWasmFallback: true,
-    nativeAacBitrates: []
+    native: false,
   },
   wasm320: {
     bitrate: 320000,
-    preferNative: false,
-    allowWasmFallback: true,
-    nativeAacBitrates: []
-  }
+    native: false,
+  },
 };
 
 const fallbackServers = [
   {
-    name: "Local 554",
-    description: "Local test server on default RTSP port 554.",
+    name: "Local Server",
+    description: "Local test server.",
     apiBase: "http://127.0.0.1:8081",
-    rtspBase: "rtspt://127.0.0.1"
   },
-  {
-    name: "Local 8554",
-    description: "Local test server on RTSP port 8554.",
-    apiBase: "http://127.0.0.1:8081",
-    rtspBase: "rtspt://127.0.0.1:8554"
-  }
 ];
 
 const defaultClientConfig = {
@@ -88,10 +76,11 @@ const defaultClientConfig = {
   servers: [],
   motd: null,
   patrons: null,
-  remoteData: ""
+  remoteData: "",
 };
 
 let active = null;
+let streamMode = null;
 let streamCode = "";
 let baseServers = fallbackServers;
 let bookmarkedServers = [];
@@ -102,9 +91,9 @@ let videoQualities = [];
 let nativeAacAvailable = true;
 let sourceRequestInFlight = false;
 let linkRestartInFlight = false;
-let encoderSwapInFlight = false;
 let customConnectRequested = false;
 let serverOnline = false;
+let serverInfoRequest = 0;
 let streamUrlRequestSeq = 0;
 let configRequestSeq = 0;
 let remoteDataUrl = "";
@@ -115,40 +104,52 @@ let clientConfig = defaultClientConfig;
 const app = {
   config,
   storageKeys,
-  get active() { return active; },
-  set active(value) { active = value; },
-  get streamCode() { return streamCode; },
-  get nativeAacAvailable() { return nativeAacAvailable; },
-  set nativeAacAvailable(value) { nativeAacAvailable = Boolean(value); },
-  get sourceRequestInFlight() { return sourceRequestInFlight; },
-  set sourceRequestInFlight(value) { sourceRequestInFlight = Boolean(value); },
-  get linkRestartInFlight() { return linkRestartInFlight; },
-  get encoderSwapInFlight() { return encoderSwapInFlight; },
+  get active() {
+    return active;
+  },
+  set active(value) {
+    active = value;
+  },
+  get streamCode() {
+    return streamCode;
+  },
+  get nativeAacAvailable() {
+    return nativeAacAvailable;
+  },
+  set nativeAacAvailable(value) {
+    nativeAacAvailable = Boolean(value);
+  },
+  get sourceRequestInFlight() {
+    return sourceRequestInFlight;
+  },
+  set sourceRequestInFlight(value) {
+    sourceRequestInFlight = Boolean(value);
+  },
+  get linkRestartInFlight() {
+    return linkRestartInFlight;
+  },
+  get streamMode() {
+    return streamMode;
+  },
   readStorage,
   writeStorage,
   readJsonStorage,
   writeJsonStorage,
   selectedEncoderMode,
-  selectedEncoderModeKey,
   selectedVideoQuality,
-  applyVideoQuality,
   selectedServer,
-  serverKey,
   serverDisplayName,
   serverDescription,
   currentServerInfo,
   serverVideoEnabled,
   serverConnectionReady,
   wsUrlForCode,
-  waitForOpen,
-  handleStreamerMessage
 };
 
 const ui = createUi(app);
 app.ui = ui;
 const streamer = createStreamer(app);
 app.streamer = streamer;
-window.force_resync = streamer.forceResync;
 
 function readStorage(key, fallback = "") {
   try {
@@ -159,7 +160,9 @@ function readStorage(key, fallback = "") {
 }
 
 function writeStorage(key, value) {
-  try { localStorage.setItem(key, value); } catch (_) {}
+  try {
+    localStorage.setItem(key, value);
+  } catch (_) {}
 }
 
 function readJsonStorage(key, fallback) {
@@ -179,8 +182,16 @@ function isRecord(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function resetStorageIfVersionChanged() {
+function initializeStorage() {
   try {
+    // Migrate existing settings on this origin without overwriting new ones.
+    for (const key of Object.values(storageKeys)) {
+      const oldKey = "vrc-audio-streamer-" + key.slice(storagePrefix.length);
+      const value = localStorage.getItem(oldKey);
+      if (value === null) continue;
+      if (localStorage.getItem(key) === null) localStorage.setItem(key, value);
+      localStorage.removeItem(oldKey);
+    }
     if (localStorage.getItem(storageKeys.version) === storageVersion) return;
     const keep = new Set([storageKeys.bookmarkedServers]);
     const keys = [];
@@ -188,7 +199,7 @@ function resetStorageIfVersionChanged() {
       const key = localStorage.key(i);
       if (key && key.startsWith(storagePrefix) && !keep.has(key)) keys.push(key);
     }
-    keys.forEach(key => localStorage.removeItem(key));
+    keys.forEach((key) => localStorage.removeItem(key));
     localStorage.setItem(storageKeys.version, storageVersion);
   } catch (_) {}
 }
@@ -202,9 +213,7 @@ function randomCode() {
 }
 
 function validStoredCode(code) {
-  return typeof code === "string"
-    && code.length === config.streamCodeLength
-    && /^[\x21-\x7e]+$/.test(code);
+  return typeof code === "string" && code.length === config.streamCodeLength && /^[\x21-\x7e]+$/.test(code);
 }
 
 function saveCode(code) {
@@ -241,17 +250,16 @@ function normalizeBase(value, defaultProtocol) {
 function normalizeServerEntry(entry) {
   if (typeof entry === "string") entry = { apiBase: entry };
   if (!isRecord(entry)) return null;
-  const apiBase = entry.apiBase || entry.api || entry.http || entry.host || "";
-  const rtspBase = entry.rtspBase || entry.rtsp || entry.media || "";
+  const apiBase = entry.apiBase || "";
+  const rtspBase = entry.rtspBase || "";
   if (typeof apiBase !== "string" || typeof rtspBase !== "string") return null;
   if (!apiBase.trim()) return null;
   return {
-    name: String(entry.name || entry.label || "").trim(),
+    name: String(entry.name || "").trim(),
     description: String(entry.description || "").trim(),
     apiBase: apiBase.trim(),
     rtspBase: rtspBase.trim(),
     password: String(entry.password || "").trim(),
-    video: entry.video === true
   };
 }
 
@@ -272,7 +280,7 @@ function hostName(value, defaultProtocol) {
 }
 
 function isLoopbackHost(host) {
-  return host === "localhost" || host === "::1" || host.startsWith("127.");
+  return host === "localhost" || host === "[::1]" || host.startsWith("127.");
 }
 
 function isLoopbackBase(value, defaultProtocol) {
@@ -285,17 +293,8 @@ function safeRtspBaseForServer(server, value) {
   return !isLoopbackBase(server.apiBase, "https://") && isLoopbackBase(base, "rtspt://") ? "" : base;
 }
 
-function safeHttpUrl(value) {
-  try {
-    const url = new URL(String(value || "").trim());
-    return url.protocol === "http:" || url.protocol === "https:" ? url.href : "";
-  } catch (_) {
-    return "";
-  }
-}
-
 function sameServer(left, right) {
-  return normalizeBase(left.apiBase, "https://") === normalizeBase(right.apiBase, "https://");
+  return serverKey(left) === serverKey(right);
 }
 
 function serverKey(server) {
@@ -308,10 +307,8 @@ function normalizeServerMeta(meta) {
   return {
     name: String(meta.name || "").trim(),
     description: String(meta.description || "").trim(),
-    rtspBase: String(meta.rtspBase || meta.rtsp_base || "").trim(),
-    policiesLink: safeHttpUrl(meta.policiesLink || meta.policies_link),
-    reportAbuseLink: safeHttpUrl(meta.reportAbuseLink || meta.report_abuse_link),
-    video: Boolean(meta.video)
+    rtspBase: String(meta.rtspBase || "").trim(),
+    video: Boolean(meta.video),
   };
 }
 
@@ -321,7 +318,7 @@ function loadServerMetaCache() {
   if (!isRecord(saved)) return;
   for (const [key, value] of Object.entries(saved)) {
     const meta = normalizeServerMeta(value);
-    if (meta && (meta.name || meta.description || meta.rtspBase || meta.policiesLink || meta.reportAbuseLink || meta.video)) {
+    if (meta && (meta.name || meta.description || meta.rtspBase || meta.video)) {
       serverMetaCache[key] = meta;
     }
   }
@@ -337,9 +334,7 @@ function savedServerMeta(server) {
 
 function serverDisplayName(server) {
   const meta = savedServerMeta(server);
-  return ((meta && meta.name) || server.name || hostLabel(server.apiBase))
-    .replace(/^[🔊📺]\s*/u, "")
-    .replace(/\s*[🔊📺]\s*$/u, "");
+  return (meta && meta.name) || server.name || hostLabel(server.apiBase);
 }
 
 function serverDescription(server) {
@@ -369,9 +364,7 @@ function serverVideoEnabled() {
 
 function loadBookmarkedServers() {
   const saved = readJsonStorage(storageKeys.bookmarkedServers, []);
-  bookmarkedServers = Array.isArray(saved)
-    ? saved.map(normalizeServerEntry).filter(Boolean)
-    : [];
+  bookmarkedServers = Array.isArray(saved) ? saved.map(normalizeServerEntry).filter(Boolean) : [];
 }
 
 function saveBookmarkedServers() {
@@ -386,7 +379,7 @@ function normalizeRemoteData(payload) {
   const data = isRecord(payload) ? payload : {};
   return {
     motd: isRecord(data.motd) ? data.motd : null,
-    patrons: isRecord(data.patrons) ? data.patrons : null
+    patrons: isRecord(data.patrons) ? data.patrons : null,
   };
 }
 
@@ -397,14 +390,14 @@ function normalizeConfig(payload) {
     langs: isRecord(data.langs) ? data.langs : { en: "English" },
     servers: Array.isArray(data.servers) ? data.servers : [],
     remoteData,
-    ...normalizeRemoteData(data)
+    ...normalizeRemoteData(data),
   };
 }
 
 async function fetchJson(urlInput) {
   const url = new URL(urlInput, location.href);
   url.searchParams.set("t", String(Date.now()));
-  const response = await fetch(url, { cache: "no-store" });
+  const response = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(10000) });
   if (!response.ok) throw new Error(`${url.pathname} ${response.status}`);
   return await response.json();
 }
@@ -453,7 +446,7 @@ async function loadClientConfig() {
     return;
   }
 
-  loadRemoteData(clientConfig.remoteData).then(remote => {
+  loadRemoteData(clientConfig.remoteData).then((remote) => {
     if (seq !== configRequestSeq) return;
     if (remote) {
       remoteDataLoaded = true;
@@ -491,9 +484,14 @@ function renderServers() {
   fragment.appendChild(customOption);
   serverSelectEl.replaceChildren(fragment);
 
-  let saved = readStorage(storageKeys.server, "0") || "0";
-  if (saved !== "custom" && (!/^\d+$/.test(saved) || Number(saved) >= servers.length)) saved = "0";
-  serverSelectEl.value = saved;
+  const saved = readStorage(storageKeys.server);
+  // Accept an old numeric selection once, then persist the stable API address.
+  const index = /^\d+$/.test(saved)
+    ? Number(saved)
+    : servers.findIndex((server) => serverKey(server) === saved);
+  serverSelectEl.value =
+    saved === "custom" ? "custom" : String(index >= 0 && index < servers.length ? index : 0);
+  saveSelectedServer();
   ui.updateCustomVisibility();
 }
 
@@ -504,7 +502,7 @@ function selectedServer() {
       name: ui.tr("serverSelectCustomOption"),
       description: ui.tr("customServerDescription"),
       apiBase: customApiEl.value,
-      password: customPasswordEl.value
+      password: customPasswordEl.value,
     };
   }
   return servers[Number(serverSelectEl.value)] || servers[0] || fallbackServers[0];
@@ -520,7 +518,7 @@ function canRequestSelectedServer() {
 
 function setServerStatus(state, streams = 0, listeners = 0) {
   serverOnline = state === "online";
-  if (!serverOnline) ui.setServerLinks("", "");
+  if (!serverOnline) ui.setServerLinks(false);
   ui.setServerStatus(state, streams, listeners);
   ui.updateSourceControls();
 }
@@ -529,12 +527,12 @@ function customServerEntry() {
   const { customApiEl, customPasswordEl } = ui.els;
   return normalizeServerEntry({
     apiBase: customApiEl.value,
-    password: customPasswordEl.value
+    password: customPasswordEl.value,
   });
 }
 
-function saveSelectedServerValue() {
-  writeStorage(storageKeys.server, ui.els.serverSelectEl.value);
+function saveSelectedServer() {
+  writeStorage(storageKeys.server, ui.els.serverSelectEl.value === "custom" ? "custom" : currentServerKey());
 }
 
 function applyServerInfo(info, targetKey = currentServerKey()) {
@@ -542,24 +540,23 @@ function applyServerInfo(info, targetKey = currentServerKey()) {
 
   const selected = selectedServer();
   const previous = serverMetaCache[targetKey] || {};
-  const rawRtspBase = typeof info.rtsp_base === "string"
-    ? info.rtsp_base
-    : typeof info.rtspBase === "string"
-      ? info.rtspBase
-      : "";
+  const rawRtspBase = typeof info.rtsp_base === "string" ? info.rtsp_base : "";
   const meta = {
     name: typeof info.name === "string" ? info.name.trim() || previous.name || "" : previous.name || "",
     description: typeof info.description === "string" ? info.description.trim() : previous.description || "",
-    rtspBase: safeRtspBaseForServer(selected, rawRtspBase) || safeRtspBaseForServer(selected, previous.rtspBase || ""),
-    policiesLink: safeHttpUrl(info.policies_link || info.policiesLink),
-    reportAbuseLink: safeHttpUrl(info.report_abuse_link || info.reportAbuseLink),
-    video: Boolean(info.video)
+    rtspBase:
+      safeRtspBaseForServer(selected, rawRtspBase) ||
+      safeRtspBaseForServer(selected, previous.rtspBase || ""),
+    officialPublic: info.official_public === true,
+    video: Boolean(info.video),
   };
 
   serverInfo = { key: targetKey, ...meta };
-  serverMetaCache[targetKey] = meta;
-  saveServerMetaCache();
-  ui.setServerLinks(meta.policiesLink, meta.reportAbuseLink);
+  if (Object.keys(meta).some((key) => meta[key] !== previous[key])) {
+    serverMetaCache[targetKey] = meta;
+    saveServerMetaCache();
+  }
+  ui.setServerLinks(meta.officialPublic);
 
   if (ui.els.serverSelectEl.value !== "custom") {
     const index = Number(ui.els.serverSelectEl.value);
@@ -574,20 +571,18 @@ function applyServerInfo(info, targetKey = currentServerKey()) {
     ui.updateCustomOption();
   }
 
-  if (active && !meta.video && active.sources.video) {
-    streamer.removeVideoSource(active.sources.video);
-  }
+  if (!active && !sourceRequestInFlight && streamMode === "video" && !meta.video) streamMode = null;
   ui.updateCustomVisibility();
   ui.updateSourceControls();
   updateUrl();
 }
 
 async function connectSelectedServer() {
-  saveSelectedServerValue();
+  saveSelectedServer();
   setServerStatus("loading");
   ui.updateCustomVisibility();
   updateUrl();
-  return await refreshStats();
+  return await refreshServerInfo();
 }
 
 async function connectCustomServer() {
@@ -605,11 +600,11 @@ async function connectCustomServer() {
 
 function saveCustomServer(entry) {
   entry.rtspBase = serverRtspBase(entry);
-  const existing = servers.findIndex(server => sameServer(server, entry));
+  const existing = servers.findIndex((server) => sameServer(server, entry));
 
   if (existing >= 0) {
     servers[existing].password = entry.password;
-    const bookmarked = bookmarkedServers.find(server => sameServer(server, entry));
+    const bookmarked = bookmarkedServers.find((server) => sameServer(server, entry));
     if (bookmarked) {
       bookmarked.password = entry.password;
       saveBookmarkedServers();
@@ -623,7 +618,7 @@ function saveCustomServer(entry) {
     ui.els.serverSelectEl.value = String(servers.length - 1);
   }
 
-  saveSelectedServerValue();
+  saveSelectedServer();
   customConnectRequested = false;
   ui.updateCustomVisibility();
   ui.updateServerHint();
@@ -633,9 +628,7 @@ function saveCustomServer(entry) {
 function removeSelectedBookmarkedServer() {
   const selectedIndex = Number(ui.els.serverSelectEl.value);
   const bookmarkIndex = selectedIndex - baseServers.length;
-  if (!Number.isInteger(selectedIndex)
-      || bookmarkIndex < 0
-      || bookmarkIndex >= bookmarkedServers.length) {
+  if (!Number.isInteger(selectedIndex) || bookmarkIndex < 0 || bookmarkIndex >= bookmarkedServers.length) {
     return false;
   }
 
@@ -648,20 +641,20 @@ function removeSelectedBookmarkedServer() {
   }
   rebuildServers();
   serverInfo = null;
-  writeStorage(storageKeys.server, "0");
+  writeStorage(storageKeys.server, serverKey(servers[0]));
   renderServers();
   connectSelectedServer();
   return true;
 }
 
 function apiUrlFor(server, path) {
-  const base = normalizeBase(server.apiBase, location.protocol === "https:" ? "https://" : "http://");
+  const base = serverKey(server);
   if (!base) throw new Error("API server is not configured.");
   return new URL(String(path).replace(/^\/+/, ""), base + "/");
 }
 
 function wsUrlForCode(code, server = selectedServer()) {
-  const url = apiUrlFor(server, `ingest?code=${encodeURIComponent(code)}`);
+  const url = apiUrlFor(server, `stream?code=${encodeURIComponent(code)}`);
   if (server.password) url.searchParams.set("password", server.password);
   if (url.protocol === "https:") url.protocol = "wss:";
   else if (url.protocol === "http:") url.protocol = "ws:";
@@ -671,7 +664,7 @@ function wsUrlForCode(code, server = selectedServer()) {
 
 function mediaUrl(hash) {
   const base = normalizeBase(serverRtspBase(selectedServer()), "rtspt://");
-  return base ? `${base}/${hash}` : "";
+  return base ? `${base}/${hash}${(active?.mode || streamMode) === "audio" ? "/audio" : ""}` : "";
 }
 
 async function updateUrl() {
@@ -693,7 +686,6 @@ function bindHintEvents(element, show, hide) {
 
 function loadEncoderMode() {
   let saved = readStorage(storageKeys.encoderMode, "native192") || "native192";
-  if (saved === "wasm190") saved = "wasm192";
   if (!encoderModes[saved]) saved = "native192";
   ui.els.encoderModeEl.value = saved;
   ui.updateSelectDisplay(ui.els.encoderModeEl);
@@ -703,33 +695,36 @@ function selectedEncoderMode() {
   return encoderModes[ui.els.encoderModeEl.value] || encoderModes.native192;
 }
 
-function selectedEncoderModeKey() {
-  return ui.els.encoderModeEl.value;
-}
-
-function normalizeVideoQuality(value, index) {
-  const match = typeof value === "string"
-    ? value.trim().match(/^(\d+)x(\d+)\*(\d+)\/(\d+)$/i)
-    : null;
+function normalizeVideoQuality(value) {
+  const match = typeof value === "string" ? value.trim().match(/^(\d+)x(\d+)\*(\d+)\/(\d+)$/i) : null;
   if (!match) return null;
   const width = Number(match[1]);
   const height = Number(match[2]);
   const fps = Number(match[3]);
   const bitrateKbps = Number(match[4]);
-  if (!Number.isInteger(width) || width < 1 || width > 65535
-      || !Number.isInteger(height) || height < 1 || height > 65535
-      || !Number.isInteger(fps) || fps < 1 || fps > 65535
-      || !Number.isInteger(bitrateKbps) || bitrateKbps < 1 || bitrateKbps > 4294967295) {
+  if (
+    !Number.isInteger(width) ||
+    width < 1 ||
+    width > 65535 ||
+    !Number.isInteger(height) ||
+    height < 1 ||
+    height > 65535 ||
+    !Number.isInteger(fps) ||
+    fps < 1 ||
+    fps > 65535 ||
+    !Number.isInteger(bitrateKbps) ||
+    bitrateKbps < 1 ||
+    bitrateKbps > 4294967295
+  ) {
     return null;
   }
   return {
     id: `${width}x${height}*${fps}/${bitrateKbps}`,
-    index,
     width,
     height,
     fps,
     bitrateKbps,
-    bitrate: bitrateKbps * 1000
+    bitrate: bitrateKbps * 1000,
   };
 }
 
@@ -756,29 +751,31 @@ function saveVideoQuality(id) {
   writeJsonStorage(storageKeys.videoQuality, byServer);
 }
 
-function setVideoQualities(values, enabled) {
+function setVideoQualities(values) {
+  if (active || sourceRequestInFlight) return;
   const seen = new Set();
   const next = [];
   const count = Array.isArray(values) ? Math.min(values.length, 32) : 0;
   for (let index = 0; index < count; index++) {
-    const quality = normalizeVideoQuality(values[index], index);
+    const quality = normalizeVideoQuality(values[index]);
     if (!quality || seen.has(quality.id)) continue;
     seen.add(quality.id);
     next.push(quality);
   }
-  if (enabled && next.length === 0) {
-    next.push(normalizeVideoQuality("1280x720*30/2000", 0));
-  }
   const saved = savedVideoQuality();
-  const selected = next.find(quality => quality.id === saved) || next[0] || null;
-  const unchanged = next.length === videoQualities.length
-    && next.every((quality, index) => quality.id === videoQualities[index].id);
+  const selected = next.find((quality) => quality.id === saved) || next[0] || null;
+  const unchanged =
+    next.length === videoQualities.length &&
+    next.every((quality, index) => quality.id === videoQualities[index].id);
   const selectedId = selected?.id || "";
   videoQualities = next;
-  if (selected && (selected.width !== config.videoWidth
-      || selected.height !== config.videoHeight
-      || selected.fps !== config.videoFps
-      || selected.bitrate !== config.videoBitrate)) {
+  if (
+    selected &&
+    (selected.width !== config.videoWidth ||
+      selected.height !== config.videoHeight ||
+      selected.fps !== config.videoFps ||
+      selected.bitrate !== config.videoBitrate)
+  ) {
     applyVideoQuality(selected);
   }
   if (saved !== selectedId) saveVideoQuality(selectedId);
@@ -789,26 +786,28 @@ function setVideoQualities(values, enabled) {
 }
 
 function selectedVideoQuality() {
-  const selected = videoQualities.find(quality => quality.id === ui.els.videoQualityEl.value);
+  const selected = videoQualities.find((quality) => quality.id === ui.els.videoQualityEl.value);
   return selected || videoQualities[0] || null;
 }
 
 async function nativeEncoderSupported() {
   if (!window.Worker) return false;
   const mode = encoderModes.native192;
-  return await new Promise(resolve => {
+  return await new Promise((resolve) => {
     const worker = new Worker(aacWorkerUrl, { type: "module" });
     let done = false;
-    const finish = supported => {
+    const finish = (supported) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      try { worker.postMessage({ type: "close" }); } catch (_) {}
+      try {
+        worker.postMessage({ type: "close" });
+      } catch (_) {}
       worker.terminate();
       resolve(supported);
     };
     const timer = setTimeout(() => finish(false), 4500);
-    worker.onmessage = event => {
+    worker.onmessage = (event) => {
       const message = event.data;
       if (message.type === "ready") finish(message.name === "Native WebCodecs AAC");
       else if (message.type === "error") finish(false);
@@ -820,9 +819,7 @@ async function nativeEncoderSupported() {
       channels: config.channels,
       bitrate: mode.bitrate,
       expectedAacConfigHex: config.expectedAacConfigHex,
-      nativeAacBitrates: mode.nativeAacBitrates,
-      preferNative: true,
-      allowWasmFallback: false
+      native: true,
     });
   });
 }
@@ -832,69 +829,33 @@ async function selectWasmWhenNativeUnsupported() {
   ui.setNativeAacAvailable(nativeAacAvailable);
 }
 
-async function refreshStats() {
+async function refreshServerInfo() {
   if (!canRequestSelectedServer()) return false;
+  const request = ++serverInfoRequest;
   const server = selectedServer();
   const key = serverKey(server);
+  const isCurrent = () =>
+    request === serverInfoRequest && canRequestSelectedServer() && key === currentServerKey();
   try {
-    const response = await fetch(apiUrlFor(server, "stats"), { cache: "no-store" });
-    if (!response.ok) throw new Error(`stats ${response.status}`);
+    const response = await fetch(apiUrlFor(server, "info"), {
+      cache: "no-store",
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!response.ok) throw new Error(`info ${response.status}`);
     const stats = await response.json();
-    if (key !== currentServerKey()) return false;
+    if (!isCurrent()) return false;
     applyServerInfo(stats, key);
-    if (Array.isArray(stats.video_qualities)) {
-      setVideoQualities(stats.video_qualities, Boolean(stats.video));
-    }
-    setServerStatus("online", Number(stats.active_streams) || 0, Number(stats.active_listeners) || 0);
+    setVideoQualities(stats.video ? stats.video_qualities : []);
+    setServerStatus(
+      "online",
+      (Number(stats.audio_streams) || 0) + (Number(stats.video_streams) || 0),
+      (Number(stats.audio_listeners) || 0) + (Number(stats.video_listeners) || 0),
+    );
     return true;
   } catch (_) {
-    if (key === currentServerKey()) setServerStatus("offline");
+    if (isCurrent()) setServerStatus("offline");
     return false;
   }
-}
-
-function listenerCountFromMessage(message) {
-  const value = Number(message.listeners);
-  return Number.isInteger(value) && value >= 0 ? value : null;
-}
-
-function handleStreamerMessage(event, key, setStreamListeners, receiveHello) {
-  if (typeof event.data !== "string") return;
-  let message = null;
-  try {
-    message = JSON.parse(event.data);
-  } catch (_) {
-    return;
-  }
-
-  if (message.type === "hello") {
-    applyServerInfo(message, key);
-    const quality = setVideoQualities(message.video_qualities, Boolean(message.video));
-    const listeners = listenerCountFromMessage(message);
-    if (listeners !== null) setStreamListeners(listeners);
-    receiveHello(message, quality);
-  } else if (message.type === "listeners") {
-    const listeners = listenerCountFromMessage(message);
-    if (listeners !== null) setStreamListeners(listeners);
-  }
-}
-
-function waitForOpen(ws) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("WebSocket open timeout")), 10000);
-    ws.onopen = () => {
-      clearTimeout(timer);
-      resolve();
-    };
-    ws.onerror = () => {
-      clearTimeout(timer);
-      reject(new Error("WebSocket connection failed"));
-    };
-    ws.onclose = () => {
-      clearTimeout(timer);
-      reject(new Error("WebSocket closed before streaming started"));
-    };
-  });
 }
 
 async function copyUrl() {
@@ -915,7 +876,7 @@ async function copyUrl() {
 }
 
 async function newLink() {
-  if (sourceRequestInFlight || linkRestartInFlight || encoderSwapInFlight) return;
+  if (sourceRequestInFlight || linkRestartInFlight || !serverOnline) return;
   linkRestartInFlight = true;
   ui.updateSourceControls();
   try {
@@ -930,6 +891,15 @@ async function newLink() {
 
 function bindEvents() {
   const els = ui.els;
+  const selectMode = (mode) => {
+    if (active || sourceRequestInFlight) return;
+    streamMode = mode;
+    ui.updateSourceControls();
+    updateUrl();
+  };
+  els.audioModeBtn.onclick = () => selectMode("audio");
+  els.videoModeBtn.onclick = () => selectMode("video");
+  els.backBtn.onclick = () => selectMode(null);
   els.rtspUrlEl.onclick = copyUrl;
   bindHintEvents(els.rtspUrlEl, ui.showRtspHint, ui.hideRtspHint);
   els.newLinkBtn.onclick = newLink;
@@ -938,7 +908,10 @@ function bindEvents() {
   els.displayVideoBtn.onclick = () => streamer.start("video");
   els.stopBtn.onclick = streamer.stop;
 
-  for (const [button, kind] of [[els.displayAudioBtn, "screen"], [els.displayVideoBtn, "video"]]) {
+  for (const [button, kind] of [
+    [els.displayAudioBtn, "screen"],
+    [els.displayVideoBtn, "video"],
+  ]) {
     bindHintEvents(button, () => ui.showSystemSourceHint(kind), ui.hideSystemSourceHint);
   }
 
@@ -946,14 +919,14 @@ function bindEvents() {
 
   els.micDeviceEl.onchange = () => {
     ui.saveMicDeviceSelection();
-    if (active) streamer.addOrReplaceSource("mic");
+    streamer.start("mic");
   };
 
   els.serverSelectEl.onchange = () => {
     if (active) streamer.stop();
     if (els.serverSelectEl.value === "custom") {
       customConnectRequested = false;
-      saveSelectedServerValue();
+      saveSelectedServer();
       setServerStatus("loading");
       ui.updateCustomVisibility();
       ui.updateSourceControls();
@@ -962,16 +935,17 @@ function bindEvents() {
     }
     connectSelectedServer();
   };
-  els.serverSelectEl.addEventListener("contextmenu", event => {
+  els.serverSelectEl.addEventListener("contextmenu", (event) => {
     if (!removeSelectedBookmarkedServer()) return;
     event.preventDefault();
   });
 
-  els.customServerFormEl.onsubmit = event => {
+  els.customServerFormEl.onsubmit = (event) => {
     event.preventDefault();
     connectCustomServer();
   };
   els.customApiEl.addEventListener("input", () => {
+    serverInfoRequest++;
     customConnectRequested = false;
     writeStorage(storageKeys.customApi, els.customApiEl.value);
     setServerStatus("loading");
@@ -980,64 +954,23 @@ function bindEvents() {
     ui.updateSourceControls();
   });
   els.customPasswordEl.addEventListener("input", () => {
+    serverInfoRequest++;
     customConnectRequested = false;
     writeStorage(storageKeys.customPassword, els.customPasswordEl.value);
     setServerStatus("loading");
     ui.updateSourceControls();
   });
 
-  els.encoderModeEl.onchange = async () => {
-    const session = active;
-    const previousMode = session && session.encoderModeKey;
-    writeStorage(storageKeys.encoderMode, els.encoderModeEl.value);
-    if (!session) return;
-    if (sourceRequestInFlight || linkRestartInFlight || encoderSwapInFlight) {
-      els.encoderModeEl.value = previousMode;
-      writeStorage(storageKeys.encoderMode, previousMode);
-      ui.updateSelectDisplay(els.encoderModeEl);
-      return;
-    }
-    encoderSwapInFlight = true;
-    ui.updateSourceControls();
-    try {
-      const info = await streamer.replaceAudioEncoder();
-      if (active === session && info) ui.updateStreamStatus(info);
-    } catch (error) {
-      console.error("AAC encoder swap failed:", error);
-      if (active === session) {
-        els.encoderModeEl.value = session.encoderModeKey;
-        writeStorage(storageKeys.encoderMode, session.encoderModeKey);
-        ui.updateSelectDisplay(els.encoderModeEl);
-      }
-    } finally {
-      encoderSwapInFlight = false;
-      ui.updateSourceControls();
-    }
+  els.encoderModeEl.onchange = () => {
+    if (!active && !sourceRequestInFlight) writeStorage(storageKeys.encoderMode, els.encoderModeEl.value);
   };
 
-  els.videoQualityEl.onchange = async () => {
-    const previous = videoQualities.find(quality =>
-      quality.width === config.videoWidth
-      && quality.height === config.videoHeight
-      && quality.fps === config.videoFps
-      && quality.bitrate === config.videoBitrate
-    ) || null;
-    const next = videoQualities.find(quality => quality.id === els.videoQualityEl.value);
-    if (!next || next === previous) return;
-    els.videoQualityEl.disabled = true;
-    try {
-      await streamer.setVideoQuality(next);
-      saveVideoQuality(next.id);
-    } catch (error) {
-      if (previous) {
-        els.videoQualityEl.value = previous.id;
-        ui.updateSelectDisplay(els.videoQualityEl);
-      }
-      console.error("Video quality change failed:", error);
-      alert(`Video quality change failed: ${error.message || error}`);
-    } finally {
-      els.videoQualityEl.disabled = false;
-    }
+  els.videoQualityEl.onchange = () => {
+    if (active || sourceRequestInFlight) return;
+    const quality = selectedVideoQuality();
+    if (!quality) return;
+    applyVideoQuality(quality);
+    saveVideoQuality(quality.id);
   };
 
   els.languageSelectEl.onchange = async () => {
@@ -1061,7 +994,7 @@ function bindEvents() {
 }
 
 async function init() {
-  resetStorageIfVersionChanged();
+  initializeStorage();
   streamCode = loadCode();
   await loadClientConfig();
   await ui.loadLanguage();
@@ -1070,13 +1003,15 @@ async function init() {
   renderServers();
   loadEncoderMode();
   await selectWasmWhenNativeUnsupported();
-  try { await ui.refreshMicDevices(ui.savedMicDeviceId()); } catch (_) {}
+  try {
+    await ui.refreshMicDevices(ui.savedMicDeviceId());
+  } catch (_) {}
   ui.setStreamingControls(false);
   updateUrl();
-  refreshStats();
+  refreshServerInfo();
   setInterval(loadClientConfig, config.configRefreshMs);
-  setInterval(refreshStats, config.statsRefreshMs);
+  setInterval(refreshServerInfo, config.statsRefreshMs);
   bindEvents();
 }
 
-init().catch(error => console.error("Client initialization failed:", error));
+init().catch((error) => console.error("Client initialization failed:", error));

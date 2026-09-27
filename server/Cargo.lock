@@ -3,15 +3,18 @@
 version = 4
 
 [[package]]
-name = "VRCStreamer"
+name = "VRCast"
 version = "0.1.0"
 dependencies = [
  "axum",
  "axum-server",
  "base64",
  "bytes",
+ "futures-util",
+ "hyper-util",
  "rustls",
  "serde",
+ "serde_json",
  "sha2",
  "tokio",
  "tracing",

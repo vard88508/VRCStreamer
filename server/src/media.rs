@@ -104,15 +104,7 @@ pub(crate) fn parse_streamer_media_frame(
     }
 }
 
-pub(crate) fn validate_h264_access_unit(
-    access_unit: &[u8],
-    keyframe: bool,
-    max_bytes: usize,
-) -> Result<(), &'static str> {
-    inspect_h264_access_unit(access_unit, keyframe, max_bytes).map(drop)
-}
-
-fn inspect_h264_access_unit(
+pub(crate) fn inspect_h264_access_unit(
     access_unit: &[u8],
     keyframe: bool,
     max_bytes: usize,

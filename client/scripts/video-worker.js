@@ -19,7 +19,7 @@ class VideoRateControl {
   minQuantizer = 0; // Zero means no temporary block.
   blockedUntil = 0;
 
-  reset(bitrate, frameRate, now, keepBlock = false) {
+  reset(bitrate, frameRate, now) {
     this.budget = Math.floor(bitrate * BITRATE_HEADROOM);
     // A bit allowance, not a media queue. Leave room below the server's burst limit.
     this.capacity = Math.max(this.budget * 0.5, this.budget / frameRate);
@@ -27,7 +27,7 @@ class VideoRateControl {
     this.updatedAt = now;
     this.adjustedAt = now;
     this.smoothedBitrate = this.budget;
-    if (!keepBlock) this.blockedUntil = 0;
+    this.blockedUntil = 0;
     this.blockedMinimum(now);
     this.quantizer = Math.max(MIN_QUANTIZER, INITIAL_QUANTIZER, this.minQuantizer);
     this.adjustments = 0;
@@ -80,12 +80,14 @@ class VideoRateControl {
   update(actualBitrate, elapsed, now, canImprove) {
     this.blockedMinimum(now);
     // Keep a short bitrate history; recover slowly and leave room for the next QP step.
-    this.smoothedBitrate += (actualBitrate - this.smoothedBitrate) * elapsed / (2 + elapsed);
+    this.smoothedBitrate += ((actualBitrate - this.smoothedBitrate) * elapsed) / (2 + elapsed);
     const nextQuantizer = this.quantizer - QUANTIZER_RECOVERY_STEP;
-    if (canImprove
-        && nextQuantizer >= Math.max(MIN_QUANTIZER, this.minQuantizer)
-        && now - this.adjustedAt >= 1000
-        && Math.max(actualBitrate, this.smoothedBitrate) < this.budget * 0.75) {
+    if (
+      canImprove &&
+      nextQuantizer >= Math.max(MIN_QUANTIZER, this.minQuantizer) &&
+      now - this.adjustedAt >= 1000 &&
+      Math.max(actualBitrate, this.smoothedBitrate) < this.budget * 0.75
+    ) {
       this.setQuantizer(nextQuantizer, now);
     }
   }
@@ -104,7 +106,6 @@ let scheduledFrameIndex = 0;
 let statsTimer = 0;
 let closed = true;
 let failed = false;
-let paused = false;
 let networkPaused = false;
 let placeholder = false;
 let placeholderImage = null;
@@ -196,7 +197,7 @@ function avcDescriptionToAnnexB(description) {
 function sendVideoPacket(chunk, header) {
   const headerLength = chunk.type === "key" && header ? header.byteLength : 0;
   const packet = new Uint8Array(chunk.byteLength + headerLength + VIDEO_FRAME_HEADER_BYTES);
-  const rtpTimestamp = Math.round(chunk.timestamp * H264_CLOCK_RATE / 1000000) >>> 0;
+  const rtpTimestamp = Math.round((chunk.timestamp * H264_CLOCK_RATE) / 1000000) >>> 0;
   packet[0] = chunk.type === "key" ? 0x01 : 0x02;
   packet[1] = rtpTimestamp >>> 24;
   packet[2] = rtpTimestamp >>> 16;
@@ -261,14 +262,13 @@ function mediaTimeMs() {
 }
 
 function audioClockIsFresh() {
-  return audioClockReady
-    && performance.now() - audioClockUpdatedAt < AUDIO_CLOCK_GRACE_MS;
+  return audioClockReady && performance.now() - audioClockUpdatedAt < AUDIO_CLOCK_GRACE_MS;
 }
 
 function syncAudioClock(timestampSamples) {
   const samples = Number(timestampSamples);
   if (!Number.isSafeInteger(samples) || samples < 0) return;
-  const nextClockMs = samples * 1000 / audioSampleRate;
+  const nextClockMs = (samples * 1000) / audioSampleRate;
   if (audioClockReady && nextClockMs <= audioClockMs) return;
   const now = performance.now();
   if (audioClockReady && now - audioClockUpdatedAt >= AUDIO_CLOCK_KEYFRAME_GAP_MS) {
@@ -281,7 +281,7 @@ function syncAudioClock(timestampSamples) {
 }
 
 function frameTimestampUs(frameIndex) {
-  return Math.round(frameIndex * 1000000 / fps);
+  return Math.round((frameIndex * 1000000) / fps);
 }
 
 function createOutputFrame(source, showPlaceholder, timestamp, duration) {
@@ -298,7 +298,7 @@ function createOutputFrame(source, showPlaceholder, timestamp, duration) {
 }
 
 function submitFrame(source, showPlaceholder, timestamp, duration, repeated = false) {
-  if (closed || paused || networkPaused || !encoder || encoder.state !== "configured") return false;
+  if (closed || networkPaused || !encoder || encoder.state !== "configured") return false;
   if (encoder.encodeQueueSize >= MAX_ENCODER_QUEUE) {
     queueDrops++;
     return false;
@@ -306,8 +306,8 @@ function submitFrame(source, showPlaceholder, timestamp, duration, repeated = fa
 
   const frame = createOutputFrame(source, showPlaceholder, timestamp, duration);
   try {
-    const keyFrame = forceNextKeyframe
-      || timestamp - lastKeyframeTimestampUs >= keyframeInterval * framePeriodUs;
+    const keyFrame =
+      forceNextKeyframe || timestamp - lastKeyframeTimestampUs >= keyframeInterval * framePeriodUs;
     encoder.encode(frame, { keyFrame, avc: { quantizer: rateControl.submit(timestamp) } });
     forceNextKeyframe = false;
     if (keyFrame) lastKeyframeTimestampUs = timestamp;
@@ -325,29 +325,25 @@ function clearPacingTimer() {
 }
 
 function scheduleNextFrame() {
-  if (closed || paused || networkPaused || pacingTimer || !audioClockReady) return;
+  if (closed || networkPaused || pacingTimer || !audioClockReady) return;
   const elapsedMs = mediaTimeMs();
-  const elapsedFrame = Math.ceil(elapsedMs * fps / 1000);
+  const elapsedFrame = Math.ceil((elapsedMs * fps) / 1000);
   scheduledFrameIndex = Math.max(elapsedFrame, lastFrameIndex + 1);
-  const delay = Math.max(0, scheduledFrameIndex * 1000 / fps - elapsedMs);
+  const delay = Math.max(0, (scheduledFrameIndex * 1000) / fps - elapsedMs);
   pacingTimer = setTimeout(runPacing, delay);
 }
 
 function runPacing() {
   pacingTimer = 0;
-  if (closed || paused || networkPaused) return;
+  if (closed || networkPaused) return;
   const elapsedMs = mediaTimeMs();
-  const scheduledAtMs = scheduledFrameIndex * 1000 / fps;
+  const scheduledAtMs = (scheduledFrameIndex * 1000) / fps;
   if (scheduledAtMs > elapsedMs) {
     if (!audioClockIsFresh()) return;
     pacingTimer = setTimeout(runPacing, Math.max(1, scheduledAtMs - elapsedMs));
     return;
   }
-  let frameIndex = Math.max(
-    scheduledFrameIndex,
-    Math.floor(elapsedMs * fps / 1000),
-    lastFrameIndex + 1
-  );
+  let frameIndex = Math.max(scheduledFrameIndex, Math.floor((elapsedMs * fps) / 1000), lastFrameIndex + 1);
   let timestamp = frameTimestampUs(frameIndex);
   while (timestamp <= lastTimestampUs) {
     frameIndex++;
@@ -356,13 +352,13 @@ function runPacing() {
   const duration = frameTimestampUs(frameIndex + 1) - timestamp;
   lastFrameIndex = frameIndex;
   lastTimestampUs = timestamp;
-  const sourceReady = !placeholder && (
-    renderedSourceFrame
-    || sourceBuffer.length >= SOURCE_BUFFER_FRAMES
-    || mediaTimeMs() >= sourceBufferReadyAt
-  );
+  const sourceReady =
+    !placeholder &&
+    (renderedSourceFrame ||
+      sourceBuffer.length >= SOURCE_BUFFER_FRAMES ||
+      mediaTimeMs() >= sourceBufferReadyAt);
   const source = sourceReady && sourceBuffer.length ? sourceBuffer.shift() : null;
-  const showPlaceholder = placeholder || !renderedSourceFrame && !source;
+  const showPlaceholder = placeholder || (!renderedSourceFrame && !source);
   const repeated = !showPlaceholder && !source;
   try {
     if (submitFrame(source, showPlaceholder, timestamp, duration, repeated) && source) {
@@ -378,7 +374,7 @@ function runPacing() {
 }
 
 function startCurrentOutput() {
-  if (closed || paused || networkPaused) return;
+  if (closed || networkPaused) return;
   if (!placeholder && !renderedSourceFrame && sourceBuffer.length === 0) return;
   scheduleNextFrame();
 }
@@ -417,8 +413,12 @@ async function stopSource() {
   const reader = sourceReader;
   sourceReader = null;
   if (reader) {
-    try { await reader.cancel(); } catch (_) {}
-    try { reader.releaseLock(); } catch (_) {}
+    try {
+      await reader.cancel();
+    } catch (_) {}
+    try {
+      reader.releaseLock();
+    } catch (_) {}
   }
 }
 
@@ -438,7 +438,9 @@ async function readSource(reader, generation) {
     if (!closed && generation === sourceGeneration) await fail(error);
   } finally {
     if (generation === sourceGeneration && sourceReader === reader) {
-      try { reader.releaseLock(); } catch (_) {}
+      try {
+        reader.releaseLock();
+      } catch (_) {}
       sourceReader = null;
     }
   }
@@ -470,13 +472,13 @@ function postStats() {
   const encodedDelta = encoded - lastEncoded;
   const sourceDelta = sourceFrames - lastSourceFrames;
   const byteDelta = encodedBytes - lastEncodedBytes;
-  const actualBitrate = byteDelta * 8 / elapsed;
+  const actualBitrate = (byteDelta * 8) / elapsed;
   lastStatsAt = now;
   lastSubmitted = submitted;
   lastEncoded = encoded;
   lastSourceFrames = sourceFrames;
   lastEncodedBytes = encodedBytes;
-  if (!closed && !paused && !networkPaused && !placeholder && encodedDelta > 0) {
+  if (!closed && !networkPaused && !placeholder && encodedDelta > 0) {
     rateControl.update(actualBitrate, elapsed, now, encodedDelta >= fps * elapsed * 0.9);
   }
   postMessage({
@@ -494,8 +496,8 @@ function postStats() {
       limitKbps: bitrateLimit / 1000,
       minQuantizer: rateControl.blockedMinimum(now),
       quantizerAdjustments: rateControl.adjustments,
-      quantizer: rateControl.quantizer
-    }
+      quantizer: rateControl.quantizer,
+    },
   });
 }
 
@@ -510,17 +512,16 @@ const H264_LEVELS = [
   [0x34, 36864, 2073600, 100000],
   [0x3c, 139264, 4177920, 100000],
   [0x3d, 139264, 8355840, 100000],
-  [0x3e, 139264, 16711680, 100000]
+  [0x3e, 139264, 16711680, 100000],
 ];
 
 function h264Codec(nextWidth, nextHeight, nextFps, nextBitrate) {
   const frameMacroblocks = Math.ceil(nextWidth / 16) * Math.ceil(nextHeight / 16);
   const macroblocksPerSecond = frameMacroblocks * nextFps;
   const bitrateKbps = Math.ceil(nextBitrate / 1000);
-  const level = H264_LEVELS.find(([, maxFrame, maxSecond, maxBitrate]) =>
-    frameMacroblocks <= maxFrame
-    && macroblocksPerSecond <= maxSecond
-    && bitrateKbps <= maxBitrate
+  const level = H264_LEVELS.find(
+    ([, maxFrame, maxSecond, maxBitrate]) =>
+      frameMacroblocks <= maxFrame && macroblocksPerSecond <= maxSecond && bitrateKbps <= maxBitrate,
   );
   if (!level) throw new Error("Video preset exceeds supported H.264 levels.");
   return `avc1.42E0${level[0].toString(16).padStart(2, "0").toUpperCase()}`;
@@ -536,7 +537,7 @@ function encoderConfig(nextWidth, nextHeight, nextFps, nextBitrate) {
     framerate: nextFps,
     hardwareAcceleration: "prefer-hardware",
     latencyMode: "realtime",
-    avc: { format: "annexb" }
+    avc: { format: "annexb" },
   };
 }
 
@@ -544,13 +545,15 @@ async function assertEncoderSupport(config) {
   if (!VideoEncoder.isConfigSupported) return;
   const support = await VideoEncoder.isConfigSupported(config);
   if (!support.supported || support.config?.bitrateMode !== "quantizer") {
-    throw new Error(`Native H.264 WebCodecs quantizer mode ${config.width}x${config.height}@${config.framerate} is not supported.`);
+    throw new Error(
+      `Native H.264 WebCodecs quantizer mode ${config.width}x${config.height}@${config.framerate} is not supported.`,
+    );
   }
 }
 
-function resetRateControl(keepBlock = false) {
+function resetRateControl() {
   const now = performance.now();
-  rateControl.reset(bitrateLimit, fps, now, keepBlock);
+  rateControl.reset(bitrateLimit, fps, now);
   lastStatsAt = now;
   lastSubmitted = submitted;
   lastEncoded = encoded;
@@ -569,59 +572,16 @@ function createEncoder(config) {
     },
     error(error) {
       if (!closed) void fail(error);
-    }
+    },
   });
   next.configure(config);
   return next;
-}
-
-async function reconfigure(message) {
-  const config = encoderConfig(
-    message.width,
-    message.height,
-    message.fps,
-    message.bitrate
-  );
-  let nextEncoder = null;
-  try {
-    await assertEncoderSupport(config);
-    nextEncoder = createEncoder(config);
-    paused = true;
-    clearPacingTimer();
-    const previousEncoder = encoder;
-    await previousEncoder.flush();
-    encoder = nextEncoder;
-    nextEncoder = null;
-    previousEncoder.close();
-
-    const keepQuantizerBlock = message.width === width && message.height === height;
-    width = message.width;
-    height = message.height;
-    fps = message.fps;
-    bitrateLimit = message.bitrate;
-    resetRateControl(keepQuantizerBlock);
-    keyframeInterval = fps;
-    framePeriodUs = Math.round(1000000 / fps);
-    lastFrameIndex = Math.floor(lastTimestampUs * fps / 1000000);
-    canvas.width = width;
-    canvas.height = height;
-    avcHeader = null;
-    lastKeyframeTimestampUs = lastTimestampUs - keyframeInterval * framePeriodUs;
-    forceNextKeyframe = true;
-    postMessage({ type: "reconfigured" });
-  } catch (error) {
-    if (nextEncoder) nextEncoder.close();
-    paused = false;
-    startCurrentOutput();
-    postMessage({ type: "reconfigure-error", message: errorText(error) });
-  }
 }
 
 async function init(message) {
   await closeAll();
   failed = false;
   closed = false;
-  paused = false;
   networkPaused = false;
   placeholder = true;
   width = message.width;
@@ -670,7 +630,7 @@ async function init(message) {
   ctx = canvas.getContext("2d", {
     alpha: false,
     desynchronized: true,
-    colorSpace: "srgb"
+    colorSpace: "srgb",
   });
   if (!ctx) throw new Error("OffscreenCanvas 2D context is not available.");
   encoder = createEncoder(config);
@@ -682,7 +642,6 @@ async function init(message) {
 
 async function closeAll() {
   closed = true;
-  paused = true;
   networkPaused = false;
   clearPacingTimer();
   clearInterval(statsTimer);
@@ -696,8 +655,12 @@ async function closeAll() {
   const currentEncoder = encoder;
   encoder = null;
   if (currentEncoder) {
-    try { await currentEncoder.flush(); } catch (_) {}
-    try { currentEncoder.close(); } catch (_) {}
+    try {
+      await currentEncoder.flush();
+    } catch (_) {}
+    try {
+      currentEncoder.close();
+    } catch (_) {}
   }
   canvas = null;
   ctx = null;
@@ -710,12 +673,6 @@ async function handleMessage(message) {
     await setSource(message.readable);
   } else if (message.type === "placeholder" && !closed) {
     await usePlaceholder();
-  } else if (message.type === "reconfigure" && !closed) {
-    await reconfigure(message);
-  } else if (message.type === "resume" && !closed) {
-    paused = false;
-    forceNextKeyframe = true;
-    startCurrentOutput();
   } else if (message.type === "transport-pause" && !closed) {
     networkPaused = true;
     clearPacingTimer();
@@ -731,4 +688,4 @@ async function handleMessage(message) {
   }
 }
 
-self.onmessage = event => enqueue(() => handleMessage(event.data || {}));
+self.onmessage = (event) => enqueue(() => handleMessage(event.data || {}));

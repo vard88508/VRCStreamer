@@ -2,7 +2,7 @@ use axum::{
     Router,
     extract::{ConnectInfo, State},
     http::{
-        HeaderMap, HeaderValue, StatusCode, Uri,
+        HeaderMap, HeaderValue, StatusCode,
         header::{
             ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE, HOST, LOCATION, ORIGIN, VARY,
         },
@@ -10,14 +10,12 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use axum_server::tls_rustls::RustlsConfig;
-use bytes::Bytes;
-use serde::{Serialize, Serializer};
+use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
+use hyper_util::rt::TokioTimer;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
-    env,
-    fmt::Write as _,
     fs,
     io::ErrorKind,
     net::{IpAddr, SocketAddr},
@@ -25,7 +23,7 @@ use std::{
     process,
     sync::{
         Arc, Mutex as StdMutex, RwLock as StdRwLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -36,6 +34,7 @@ use tokio::{
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
+mod config;
 mod limits;
 mod media;
 mod rtsp;
@@ -43,10 +42,11 @@ mod rtsp;
 mod tests;
 mod websocket;
 
+use config::{Config, VideoQuality};
 use limits::{IpLimitTable, allow_http_request};
-use media::{AudioMessage, VideoMessage, h264_sdp_fmtp, validate_h264_access_unit};
+use media::{AudioMessage, VideoMessage};
 use rtsp::rtsp_server;
-use websocket::ingest_ws;
+use websocket::stream_ws;
 
 const RTP_VIDEO_PAYLOAD_TYPE: u8 = 96;
 const RTP_AUDIO_PAYLOAD_TYPE: u8 = 97;
@@ -70,8 +70,6 @@ const AAC_ABUSE_BURST_SECS: usize = 10;
 const MEDIA_FRAME_HEADER_BYTES: usize = 5;
 const MEDIA_CLOCK_RATE: u32 = AAC_SAMPLE_RATE;
 const H264_CLOCK_RATE: u32 = 90_000;
-const H264_DEFAULT_MAX_ACCESS_UNIT_BYTES: usize = 512 * 1024;
-const H264_HARD_MAX_ACCESS_UNIT_BYTES: usize = 8 * 1024 * 1024;
 const H264_MAX_NAL_UNITS: usize = 64;
 const RTP_MAX_PAYLOAD_BYTES: usize = 1200;
 const RTSP_MAX_LINE_BYTES: usize = 4096;
@@ -83,92 +81,35 @@ const RTSP_MAX_INTERLEAVED_BYTES: usize = 4096;
 const STREAM_ID_HEX_CHARS: usize = 32;
 const STREAM_ID_BYTES: usize = STREAM_ID_HEX_CHARS / 2;
 const STREAM_CODE_BYTES: usize = 32;
-const PLACEHOLDERS_PATH: &str = "placeholders";
 const STREAM_BLACKLIST_FILE: &str = "blacklist.txt";
 const STREAM_BLACKLIST_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_STREAMER_IP_BANS: usize = 65_536;
 const STREAMER_LISTENER_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 const STREAMER_CONTROL_MESSAGES_PER_SECOND: usize = 8;
 const RTCP_REPORT_INTERVAL: Duration = Duration::from_secs(5);
-const DEFAULT_VIDEO_QUALITIES: &str =
-    "1280x720*30/2000,1280x720*60/4000,1920x1080*30/3000,1920x1080*60/6000";
-const MAX_VIDEO_QUALITIES: usize = 32;
 const DEFAULT_TOKEN_BUCKET_BURST_SECS: usize = 2;
-const MAX_VIDEO_INGEST_BURST_SECS: usize = 60;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct VideoQuality {
-    width: u16,
-    height: u16,
-    fps: u16,
-    bitrate_kbps: u32,
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+#[repr(u8)]
+enum StreamMode {
+    Audio = 1,
+    Video = 2,
 }
 
-impl VideoQuality {
-    fn video_bytes_per_second(self) -> usize {
-        (self.bitrate_kbps as usize).saturating_mul(1000) / 8
-    }
-
-    fn max_ingest_frames_per_second(self) -> usize {
-        (self.fps as usize).saturating_mul(3).div_ceil(2)
-    }
-
-    fn write_json_string(self, out: &mut String) {
-        let _ = write!(out, "\"{self}\"");
-    }
+#[derive(Default)]
+struct MediaCounts {
+    audio: AtomicUsize,
+    video: AtomicUsize,
 }
 
-impl std::fmt::Display for VideoQuality {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "{}x{}*{}/{}",
-            self.width, self.height, self.fps, self.bitrate_kbps
-        )
+impl MediaCounts {
+    fn counter(&self, mode: StreamMode) -> &AtomicUsize {
+        match mode {
+            StreamMode::Audio => &self.audio,
+            StreamMode::Video => &self.video,
+        }
     }
-}
-
-impl Serialize for VideoQuality {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.collect_str(self)
-    }
-}
-
-#[derive(Clone)]
-struct Config {
-    server_name: String,
-    server_description: String,
-    policies_link: Option<String>,
-    report_abuse_link: Option<String>,
-    redirect_url: HeaderValue,
-    bind_addr: SocketAddr,
-    rtsp_bind_addr: SocketAddr,
-    rtsp_public_base: Option<String>,
-    tls_cert_path: Option<String>,
-    tls_key_path: Option<String>,
-    video_enabled: bool,
-    video_qualities: Vec<VideoQuality>,
-    max_h264_frame_bytes: usize,
-    video_ingest_burst_secs: usize,
-    max_connections: usize,
-    max_streamers: usize,
-    max_streamers_per_ip: usize,
-    max_listeners_total: usize,
-    max_listeners_per_stream: usize,
-    max_listeners_per_ip: usize,
-    max_http_requests_per_ip: usize,
-    max_rtsp_requests_per_connection: usize,
-    rtsp_handshake_timeout: Duration,
-    http_rate_limit_window: Duration,
-    egress_kbps_per_listener: usize,
-    channel_buffer: usize,
-    streamer_idle_timeout: Duration,
-    passwords: Vec<String>,
-    allow_any_origin: bool,
-    allowed_origins: Vec<String>,
 }
 
 struct AppState {
@@ -177,10 +118,11 @@ struct AppState {
     stream_blacklist: StdRwLock<HashSet<String>>,
     blocked_streamer_ips: StdRwLock<StreamerIpBans>,
     ip_limits: StdMutex<IpLimitTable>,
-    placeholders: Placeholders,
     active_connections: AtomicUsize,
     active_streamers: AtomicUsize,
     active_listeners: AtomicUsize,
+    streams: MediaCounts,
+    listeners: MediaCounts,
     next_rtsp_session: AtomicUsize,
     log_salt: [u8; 16],
 }
@@ -196,11 +138,12 @@ struct Channel {
     audio_tx: broadcast::Sender<AudioMessage>,
     video_tx: broadcast::Sender<VideoMessage>,
     streamer: AtomicBool,
-    video_active: AtomicBool,
+    mode: AtomicU8,
     listeners: AtomicUsize,
-    resync_epoch: AtomicUsize,
+    generation: AtomicUsize,
     blacklist_notify: Notify,
     video_fmtp: StdRwLock<Option<Arc<str>>>,
+    configuration_changed: Notify,
 }
 
 impl Channel {
@@ -211,11 +154,20 @@ impl Channel {
             audio_tx,
             video_tx,
             streamer: AtomicBool::new(false),
-            video_active: AtomicBool::new(false),
+            mode: AtomicU8::new(0),
             listeners: AtomicUsize::new(0),
-            resync_epoch: AtomicUsize::new(0),
+            generation: AtomicUsize::new(0),
             blacklist_notify: Notify::new(),
             video_fmtp: StdRwLock::new(None),
+            configuration_changed: Notify::new(),
+        }
+    }
+
+    fn mode(&self) -> Option<StreamMode> {
+        match self.mode.load(Ordering::Acquire) {
+            1 => Some(StreamMode::Audio),
+            2 => Some(StreamMode::Video),
+            _ => None,
         }
     }
 
@@ -231,35 +183,19 @@ impl Channel {
             .video_fmtp
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = value;
+        self.configuration_changed.notify_waiters();
     }
-}
-
-struct Placeholders {
-    offline_video: Bytes,
-    audio_only_video: Bytes,
-    offline_fmtp: Arc<str>,
-    audio_only_fmtp: Arc<str>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let log_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let config = Config::load()?;
+    let log_filter =
+        EnvFilter::try_new(&config.log_filter).unwrap_or_else(|_| EnvFilter::new("warn"));
     fmt().with_env_filter(log_filter).init();
 
-    let config = match Config::from_env() {
-        Ok(config) => config,
-        Err(error) => {
-            error!(
-                %error,
-                active_streams = 0usize,
-                active_listeners = 0usize,
-                "server failed to load config"
-            );
-            return Err(error);
-        }
-    };
     let bind_addr = config.bind_addr;
     let blacklist_path = PathBuf::from(STREAM_BLACKLIST_FILE);
     let stream_blacklist = match load_stream_blacklist(&blacklist_path) {
@@ -276,40 +212,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "stream blacklist loaded"
         );
     }
-    let placeholders = match load_placeholders(&config) {
-        Ok(placeholders) => placeholders,
-        Err(error) => {
-            error!(
-                %error,
-                active_streams = 0usize,
-                active_listeners = 0usize,
-                "server failed to load placeholders"
-            );
-            return Err(error);
-        }
-    };
     let state = Arc::new(AppState {
         config,
         channels: StdRwLock::new(HashMap::new()),
         stream_blacklist: StdRwLock::new(stream_blacklist),
         blocked_streamer_ips: StdRwLock::new(StreamerIpBans::default()),
         ip_limits: StdMutex::new(IpLimitTable::new()),
-        placeholders,
         active_connections: AtomicUsize::new(0),
         active_streamers: AtomicUsize::new(0),
         active_listeners: AtomicUsize::new(0),
+        streams: MediaCounts::default(),
+        listeners: MediaCounts::default(),
         next_rtsp_session: AtomicUsize::new(1),
         log_salt: make_log_salt(),
     });
     install_panic_hook(state.clone());
     tokio::spawn(watch_stream_blacklist(state.clone(), blacklist_path));
 
-    let app = Router::new()
-        .route("/", get(root_redirect))
-        .route("/healthz", get(healthz))
-        .route("/stats", get(stats))
-        .route("/ingest", get(ingest_ws))
-        .with_state(state.clone());
+    let app = http_router(state.clone());
 
     let rtsp_listener = match TcpListener::bind(state.config.rtsp_bind_addr).await {
         Ok(listener) => listener,
@@ -328,19 +248,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = app.into_make_service_with_connect_info::<SocketAddr>();
 
     let http_server = async {
+        let mut server = axum_server::bind(bind_addr).handle(handle);
+        server
+            .http_builder()
+            .http1()
+            .timer(TokioTimer::new())
+            .header_read_timeout(Duration::from_secs(10));
         if let (Some(cert_path), Some(key_path)) = (tls_cert_path, tls_key_path) {
             let tls_config = RustlsConfig::from_pem_file(cert_path, key_path).await?;
             info!(port = bind_addr.port(), "listening on https");
-            axum_server::tls_rustls::bind_rustls(bind_addr, tls_config)
-                .handle(handle)
+            server
+                .acceptor(RustlsAcceptor::new(tls_config))
                 .serve(service)
                 .await?;
         } else {
             info!(port = bind_addr.port(), "listening on http");
-            axum_server::bind(bind_addr)
-                .handle(handle)
-                .serve(service)
-                .await?;
+            server.serve(service).await?;
         }
 
         Ok::<(), Box<dyn std::error::Error>>(())
@@ -361,125 +284,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
-}
-
-impl Config {
-    fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
-        let bind_addr = env::var("BIND_ADDR")
-            .unwrap_or_else(|_| "0.0.0.0:443".to_owned())
-            .parse()?;
-        let rtsp_bind_addr: SocketAddr = env::var("RTSP_BIND_ADDR")
-            .unwrap_or_else(|_| "0.0.0.0:554".to_owned())
-            .parse()?;
-        let rtsp_public_base = env_public_base("RTSP_PUBLIC_BASE", "rtspt://");
-        let tls_cert_path = env_nonempty_or_default(
-            "TLS_CERT_PATH",
-            "/etc/letsencrypt/live/example.com/fullchain.pem",
-        );
-        let tls_key_path = env_nonempty_or_default(
-            "TLS_KEY_PATH",
-            "/etc/letsencrypt/live/example.com/privkey.pem",
-        );
-        if tls_cert_path.is_some() != tls_key_path.is_some() {
-            return Err("TLS_CERT_PATH and TLS_KEY_PATH must be set together".into());
-        }
-        let video_enabled = env_bool("VIDEO", true);
-        let video_qualities = parse_video_qualities(&video_qualities_env())?;
-        let max_h264_frame_bytes = env_usize_in_range(
-            "MAX_H264_FRAME_BYTES",
-            H264_DEFAULT_MAX_ACCESS_UNIT_BYTES,
-            1,
-            H264_HARD_MAX_ACCESS_UNIT_BYTES,
-        )?;
-        let video_ingest_burst_secs = env_usize_in_range(
-            "VIDEO_INGEST_BURST_SECS",
-            DEFAULT_TOKEN_BUCKET_BURST_SECS,
-            1,
-            MAX_VIDEO_INGEST_BURST_SECS,
-        )?;
-        let max_connections = env_usize("MAX_CONNECTIONS", 320);
-        let max_streamers = env_usize("MAX_STREAMERS", 0);
-        let max_listeners_total = env_usize("MAX_LISTENERS_TOTAL", 0);
-        let max_listeners_per_stream = env_usize("MAX_LISTENERS_PER_STREAM", 105);
-        let max_listeners_per_ip = env_usize("MAX_LISTENERS_PER_IP", 6);
-        let egress_kbps_per_listener = env_usize("EGRESS_KBPS_PER_LISTENER", 384);
-
-        Ok(Self {
-            server_name: env::var("SERVER_NAME")
-                .unwrap_or_else(|_| "Self-Hosted Instance".to_owned()),
-            server_description: env::var("SERVER_DESCRIPTION").unwrap_or_default(),
-            policies_link: env_optional_http_url("POLICIES_LINK")?,
-            report_abuse_link: env_optional_http_url("REPORT_ABUSE_LINK")?,
-            redirect_url: parse_redirect_url(
-                &env::var("ROOT_REDIRECT_URL")
-                    .unwrap_or_else(|_| "https://stream.vard.cc".to_owned()),
-            )?,
-            bind_addr,
-            rtsp_bind_addr,
-            rtsp_public_base,
-            tls_cert_path,
-            tls_key_path,
-            video_enabled,
-            video_qualities,
-            max_h264_frame_bytes,
-            video_ingest_burst_secs,
-            max_connections,
-            max_streamers,
-            max_streamers_per_ip: env_usize("MAX_STREAMERS_PER_IP", 3),
-            max_listeners_total,
-            max_listeners_per_stream,
-            max_listeners_per_ip,
-            max_http_requests_per_ip: env_usize("MAX_HTTP_REQUESTS_PER_IP", 60),
-            max_rtsp_requests_per_connection: env_usize("MAX_RTSP_REQUESTS_PER_CONNECTION", 4096),
-            rtsp_handshake_timeout: Duration::from_secs(
-                env_u64("RTSP_HANDSHAKE_TIMEOUT_SECS", 30).max(1),
-            ),
-            http_rate_limit_window: Duration::from_secs(
-                env_u64("HTTP_RATE_LIMIT_WINDOW_SECS", 60).max(1),
-            ),
-            egress_kbps_per_listener,
-            channel_buffer: env_usize("CHANNEL_BUFFER", 128).max(1),
-            streamer_idle_timeout: Duration::from_secs(env_u64("STREAMER_IDLE_TIMEOUT_SECS", 120)),
-            passwords: env_list("PASSWORD"),
-            allow_any_origin: env_bool("ALLOW_ANY_ORIGIN", false),
-            allowed_origins: env::var("ALLOWED_ORIGINS")
-                .unwrap_or_else(|_| "https://stream.vard.cc".to_owned())
-                .split(',')
-                .map(str::trim)
-                .filter(|origin| !origin.is_empty())
-                .map(str::to_owned)
-                .collect(),
-        })
-    }
-}
-
-fn load_placeholders(config: &Config) -> Result<Placeholders, Box<dyn std::error::Error>> {
-    let offline_video = load_placeholder(PLACEHOLDERS_PATH, "offline.h264")?;
-    let audio_only_video = load_placeholder(PLACEHOLDERS_PATH, "audio_only.h264")?;
-    validate_h264_access_unit(&offline_video, true, config.max_h264_frame_bytes)
-        .map_err(|reason| format!("offline.h264 is invalid: {reason}"))?;
-    validate_h264_access_unit(&audio_only_video, true, config.max_h264_frame_bytes)
-        .map_err(|reason| format!("audio_only.h264 is invalid: {reason}"))?;
-    let offline_fmtp = Arc::from(
-        h264_sdp_fmtp(&offline_video)
-            .map_err(|reason| format!("offline.h264 has no usable SPS/PPS: {reason}"))?,
-    );
-    let audio_only_fmtp = Arc::from(
-        h264_sdp_fmtp(&audio_only_video)
-            .map_err(|reason| format!("audio_only.h264 has no usable SPS/PPS: {reason}"))?,
-    );
-
-    Ok(Placeholders {
-        offline_video,
-        audio_only_video,
-        offline_fmtp,
-        audio_only_fmtp,
-    })
-}
-
-fn load_placeholder(dir: &str, name: &str) -> Result<Bytes, Box<dyn std::error::Error>> {
-    let bytes = fs::read(std::path::Path::new(dir).join(name))?;
-    Ok(Bytes::from(bytes))
 }
 
 fn load_stream_blacklist(path: &Path) -> Result<HashSet<String>, String> {
@@ -616,20 +420,37 @@ async fn watch_stream_blacklist(state: Arc<AppState>, path: PathBuf) {
     }
 }
 
-async fn root_redirect(
+fn http_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/status", get(status))
+        .route("/info", get(server_info))
+        .route("/stream", get(stream_ws))
+        .fallback(redirect)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_http,
+        ))
+        .with_state(state)
+}
+
+async fn rate_limit_http(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
 ) -> Response {
     if !allow_http_request(&state, addr.ip()) {
         return text_response_with_cors(
             StatusCode::TOO_MANY_REQUESTS,
             "too many requests\n",
-            &headers,
+            request.headers(),
             &state.config,
         );
     }
+    next.run(request).await
+}
 
+async fn redirect(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let mut response = StatusCode::FOUND.into_response();
     response
         .headers_mut()
@@ -641,79 +462,45 @@ async fn root_redirect(
     response
 }
 
-async fn healthz(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-) -> Response {
-    if !allow_http_request(&state, addr.ip()) {
-        return text_response_with_cors(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many requests\n",
-            &headers,
-            &state.config,
-        );
-    }
-
+async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let mut response = ([(CONTENT_TYPE, "text/plain; charset=utf-8")], "ok\n").into_response();
     apply_http_cors(response.headers_mut(), &headers, &state.config);
     response
 }
 
 #[derive(Serialize)]
-struct StatsResponse<'a> {
+struct ServerInfo<'a> {
     name: &'a str,
     description: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    policies_link: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    report_abuse_link: Option<&'a str>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    official_public: bool,
     rtsp_base: String,
     video: bool,
     video_qualities: &'a [VideoQuality],
-    active_connections: usize,
-    active_streamers: usize,
-    active_listeners: usize,
-    active_streams: usize,
-    estimated_egress_kbps: usize,
+    audio_streams: usize,
+    video_streams: usize,
+    audio_listeners: usize,
+    video_listeners: usize,
 }
 
-async fn stats(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-) -> Response {
-    if !allow_http_request(&state, addr.ip()) {
-        return text_response_with_cors(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many requests\n",
-            &headers,
-            &state.config,
-        );
-    }
-
-    let active_connections = state.active_connections.load(Ordering::Acquire);
-    let active_streamers = state.active_streamers.load(Ordering::Acquire);
-    let active_listeners = state.active_listeners.load(Ordering::Acquire);
+async fn server_info(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let video_qualities = if state.config.video_enabled {
         state.config.video_qualities.as_slice()
     } else {
         &[]
     };
 
-    let mut response = axum::Json(StatsResponse {
+    let mut response = axum::Json(ServerInfo {
         name: &state.config.server_name,
         description: &state.config.server_description,
-        policies_link: state.config.policies_link.as_deref(),
-        report_abuse_link: state.config.report_abuse_link.as_deref(),
+        official_public: state.config.official_public,
         rtsp_base: public_rtsp_base(&state.config, &headers),
         video: state.config.video_enabled,
         video_qualities,
-        active_connections,
-        active_streamers,
-        active_listeners,
-        active_streams: active_streamers,
-        estimated_egress_kbps: estimated_egress_kbps(&state.config),
+        audio_streams: state.streams.audio.load(Ordering::Acquire),
+        video_streams: state.streams.video.load(Ordering::Acquire),
+        audio_listeners: state.listeners.audio.load(Ordering::Acquire),
+        video_listeners: state.listeners.video.load(Ordering::Acquire),
     })
     .into_response();
     let response_headers = response.headers_mut();
@@ -722,24 +509,17 @@ async fn stats(
     response
 }
 
-fn force_resync_channel(channel: &Channel) -> usize {
-    channel
-        .resync_epoch
-        .fetch_add(1, Ordering::AcqRel)
-        .wrapping_add(1)
-}
-
-fn wake_audio_listeners(channel: &Channel) {
-    let _ = channel.audio_tx.send(AudioMessage::Wake);
-}
-
-fn wake_video_listeners(channel: &Channel) {
-    let _ = channel.video_tx.send(VideoMessage::Wake);
+fn advance_stream_generation(channel: &Channel) -> usize {
+    // Do not reuse a DESCRIBE generation when an idle channel is removed and recreated.
+    static NEXT_GENERATION: AtomicUsize = AtomicUsize::new(1);
+    let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+    channel.generation.store(generation, Ordering::Release);
+    generation
 }
 
 fn wake_media_listeners(channel: &Channel) {
-    wake_audio_listeners(channel);
-    wake_video_listeners(channel);
+    let _ = channel.audio_tx.send(AudioMessage::Wake);
+    let _ = channel.video_tx.send(VideoMessage::Wake);
 }
 
 fn reserve_channel<T>(
@@ -853,12 +633,6 @@ fn limit_allows(limit: usize, current: usize) -> bool {
     limit == 0 || current < limit
 }
 
-fn estimated_egress_kbps(config: &Config) -> usize {
-    config
-        .max_listeners_total
-        .saturating_mul(config.egress_kbps_per_listener)
-}
-
 fn valid_hash(key: &str) -> bool {
     key.len() == STREAM_ID_HEX_CHARS && key.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -899,7 +673,7 @@ fn make_log_salt() -> [u8; 16] {
 
 fn peer_id(state: &AppState, ip: IpAddr) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"VRCStreamer peer log id v1");
+    hasher.update(b"VRCast peer log id v1");
     hasher.update(state.log_salt);
     match ip {
         IpAddr::V4(ip) => hasher.update(ip.octets()),
@@ -917,77 +691,6 @@ fn push_hex_prefix(out: &mut String, bytes: &[u8], take: usize) {
         out.push(hex_char(byte >> 4));
         out.push(hex_char(byte & 0x0f));
     }
-}
-
-fn streamer_hello_message(config: &Config, listeners: usize, rtsp_base: &str) -> String {
-    let mut out = String::with_capacity(
-        136 + config.server_name.len()
-            + config.server_description.len()
-            + config.policies_link.as_ref().map_or(0, String::len)
-            + config.report_abuse_link.as_ref().map_or(0, String::len)
-            + rtsp_base.len()
-            + config.video_qualities.len() * 24,
-    );
-    out.push_str("{\"type\":\"hello\",\"name\":");
-    push_json_string(&mut out, &config.server_name);
-    out.push_str(",\"description\":");
-    push_json_string(&mut out, &config.server_description);
-    if let Some(link) = &config.policies_link {
-        out.push_str(",\"policies_link\":");
-        push_json_string(&mut out, link);
-    }
-    if let Some(link) = &config.report_abuse_link {
-        out.push_str(",\"report_abuse_link\":");
-        push_json_string(&mut out, link);
-    }
-    out.push_str(",\"rtsp_base\":");
-    push_json_string(&mut out, rtsp_base);
-    out.push_str(",\"video\":");
-    out.push_str(if config.video_enabled {
-        "true"
-    } else {
-        "false"
-    });
-    out.push_str(",\"video_qualities\":[");
-    if config.video_enabled {
-        for (index, quality) in config.video_qualities.iter().enumerate() {
-            if index != 0 {
-                out.push(',');
-            }
-            quality.write_json_string(&mut out);
-        }
-    }
-    out.push(']');
-    out.push_str(",\"listeners\":");
-    let _ = write!(out, "{listeners}");
-    out.push('}');
-    out
-}
-
-fn streamer_listeners_message(listeners: usize) -> String {
-    let mut out = String::with_capacity(40);
-    let _ = write!(out, "{{\"type\":\"listeners\",\"listeners\":{listeners}}}");
-    out
-}
-
-fn push_json_string(out: &mut String, value: &str) {
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            ch if ch <= '\u{1f}' => {
-                let _ = write!(out, "\\u{:04x}", ch as u32);
-            }
-            ch => out.push(ch),
-        }
-    }
-    out.push('"');
 }
 
 fn hex_char(nibble: u8) -> char {
@@ -1012,7 +715,7 @@ fn apply_http_cors(response: &mut HeaderMap, request: &HeaderMap, config: &Confi
 }
 
 fn cors_origin(headers: &HeaderMap, config: &Config) -> Option<HeaderValue> {
-    if config.allow_any_origin {
+    if config.allowed_origins.iter().any(|origin| origin == "*") {
         return Some(HeaderValue::from_static("*"));
     }
 
@@ -1053,100 +756,6 @@ fn text_response_with_cors(
     response
 }
 
-fn env_usize(key: &str, default: usize) -> usize {
-    env_usize_optional(key).unwrap_or(default)
-}
-
-fn env_usize_in_range(
-    key: &str,
-    default: usize,
-    min: usize,
-    max: usize,
-) -> Result<usize, Box<dyn std::error::Error>> {
-    let value = match env::var(key) {
-        Ok(value) => value
-            .parse::<usize>()
-            .map_err(|_| format!("{key} must be an integer"))?,
-        Err(_) => default,
-    };
-    if !(min..=max).contains(&value) {
-        return Err(format!("{key} must be between {min} and {max}").into());
-    }
-    Ok(value)
-}
-
-fn env_usize_optional(key: &str) -> Option<usize> {
-    env::var(key).ok().and_then(|value| value.parse().ok())
-}
-
-fn env_u64(key: &str, default: u64) -> u64 {
-    env::var(key)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_bool(key: &str, default: bool) -> bool {
-    env::var(key)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(default)
-}
-
-fn env_public_base(key: &str, default_scheme: &str) -> Option<String> {
-    match env::var(key) {
-        Ok(value) => normalize_public_base(&value, default_scheme),
-        Err(_) => None,
-    }
-}
-
-fn parse_redirect_url(value: &str) -> Result<HeaderValue, Box<dyn std::error::Error>> {
-    let value = value.trim();
-    let uri: Uri = value.parse()?;
-    if !matches!(uri.scheme_str(), Some(scheme) if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
-        || uri.authority().is_none()
-    {
-        return Err("ROOT_REDIRECT_URL must be an absolute HTTP or HTTPS URL".into());
-    }
-    Ok(value.parse()?)
-}
-
-fn env_optional_http_url(key: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let Ok(value) = env::var(key) else {
-        return Ok(None);
-    };
-    let value = value.trim();
-    if value.is_empty() || value.eq_ignore_ascii_case("none") {
-        return Ok(None);
-    }
-    let uri: Uri = value.parse()?;
-    if !matches!(uri.scheme_str(), Some(scheme) if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
-        || uri.authority().is_none()
-    {
-        return Err(format!("{key} must be an absolute HTTP or HTTPS URL").into());
-    }
-    Ok(Some(value.to_owned()))
-}
-
-fn normalize_public_base(value: &str, default_scheme: &str) -> Option<String> {
-    let mut text = value.trim();
-    if text.is_empty() || text.eq_ignore_ascii_case("none") {
-        return None;
-    }
-    let mut owned = String::new();
-    if !text.contains("://") {
-        owned.push_str(default_scheme);
-        owned.push_str(text);
-        text = &owned;
-    }
-    Some(text.trim_end_matches('/').to_owned())
-}
-
 fn public_rtsp_base(config: &Config, headers: &HeaderMap) -> String {
     if let Some(base) = &config.rtsp_public_base {
         return base.clone();
@@ -1183,91 +792,6 @@ fn default_rtsp_host(bind_addr: SocketAddr) -> String {
         IpAddr::V6(ip) if ip.is_unspecified() => "[::1]".to_owned(),
         IpAddr::V6(ip) => format!("[{ip}]"),
         ip => ip.to_string(),
-    }
-}
-
-fn env_list(key: &str) -> Vec<String> {
-    env::var(key)
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
-fn video_qualities_env() -> String {
-    if let Ok(value) = env::var("AVAILABLE_VIDEO_QUALITY") {
-        if env::var_os("AVALIABLE_VIDEO_QUALITY").is_some() {
-            warn!(
-                "AVALIABLE_VIDEO_QUALITY is deprecated and ignored because AVAILABLE_VIDEO_QUALITY is set"
-            );
-        }
-        return value;
-    }
-    if let Ok(value) = env::var("AVALIABLE_VIDEO_QUALITY") {
-        warn!("AVALIABLE_VIDEO_QUALITY is deprecated; use AVAILABLE_VIDEO_QUALITY");
-        return value;
-    }
-    DEFAULT_VIDEO_QUALITIES.to_owned()
-}
-
-fn parse_video_qualities(value: &str) -> Result<Vec<VideoQuality>, Box<dyn std::error::Error>> {
-    let mut qualities = Vec::new();
-    for entry in value
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-    {
-        if qualities.len() >= MAX_VIDEO_QUALITIES {
-            return Err(format!(
-                "AVAILABLE_VIDEO_QUALITY supports at most {MAX_VIDEO_QUALITIES} presets"
-            )
-            .into());
-        }
-        let (size_and_fps, bitrate) = entry
-            .split_once('/')
-            .ok_or_else(|| format!("invalid AVAILABLE_VIDEO_QUALITY preset: {entry}"))?;
-        let (size, fps) = size_and_fps
-            .split_once('*')
-            .ok_or_else(|| format!("invalid AVAILABLE_VIDEO_QUALITY preset: {entry}"))?;
-        let (width, height) = size
-            .split_once(['x', 'X'])
-            .ok_or_else(|| format!("invalid AVAILABLE_VIDEO_QUALITY preset: {entry}"))?;
-        let quality = VideoQuality {
-            width: parse_nonzero(width, entry)?,
-            height: parse_nonzero(height, entry)?,
-            fps: parse_nonzero(fps, entry)?,
-            bitrate_kbps: parse_nonzero(bitrate, entry)?,
-        };
-        if qualities.contains(&quality) {
-            return Err(format!("duplicate AVAILABLE_VIDEO_QUALITY preset: {entry}").into());
-        }
-        qualities.push(quality);
-    }
-    if qualities.is_empty() {
-        return Err("AVAILABLE_VIDEO_QUALITY must contain at least one preset".into());
-    }
-    Ok(qualities)
-}
-
-fn parse_nonzero<T>(value: &str, preset: &str) -> Result<T, Box<dyn std::error::Error>>
-where
-    T: std::str::FromStr + Default + PartialEq,
-    T::Err: std::error::Error + 'static,
-{
-    let parsed = value.trim().parse::<T>()?;
-    if parsed == T::default() {
-        return Err(format!("zero value in AVAILABLE_VIDEO_QUALITY preset: {preset}").into());
-    }
-    Ok(parsed)
-}
-
-fn env_nonempty_or_default(key: &str, default: &str) -> Option<String> {
-    match env::var(key) {
-        Ok(value) if value.is_empty() || value.eq_ignore_ascii_case("none") => None,
-        Ok(value) => Some(value),
-        Err(_) => Some(default.to_owned()),
     }
 }
 

@@ -241,11 +241,15 @@ header{
 .first-source-selection>h2{
   margin-bottom:1.4rem
 }
+#firstSourceSelection>h2{
+  line-height:1.15;
+  padding:0 2rem
+}
 .stream-panel>h2{
   flex:0 0 auto;
   margin-bottom:.45rem
 }
-.first-source-selection>div:first-of-type{
+.source-choices{
   display:flex;
   gap:.5rem;
   justify-content:center
@@ -302,7 +306,7 @@ header{
   line-height:1;
   pointer-events:none;
   position:absolute;
-  right:-.5rem;
+  right:1rem;
   text-shadow:1px 1px #4a0000;
   top:1.25rem;
   white-space:nowrap
@@ -765,20 +769,35 @@ header{
 }
 .stream-bottom{
   align-items:center;
-  bottom:0;
   display:flex;
+  flex-wrap:wrap;
   gap:.75rem;
   justify-content:space-between;
-  left:0;
-  margin:0 -.5rem;
-  position:absolute;
-  right:0
+  margin:0 -.5rem
 }
 .stream-selects{
   align-items:center;
   display:flex;
+  flex-wrap:wrap;
   gap:.5rem;
+  justify-content:center;
+  margin-top:2rem;
   min-width:0
+}
+.session-settings{
+  color:#a6b2a9;
+  font-size:.75rem;
+  line-height:1.35
+}
+.back-button{
+  font-size:1.5rem;
+  left:.25rem;
+  line-height:1;
+  position:absolute;
+  top:0
+}
+#modeSelection{
+  margin-bottom:2rem
 }
 .stream-select{
   flex:0 1 auto;
@@ -879,10 +898,10 @@ header{
 @media (max-width:540px){
   .stream-bottom{gap:.35rem}
   .stream-selects{gap:.35rem}
-  .stream-select{max-width:8rem}
+  .stream-select{max-width:100%}
   .video-quality-select{
     flex-shrink:1;
-    max-width:8rem
+    max-width:100%
   }
   .custom-server{
     grid-template-columns:1fr
